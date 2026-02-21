@@ -30,6 +30,10 @@ func MaybeQueueScout(db *sql.DB, eg *epi.Epigenome, ws *Workspace, dr *Drives) (
 	if db == nil || eg == nil || ws == nil || dr == nil {
 		return false, ScoutRequest{}
 	}
+	// survival gate: no scout under high survival pressure
+	if ws.DrivesEnergyDeficit >= 0.65 {
+		return false, ScoutRequest{}
+	}
 	intervalSec, minCur, maxPerHour, enabled := eg.ScoutParams()
 	if !enabled || dr.Curiosity < minCur {
 		return false, ScoutRequest{}

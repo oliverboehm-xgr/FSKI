@@ -46,6 +46,19 @@ type Workspace struct {
 	LastPolicyCtx    string
 	LastPolicyAction string
 	LastPolicyStyle  string
+
+	// Executive / Survival-gate controls (kernel truth)
+	SurvivalMode    bool
+	WebAllowed      bool
+	AutonomyAllowed bool
+	MaxContextTurns int
+	MaxDetailItems  int
+
+	// Executive plan (minimal FSM)
+	ActiveGoal      string
+	ActivePlanTopic string
+	PlanSteps       []string
+	PlanIndex       int
 }
 
 func NewWorkspace() *Workspace {

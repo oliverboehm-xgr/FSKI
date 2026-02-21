@@ -208,26 +208,18 @@ func main() {
 		// 2) generate Bunny reply
 		start := time.Now()
 		mu.Lock()
-		// determine intent (rules + NB)
+		// determine intent (rules + NB), then let executive run strategy.
 		intent := brain.DetectIntentHybrid(text, eg, nb)
-		intentMode := brain.IntentToMode(intent)
-
-		// policy bandit chooses strategy/style from current context
-		ctxKey := brain.MakePolicyContext(intentMode, ws.DrivesEnergyDeficit, ws.SocialCraving)
-		choice := brain.ChoosePolicy(db.DB, ctxKey)
-
-		// store last routed intent for context (used below)
-		ws.LastRoutedIntent = intentMode
+		_ = intent
 		ws.LastUserText = text
-		ws.LastPolicyCtx = choice.ContextKey
-		ws.LastPolicyAction = choice.Action
-		ws.LastPolicyStyle = choice.Style
-
-		out, err := say(db.DB, epiPath, oc, model, modelStance, &body, aff, ws, tr, dr, eg, text)
+		out, err := ExecuteTurn(db.DB, epiPath, oc, modelSpeaker, modelStance, &body, aff, ws, tr, dr, eg, text)
 		brain.LatencyAffect(ws, aff, eg, time.Since(start))
 		mu.Unlock()
 		if err != nil {
 			return ui.Message{}, err
+		}
+		if strings.TrimSpace(out) == "" {
+			return ui.Message{}, nil
 		}
 		id := persistMessageWithKind(db.DB, out, nil, 0.2, "reply")
 		// link reply -> user_text + intent + policy for learning
@@ -1104,11 +1096,15 @@ func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, stanceMode
 
 	// GENERIC RESEARCH GATE:
 	// decides when senses are needed to make progress (not only "opinion").
-	rd := brain.DecideResearch(db, userText, intent, ws, tr, dr, aff)
-	if rd.Do {
-		// If the gate says "research", route into evidence answering.
-		// answerWithEvidence already does Search+Fetch+Snippet fallback.
-		return answerWithEvidence(db, oc, model, body, aff, ws, tr, eg, rd.Query)
+	if ws != nil && !ws.WebAllowed {
+		// Survival gate disabled web; continue without research.
+	} else {
+		rd := brain.DecideResearch(db, userText, intent, ws, tr, dr, aff)
+		if rd.Do {
+			// If the gate says "research", route into evidence answering.
+			// answerWithEvidence already does Search+Fetch+Snippet fallback.
+			return answerWithEvidence(db, oc, model, body, aff, ws, tr, eg, rd.Query)
+		}
 	}
 
 	// external fact explicit routing remains as a safe default
@@ -1134,30 +1130,7 @@ HARTE REGELN
 	sm := epi.BuildSelfModel(body, aff, ws, tr, eg)
 	selfLines := buildSelfLines(sm, aff)
 	mode := brain.IntentToMode(intent)
-	activeTopic := ""
-	if ws != nil {
-		activeTopic = ws.ActiveTopic
-	}
-	// STM (last turns)
-	_, ctxTurns, detailItems, _, _, _, _ := eg.MemoryParams()
-	turns := brain.RecentTurns(db, ctxTurns)
-	// Gist (episode summary)
-	gist := ""
-	if activeTopic != "" {
-		if s, ok := brain.GetLastEpisode(db, activeTopic); ok {
-			gist = s
-		}
-	}
-	// Details (decaying items)
-	details := ""
-	if activeTopic != "" && detailItems > 0 {
-		details = brain.RecallDetails(db, activeTopic, detailItems)
-	}
-	// Concepts (existing LTM)
-	concepts := ""
-	if activeTopic != "" {
-		concepts = brain.RecallConcepts(db, activeTopic, 4)
-	}
+	activeTopic, gist, details, concepts, stance, turns := BuildHumanContext(db, eg, ws)
 	affKeys := ""
 	if aff != nil {
 		affKeys = strings.Join(aff.Keys(), ", ")
@@ -1182,6 +1155,7 @@ HARTE REGELN
 		"\n\nSTORY_SO_FAR (gist):\n" + gist +
 		"\n\nDETAILS (decay):\n" + details +
 		"\n\nCONCEPTS:\n" + concepts +
+		"\n\nSTANCE:\n" + stance +
 		"\n\nRECENT_TURNS:\n" + turns +
 		"\n\nSELFMODEL_LINES:\n" + selfLines +
 		"\n\nUSER:\n" + userText
