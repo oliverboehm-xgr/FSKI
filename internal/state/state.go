@@ -109,6 +109,13 @@ func migrate(db *sql.DB) error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_message_meta_kind ON message_meta(kind);`,
 
+		// Thread / dialog state (short-term memory anchor)
+		`CREATE TABLE IF NOT EXISTS thread_state (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+
 		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {

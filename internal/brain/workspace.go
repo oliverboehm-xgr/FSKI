@@ -15,11 +15,12 @@ type Workspace struct {
 	LastTopic      string
 	LastUserText   string
 	PrevUserText   string
+	ActiveTopic    string
 	_daydreamAccum float64
 }
 
 func NewWorkspace() *Workspace {
-	return &Workspace{CurrentThought: "Idle: Systemcheck (Ressourcen/Affects).", Confidence: 0.6, LastTopic: ""}
+	return &Workspace{CurrentThought: "Idle: Systemcheck (Ressourcen/Affects).", Confidence: 0.6, LastTopic: "", ActiveTopic: ""}
 }
 
 // TickWorkspace = Kernel-"Denken": generiert Gedankenobjekte ohne LLM.
