@@ -162,6 +162,17 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"warmup_min_docs":     30,   // learned stopword filter starts only after enough docs
 				"stopword_min_df":     8,    // token must be frequently observed before suppression
 			}},
+
+			// Ollama backend manager (opt-in)
+			"ollama_manager": {Type: "ollama_manager", Enabled: true, Params: map[string]any{
+				"enabled":            true,
+				"auto_start":         true,  // try to start ollama if offline
+				"auto_pull":          false, // WARNING: downloads models; keep opt-in
+				"start_retries":      20,
+				"start_retry_ms":     250,
+				"pull_timeout_sec":   1800, // safety timeout for pull command
+				"max_models_to_pull": 3,    // avoid pulling too much automatically
+			}},
 			"cooldown": {
 				Type:    "cooldown",
 				Enabled: true,
@@ -250,6 +261,15 @@ func (eg *Epigenome) ensureDefaults() (changed bool) {
 		"min_talk_drive":   0.55,
 		"cooldown_seconds": 60,
 		"topic_k":          5,
+	}})
+	add("ollama_manager", &ModuleSpec{Type: "ollama_manager", Enabled: true, Params: map[string]any{
+		"enabled":            true,
+		"auto_start":         true,
+		"auto_pull":          false,
+		"start_retries":      20,
+		"start_retry_ms":     250,
+		"pull_timeout_sec":   1800,
+		"max_models_to_pull": 3,
 	}})
 
 	def := func(k string, base, decay, coupling float64) {
@@ -427,6 +447,58 @@ func (eg *Epigenome) SayEnergyCost() float64 {
 		return 1.0
 	}
 	return asFloat(m.Params["cost"], 1.0)
+}
+
+func (eg *Epigenome) OllamaManagerParams() (enabled, autoStart, autoPull bool, startRetries int, startRetryMs int, pullTimeoutSec int, maxPull int) {
+	m := eg.Modules["ollama_manager"]
+	if m == nil || !m.Enabled {
+		return false, false, false, 0, 0, 0, 0
+	}
+	if v, ok := m.Params["enabled"].(bool); ok {
+		enabled = v
+	} else {
+		enabled = true
+	}
+	if v, ok := m.Params["auto_start"].(bool); ok {
+		autoStart = v
+	} else {
+		autoStart = true
+	}
+	if v, ok := m.Params["auto_pull"].(bool); ok {
+		autoPull = v
+	} else {
+		autoPull = false
+	}
+	startRetries = int(asFloat(m.Params["start_retries"], 20))
+	startRetryMs = int(asFloat(m.Params["start_retry_ms"], 250))
+	pullTimeoutSec = int(asFloat(m.Params["pull_timeout_sec"], 1800))
+	maxPull = int(asFloat(m.Params["max_models_to_pull"], 3))
+
+	if startRetries < 0 {
+		startRetries = 0
+	}
+	if startRetries > 200 {
+		startRetries = 200
+	}
+	if startRetryMs < 50 {
+		startRetryMs = 50
+	}
+	if startRetryMs > 5000 {
+		startRetryMs = 5000
+	}
+	if pullTimeoutSec < 60 {
+		pullTimeoutSec = 60
+	}
+	if pullTimeoutSec > 7200 {
+		pullTimeoutSec = 7200
+	}
+	if maxPull < 0 {
+		maxPull = 0
+	}
+	if maxPull > 20 {
+		maxPull = 20
+	}
+	return
 }
 
 type IntentRule struct {

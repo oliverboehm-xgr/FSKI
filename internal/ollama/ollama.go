@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -79,4 +81,40 @@ func (c *Client) Ping() error {
 	}
 
 	return nil
+}
+
+func (c *Client) ListModels() (map[string]struct{}, error) {
+	req, _ := http.NewRequest("GET", c.BaseURL+"/api/tags", nil)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("ollama status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var parsed struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]struct{}, len(parsed.Models))
+	for _, m := range parsed.Models {
+		name := strings.TrimSpace(m.Name)
+		if name != "" {
+			out[name] = struct{}{}
+		}
+	}
+	return out, nil
 }
