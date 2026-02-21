@@ -705,18 +705,32 @@ HARTE REGELN
 	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, ws, tr, eg), "", "  ")
 	mode := brain.IntentToMode(intent)
 	activeTopic := ""
-	if ws != nil {
-		activeTopic = ws.ActiveTopic
-	}
-	dialogCtx := brain.BuildDialogContext(db, 14)
-	recall := ""
+	if ws != nil { activeTopic = ws.ActiveTopic }
+	// STM (last turns)
+	_, ctxTurns, detailItems, _, _, _, _ := eg.MemoryParams()
+	turns := brain.RecentTurns(db, ctxTurns)
+	// Gist (episode summary)
+	gist := ""
 	if activeTopic != "" {
-		recall = brain.RecallConcepts(db, activeTopic, 4)
+		if s, ok := brain.GetLastEpisode(db, activeTopic); ok { gist = s }
 	}
+	// Details (decaying items)
+	details := ""
+	if activeTopic != "" && detailItems > 0 {
+		details = brain.RecallDetails(db, activeTopic, detailItems)
+	}
+	// Concepts (existing LTM)
+	concepts := ""
+	if activeTopic != "" {
+		concepts = brain.RecallConcepts(db, activeTopic, 4)
+	}
+
 	user := "MODE: " + mode +
 		"\nACTIVE_TOPIC: " + activeTopic +
-		"\n\nDIALOG_CONTEXT:\n" + dialogCtx +
-		"\n\nRELEVANT_MEMORY:\n" + recall +
+		"\n\nSTORY_SO_FAR (gist):\n" + gist +
+		"\n\nDETAILS (decay):\n" + details +
+		"\n\nCONCEPTS:\n" + concepts +
+		"\n\nRECENT_TURNS:\n" + turns +
 		"\n\nSelfModel:\n" + string(selfJSON) +
 		"\n\nUSER:\n" + userText
 	out, err := oc.Chat(model, []ollama.Message{
