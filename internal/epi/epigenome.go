@@ -48,9 +48,10 @@ func LoadOrInit(path string) (*Epigenome, error) {
 	eg := &Epigenome{
 		Version: 1,
 		Modules: map[string]*ModuleSpec{
-			"locale":    {Type: "locale", Enabled: true, Params: map[string]any{"lang": "de"}},
-			"energy":    {Type: "energy", Enabled: true, Params: map[string]any{"max": 100}},
-			"heartbeat": {Type: "heartbeat", Enabled: true, Params: map[string]any{"ms": 500}},
+			"locale":           {Type: "locale", Enabled: true, Params: map[string]any{"lang": "de"}},
+			"energy":           {Type: "energy", Enabled: true, Params: map[string]any{"max": 100}},
+			"utterance_filter": {Type: "utterance_filter", Enabled: true, Params: map[string]any{"banned_phrases": []any{}}},
+			"heartbeat":        {Type: "heartbeat", Enabled: true, Params: map[string]any{"ms": 500}},
 			"cooldown": {
 				Type:    "cooldown",
 				Enabled: true,
@@ -196,6 +197,28 @@ func (eg *Epigenome) EnergyMax() float64 {
 		return 100
 	}
 	return asFloat(m.Params["max"], 100)
+}
+
+func (eg *Epigenome) UtteranceBannedPhrases() []string {
+	m := eg.Modules["utterance_filter"]
+	if m == nil || !m.Enabled {
+		return nil
+	}
+	raw, ok := m.Params["banned_phrases"]
+	if !ok || raw == nil {
+		return nil
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, v := range arr {
+		if s, ok := v.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func asFloat(v any, def float64) float64 {
