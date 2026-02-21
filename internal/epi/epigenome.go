@@ -122,13 +122,17 @@ func LoadOrInit(path string) (*Epigenome, error) {
 			// Models per brain area (LoRA-ready).
 			// Keys are "speaker", "critic", "daydream", "scout", "hippocampus", "stance".
 			"models": {Type: "models", Enabled: true, Params: map[string]any{
-				"default":     "llama3.1:8b",
-				"speaker":     "llama3.1:8b",
-				"critic":      "llama3.1:8b",
-				"daydream":    "llama3.1:8b",
-				"scout":       "llama3.1:8b",
-				"hippocampus": "llama3.1:8b",
-				"stance":      "llama3.1:8b",
+				// Default split: heavy model for creative/complex synthesis,
+				// small model for checking/extracting.
+				"default":  "llama3.1:8b",
+				"speaker":  "llama3.1:8b",
+				"daydream": "llama3.1:8b",
+				"stance":   "llama3.1:8b",
+
+				// Small / efficient
+				"critic":      "llama3.2:3b",
+				"scout":       "llama3.2:3b",
+				"hippocampus": "llama3.2:3b",
 				// later you can set: "critic": "llama3.1:8b-lora-critic"
 			}},
 			"cooldown": {
