@@ -9,8 +9,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"frankenstein-v0/internal/brain"
 	"frankenstein-v0/internal/epi"
 	"frankenstein-v0/internal/ollama"
 	"frankenstein-v0/internal/state"
@@ -60,12 +62,32 @@ func main() {
 		CooldownUntil: time.Time{},
 	}
 
+	// Kernel affect state (generic: pain/unwell/fear/...)
+	aff := brain.NewAffectState()
+
+	// Shared lock because heartbeat and CLI touch body/aff
+	var mu sync.Mutex
+
 	fmt.Println("Frankenstein v0 online.")
 	fmt.Println("Commands: /think | /say <text...> | /rate <up|meh|down> | /status | /mutate ... | /quit")
 	fmt.Println()
 
 	var lastMessageID int64 = 0
 	reader := bufio.NewReader(os.Stdin)
+
+	// Heartbeat: kernel ticks regardless of LLM usage
+	hb := brain.NewHeartbeat(eg)
+	stopHB := hb.Start(func(delta time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		// 1) Update affect loop (homeostasis)
+		brain.TickAffects(&body, aff, eg, delta)
+
+		// 2) Lightweight energy drift / recovery (epigenetic)
+		brain.TickBody(&body, eg, delta)
+	})
+	defer stopHB()
 
 	for {
 		fmt.Print("> ")
@@ -83,8 +105,10 @@ func main() {
 
 		switch cmd {
 		case "/think":
+			mu.Lock()
 			// one “idle” cycle: pick a topic, search, fetch, propose a message
-			msgText, sources, err := oneThinkCycle(db.DB, oc, model, &body, eg)
+			msgText, sources, err := oneThinkCycle(db.DB, oc, model, &body, aff, eg)
+			mu.Unlock()
 			if err != nil {
 				fmt.Println("ERR:", err)
 				continue
@@ -93,7 +117,10 @@ func main() {
 				fmt.Println("(silent)")
 				continue
 			}
-			if time.Now().Before(body.CooldownUntil) {
+			mu.Lock()
+			cd := time.Now().Before(body.CooldownUntil)
+			mu.Unlock()
+			if cd {
 				fmt.Println("(cooldown, message queued but not spoken)")
 				continue
 			}
@@ -108,7 +135,9 @@ func main() {
 				continue
 			}
 			userText := strings.Join(args, " ")
+			mu.Lock()
 			out, err := say(db.DB, oc, model, &body, eg, userText)
+			mu.Unlock()
 			if err != nil {
 				fmt.Println("ERR:", err)
 				continue
@@ -141,7 +170,10 @@ func main() {
 			}
 			fmt.Println("(saved)")
 		case "/status":
-			fmt.Println(renderStatus(&body, eg))
+			mu.Lock()
+			s := renderStatus(&body, aff, eg)
+			mu.Unlock()
+			fmt.Println(s)
 		case "/mutate":
 			if len(args) == 0 {
 				fmt.Println("Use: /mutate add|enable|disable|set ...")
@@ -160,12 +192,9 @@ func main() {
 	}
 }
 
-func oneThinkCycle(db *sql.DB, oc *ollama.Client, model string, body *BodyState, eg *epi.Epigenome) (string, []SourceRecord, error) {
-	// Minimal: fixed curiosity query for the first run.
-	// Next iteration we’ll generate topics from interests + memory.
+func oneThinkCycle(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, eg *epi.Epigenome) (string, []SourceRecord, error) {
 	query := "best practices evidence based web research for autonomous agents"
 
-	// Web cost model
 	body.WebCountHour++
 	body.Energy -= 1.0
 	if body.Energy < 0 {
@@ -180,7 +209,6 @@ func oneThinkCycle(db *sql.DB, oc *ollama.Client, model string, body *BodyState,
 		return "", nil, nil
 	}
 
-	// Fetch top 1–2
 	var sources []SourceRecord
 	for i := 0; i < len(results) && i < 2; i++ {
 		fr, err := websense.Fetch(results[i].URL)
@@ -201,7 +229,6 @@ func oneThinkCycle(db *sql.DB, oc *ollama.Client, model string, body *BodyState,
 		return "", nil, nil
 	}
 
-	// Ask LLM to synthesize a single proactive message with evidence mention.
 	sys := `You are "Frankenstein", an embodied research organism.
 Rules:
 - Be concise and non-spammy.
@@ -210,7 +237,7 @@ Rules:
 - Max 70 words.`
 
 	srcJSON, _ := json.MarshalIndent(sources, "", "  ")
-	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, eg), "", "  ")
+	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, eg), "", "  ")
 
 	user := "SelfModel:\n" + string(selfJSON) + "\n\n" +
 		"Sources (evidence):\n" + string(srcJSON) + "\n\n" +
@@ -229,7 +256,6 @@ Rules:
 		return "", nil, nil
 	}
 
-	// Communication cost + cooldown (epigenetic)
 	body.Energy -= 1.5
 	body.CooldownUntil = time.Now().Add(eg.CooldownDuration())
 
@@ -242,7 +268,7 @@ Rules:
 - Answer Oliver directly and naturally.
 - Be brief unless asked otherwise.
 - If you refer to your own state, ONLY use SelfModel.`
-	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, eg), "", "  ")
+	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, nil, eg), "", "  ")
 	user := "SelfModel:\n" + string(selfJSON) + "\n\nOliver says:\n" + userText
 	out, err := oc.Chat(model, []ollama.Message{
 		{Role: "system", Content: sys},
@@ -311,7 +337,6 @@ func splitCmd(line string) (string, []string) {
 		}
 		return parts[0], parts[1:]
 	}
-	// convenience: treat non-slash as /say
 	return "/say", []string{line}
 }
 
@@ -328,7 +353,7 @@ func parseRating(s string) (int, bool) {
 	}
 }
 
-func renderStatus(body *BodyState, eg *epi.Epigenome) string {
+func renderStatus(body *BodyState, aff *brain.AffectState, eg *epi.Epigenome) string {
 	var b strings.Builder
 	b.WriteString("BodyState:\n")
 	b.WriteString(fmt.Sprintf("  energy: %.1f\n", body.Energy))
@@ -338,6 +363,12 @@ func renderStatus(body *BodyState, eg *epi.Epigenome) string {
 	} else {
 		b.WriteString("  cooldownUntil: (none)\n")
 	}
+	if aff != nil {
+		b.WriteString("\nAffects:\n")
+		for _, k := range aff.Keys() {
+			b.WriteString(fmt.Sprintf("  %s: %.3f\n", k, aff.Get(k)))
+		}
+	}
 	b.WriteString("\nEpigenome (enabled modules):\n")
 	for _, name := range eg.EnabledModuleNames() {
 		b.WriteString("  - " + name + "\n")
@@ -346,10 +377,6 @@ func renderStatus(body *BodyState, eg *epi.Epigenome) string {
 }
 
 func handleMutate(args []string, eg *epi.Epigenome, path string) error {
-	// /mutate add <name> <type>
-	// /mutate enable <name>
-	// /mutate disable <name>
-	// /mutate set <name> <key> <value>
 	op := strings.ToLower(args[0])
 	switch op {
 	case "add":
@@ -373,7 +400,6 @@ func handleMutate(args []string, eg *epi.Epigenome, path string) error {
 		if len(args) != 4 {
 			return fmt.Errorf("use: /mutate set <name> <key> <value>")
 		}
-		// tiny coercion: int/float/bool/string
 		valRaw := args[3]
 		var v any = valRaw
 		if i, err := strconv.Atoi(valRaw); err == nil {
