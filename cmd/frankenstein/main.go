@@ -279,7 +279,8 @@ HARTE REGELN
 	body.Energy -= 1.5
 	body.CooldownUntil = time.Now().Add(eg.CooldownDuration())
 
-	return brain.PostprocessGerman(out), sources, nil
+	out = brain.ApplyUtteranceFilter(out, eg)
+	return brain.PostprocessUtterance(out), sources, nil
 }
 
 func say(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome, userText string) (string, error) {
@@ -327,7 +328,8 @@ HARTE REGELN
 		body.Energy = 0
 	}
 	body.CooldownUntil = time.Now().Add(eg.CooldownDuration())
-	return brain.PostprocessGerman(out), nil
+	out = brain.ApplyUtteranceFilter(out, eg)
+	return brain.PostprocessUtterance(out), nil
 }
 
 func answerWithEvidence(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome, userText string) (string, error) {
@@ -385,7 +387,8 @@ HARTE REGELN
 	out = strings.TrimSpace(out)
 	body.Energy -= 0.8
 	body.CooldownUntil = time.Now().Add(eg.CooldownDuration())
-	return brain.PostprocessGerman(out), nil
+	out = brain.ApplyUtteranceFilter(out, eg)
+	return brain.PostprocessUtterance(out), nil
 }
 
 func storeSource(db *sql.DB, fr *websense.FetchResult) {
