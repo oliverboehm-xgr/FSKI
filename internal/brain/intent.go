@@ -1,6 +1,11 @@
 package brain
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+
+	"frankenstein-v0/internal/epi"
+)
 
 type Intent int
 
@@ -14,41 +19,59 @@ const (
 	IntentResearchCommand
 )
 
-func DetectIntent(s string) Intent {
+// DetectIntent is now data-driven (epigenetic). If eg==nil or no rules, it falls back to UNKNOWN.
+func DetectIntentWithEpigenome(s string, eg *epi.Epigenome) Intent {
 	t := normalizeText(s)
+	if eg == nil {
+		return IntentUnknown
+	}
+	rules := eg.IntentRules()
+	if len(rules) == 0 {
+		return IntentUnknown
+	}
+	for _, r := range rules {
+		if matchRule(t, r) {
+			return mapIntentString(r.Intent)
+		}
+	}
+	return IntentUnknown
+}
 
-	switch {
-	case hasAny(t, "wiegeht", "wie geht", "wasdenkst", "was denkst", "hastduangst", "hast du angst", "energie", "cooldown"):
+func matchRule(t string, r epi.IntentRule) bool {
+	for _, c := range r.Contains {
+		if c == "" {
+			continue
+		}
+		if strings.Contains(t, strings.ToLower(c)) {
+			return true
+		}
+	}
+	for _, pat := range r.Regex {
+		re, err := regexp.Compile(pat)
+		if err != nil {
+			continue
+		}
+		if re.MatchString(t) {
+			return true
+		}
+	}
+	return false
+}
+
+func mapIntentString(s string) Intent {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "META_BUNNY":
 		return IntentMetaBunny
-
-	// opinion must win over external facts/research patterns
-	case isOpinionRequest(t):
+	case "EXTERNAL_FACT":
+		return IntentExternalFact
+	case "OPINION":
 		return IntentOpinion
-
-	// explicit research command (meta)
-	case isResearchCommand(t):
+	case "RESEARCH_CMD":
 		return IntentResearchCommand
-
-	// external factual patterns
-	case isExternalFactPattern(t):
-		return IntentExternalFact
-
-	case hasAny(t,
-		"wetter", "vorhersage", "temperatur", "regen", "wind",
-		"news", "nachrichten", "heute", "morgen",
-		"kurs", "preis", "aktie", "bitcoin", "ethereum",
-		"datum", "uhrzeit", "wann", "wie viel",
-		"wer ist", "aktuell", "jetzt",
-		"krieg", "konflikt", // generisch, kein Topic-hardcode
-	):
-		return IntentExternalFact
-
-	case hasAny(t, "glücklich", "sinn", "beziehung", "stress", "motivation"):
+	case "USER_LIFE":
 		return IntentUserLife
-
-	case hasAny(t, "code", "patch", "github", "fski", "go ", "ollama", "sqlite", "module"):
+	case "TASK_TECH":
 		return IntentTaskTech
-
 	default:
 		return IntentUnknown
 	}
@@ -73,15 +96,6 @@ func IntentToMode(i Intent) string {
 	}
 }
 
-func hasAny(t string, subs ...string) bool {
-	for _, s := range subs {
-		if strings.Contains(t, s) {
-			return true
-		}
-	}
-	return false
-}
-
 func normalizeText(s string) string {
 	t := strings.ToLower(strings.TrimSpace(s))
 	t = strings.ReplaceAll(t, "\t", " ")
@@ -89,43 +103,4 @@ func normalizeText(s string) string {
 		t = strings.ReplaceAll(t, "  ", " ")
 	}
 	return t
-}
-
-func isResearchCommand(t string) bool {
-	return hasAny(t,
-		"recherchier", "recherchiere",
-		"im internet", "nachsehen", "schau nach",
-		"google", "web", "quelle", "quellen",
-	)
-}
-
-func isOpinionRequest(t string) bool {
-	return hasAny(t,
-		"deine meinung", "meine meinung", "meinung",
-		"was sagst du", "äußere dich", "aeussere dich",
-		"bewerte", "einschätzung", "einschaetzung",
-		"position", "haltung",
-		"gut oder schlecht", "findest du es gut", "findest du es schlecht",
-		"stell dich", "stellung beziehen", "partei ergreifen",
-		"reagiere so wie du willst", "reagiere wie du willst",
-	)
-}
-
-func isExternalFactPattern(t string) bool {
-	if strings.Contains(t, "wo liegt") || strings.Contains(t, "wo ist") {
-		return true
-	}
-	if strings.Contains(t, "hauptstadt") {
-		return true
-	}
-	if strings.Contains(t, "wer ist") || strings.Contains(t, "wer war") {
-		return true
-	}
-	if strings.Contains(t, "wie hoch") || strings.Contains(t, "wie viel") {
-		return true
-	}
-	if strings.HasSuffix(t, "?") && (strings.Contains(t, "wo ") || strings.Contains(t, "wer ") || strings.Contains(t, "wann ")) {
-		return true
-	}
-	return false
 }
