@@ -13,9 +13,9 @@ import (
 // This replaces "policy as prompt hint".
 func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, modelStance string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string) (string, error) {
 	// --- Generic info gate (learned IDF) ---
-	// Observe utterance once per user turn (updates token_df)
-	brain.ObserveUtterance(db, userText)
+	// Score first, then observe (avoid self-influencing DF during the same turn).
 	low, info := brain.IsLowInfo(db, eg, userText)
+	brain.ObserveUtterance(db, userText)
 	if ws != nil {
 		ws.LastUserInfoScore = info.Score
 		ws.LastUserTopToken = info.TopToken
@@ -72,8 +72,11 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		}
 		return "Kurze Rückfrage: Willst du Fakten/Status, eine Bewertung/Haltung, oder Optionen mit Trade-offs?", nil
 	case "social_ping":
+		// For user turns, never return empty. If autonomy is blocked, fallback to direct answer.
 		if ws != nil && !ws.AutonomyAllowed {
-			return "", nil
+			choice.Action = "direct_answer"
+			ws.LastPolicyAction = "direct_answer"
+			return say(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, userText)
 		}
 		if topic != "" {
 			return "Bevor ich weiterlaufe: soll ich beim Thema \"" + topic + "\" eher recherchieren, eine Haltung bilden, oder gemeinsam Optionen strukturieren?", nil
@@ -91,6 +94,10 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		}
 		return answerWithEvidence(db, oc, modelSpeaker, body, aff, ws, tr, eg, q)
 	default:
-		return say(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, userText)
+		out, err := say(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, userText)
+		if err == nil && strings.TrimSpace(out) == "" {
+			return "Ich bin da. Sag mir kurz, was du von mir willst: Status, Meinung oder einfach reden?", nil
+		}
+		return out, err
 	}
 }
