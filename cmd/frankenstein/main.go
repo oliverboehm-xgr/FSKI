@@ -36,6 +36,12 @@ type SourceRecord struct {
 	Hash      string `json:"hash"`
 }
 
+type OutMsg struct {
+	Text    string
+	Sources []SourceRecord
+	Kind    string // "auto" or "reply" or "think"
+}
+
 func main() {
 	model := getenv("FRANK_MODEL", "llama3.1:8b")
 	ollamaURL := getenv("OLLAMA_URL", "http://localhost:11434")
@@ -63,184 +69,284 @@ func main() {
 		CooldownUntil: time.Time{},
 	}
 
-	// Kernel affect state (generic: pain/unwell/fear/...)
 	aff := brain.NewAffectState()
 	ws := brain.NewWorkspace()
 
-	// traits (persistent learning knobs)
 	tr, err := brain.LoadOrInitTraits(db.DB)
 	must(err)
 
-	// drives (curiosity, urge_to_share)
 	dr, err := brain.LoadOrInitDrives(db.DB)
 	must(err)
 
-	// Load persisted affects
 	_ = brain.LoadAffectState(db.DB, aff)
 
-	// Shared lock because heartbeat and CLI touch body/aff/ws/tr
 	var mu sync.Mutex
 
 	fmt.Println("Bunny v0 online.")
 	fmt.Println("Commands: /think | /say <text...> | /rate <up|meh|down> | /caught | /status | /mutate ... | /quit")
 	fmt.Println()
 
-	var lastMessageID int64 = 0
-	reader := bufio.NewReader(os.Stdin)
+	// async input + async output
+	inputCh := make(chan string, 16)
+	outCh := make(chan OutMsg, 16)
+	speakReqCh := make(chan brain.SpeakRequest, 8)
+	speakOutCh := make(chan string, 8)
 
-	// Heartbeat: kernel ticks regardless of LLM usage
+	var lastMessageID int64 = 0 // protected by mu
+	var lastAutoSpeak time.Time // protected by mu
+
+	go func() {
+		reader := bufio.NewReader(os.Stdin)
+		for {
+			fmt.Print("> ")
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				close(inputCh)
+				return
+			}
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			inputCh <- line
+		}
+	}()
+
+	go func() {
+		for req := range speakReqCh {
+			sys := `Du bist Bunny.
+Du darfst autonom sprechen, aber nur wenn es einen echten Grund gibt (Mitteilungsbedürfnis).
+Regeln:
+- Deutsch. Kurz: 1–3 Sätze.
+- Kein Smalltalk. Keine Entschuldigung. Keine Meta-Erklärungen.
+- Keine externen Fakten behaupten (nur interne Gedanken/Fragen/Beobachtungen).
+- Ein Satz Inhalt + optional 1 Frage an Oliver.`
+
+			user := "SelfModel:\n" + req.SelfModelJSON + "\n\n" +
+				"Reason:\n" + req.Reason + "\n\n" +
+				"Topic:\n" + req.Topic + "\n\n" +
+				"ConceptSummary:\n" + req.ConceptSummary + "\n\n" +
+				"CurrentThought:\n" + req.CurrentThought + "\n\n" +
+				"Compose ONE proactive message now."
+
+			txt, err := oc.Chat(model, []ollama.Message{{Role: "system", Content: sys}, {Role: "user", Content: user}})
+			if err != nil {
+				continue
+			}
+			txt = strings.TrimSpace(txt)
+			if txt == "" {
+				continue
+			}
+			speakOutCh <- txt
+		}
+	}()
+
 	hb := brain.NewHeartbeat(eg)
 	var tickN int
 	stopHB := hb.Start(func(delta time.Duration) {
 		mu.Lock()
 		defer mu.Unlock()
 
-		// 1) Update affect loop (homeostasis)
 		brain.TickAffects(&body, aff, eg, delta)
-
-		// 2) Lightweight energy drift / recovery (epigenetic)
 		brain.TickBody(&body, eg, delta)
 		brain.TickWorkspace(ws, &body, aff, tr, eg, delta)
 		brain.TickDrives(dr, aff, delta)
 		brain.TickDaydream(db.DB, ws, dr, aff, delta)
 
-		// interest decay (slow) + persist affects periodically
 		tickN++
-		if tickN%60 == 0 { // ~ every 30s if heartbeat=500ms
+		if tickN%60 == 0 {
 			brain.DecayInterests(db.DB, 0.995)
 		}
-		if tickN%40 == 0 { // persist affects ~ every 20s
+		if tickN%40 == 0 {
 			_ = brain.SaveAffectState(db.DB, aff)
 		}
 		if tickN%40 == 0 {
 			brain.SaveDrives(db.DB, dr)
 		}
+
+		now := time.Now()
+		if now.Before(body.CooldownUntil) {
+			return
+		}
+		minInterval := 25 * time.Second
+		if !lastAutoSpeak.IsZero() && now.Sub(lastAutoSpeak) < minInterval {
+			return
+		}
+		talkBias := 0.45
+		if tr != nil {
+			talkBias = tr.TalkBias
+		}
+		inhib := 0.0
+		inhib += 0.9 * aff.Get("shame")
+		inhib += 0.4 * aff.Get("unwell")
+		inhib += 0.3 * aff.Get("pain")
+		inhib += 0.3 * aff.Get("fear")
+		threshold := 0.78 - 0.22*talkBias + 0.25*inhib
+		if threshold < 0.45 {
+			threshold = 0.45
+		}
+		if dr != nil && dr.UrgeToShare >= threshold && body.Energy >= 5 {
+			topic, w := brain.TopInterest(db.DB)
+			if topic == "" || w < 0.05 {
+				topic = ws.LastTopic
+			}
+			conceptSummary := ""
+			if topic != "" {
+				if c, ok := brain.GetConcept(db.DB, topic); ok {
+					conceptSummary = c.Summary
+				}
+			}
+			smJSON, _ := json.MarshalIndent(epi.BuildSelfModel(&body, aff, ws, tr, eg), "", "  ")
+
+			body.Energy -= eg.SayEnergyCost()
+			if body.Energy < 0 {
+				body.Energy = 0
+			}
+			body.CooldownUntil = now.Add(eg.CooldownDuration())
+			dr.UrgeToShare = dr.UrgeToShare * 0.55
+			lastAutoSpeak = now
+
+			req := brain.SpeakRequest{Reason: "Mitteilungsbedürfnis ist hoch (UrgeToShare).", Topic: topic, ConceptSummary: conceptSummary, CurrentThought: ws.CurrentThought, SelfModelJSON: string(smJSON)}
+			select {
+			case speakReqCh <- req:
+			default:
+			}
+		}
 	})
 	defer stopHB()
 
 	for {
-		fmt.Print("> ")
-		line, _ := reader.ReadString('\n')
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		if line == "/quit" || line == "quit" || line == "exit" {
-			return
-		}
-
-		cmd, args := splitCmd(line)
-
-		switch cmd {
-		case "/think":
+		select {
+		case line, ok := <-inputCh:
+			if !ok {
+				return
+			}
+			if line == "/quit" || line == "quit" || line == "exit" {
+				return
+			}
+			cmd, args := splitCmd(line)
+			switch cmd {
+			case "/think":
+				mu.Lock()
+				msgText, sources, err := oneThinkCycle(db.DB, oc, model, &body, aff, ws, tr, eg)
+				mu.Unlock()
+				if err != nil {
+					fmt.Println("ERR:", err)
+					continue
+				}
+				if msgText == "" {
+					fmt.Println("(silent)")
+					continue
+				}
+				mu.Lock()
+				cd := time.Now().Before(body.CooldownUntil)
+				mu.Unlock()
+				if cd {
+					fmt.Println("(cooldown, message queued but not spoken)")
+					continue
+				}
+				outCh <- OutMsg{Text: msgText, Sources: sources, Kind: "think"}
+			case "/say":
+				if len(args) == 0 {
+					fmt.Println("Use: /say <text...>")
+					continue
+				}
+				userText := strings.Join(args, " ")
+				mu.Lock()
+				out, err := say(db.DB, epiPath, oc, model, &body, aff, ws, tr, dr, eg, userText)
+				mu.Unlock()
+				if err != nil {
+					fmt.Println("ERR:", err)
+					continue
+				}
+				if out == "" {
+					fmt.Println("(silent)")
+					continue
+				}
+				outCh <- OutMsg{Text: out, Sources: nil, Kind: "reply"}
+			case "/rate":
+				if len(args) != 1 {
+					fmt.Println("Use: /rate up|meh|down")
+					continue
+				}
+				v, ok := parseRating(args[0])
+				if !ok {
+					fmt.Println("Use: /rate up|meh|down")
+					continue
+				}
+				mu.Lock()
+				lid := lastMessageID
+				mu.Unlock()
+				if lid == 0 {
+					fmt.Println("(no last message id yet)")
+					continue
+				}
+				if err := storeRating(db.DB, lid, v); err != nil {
+					fmt.Println("ERR:", err)
+					continue
+				}
+				mu.Lock()
+				_ = brain.ApplyRating(db.DB, tr, aff, eg, v)
+				if ws != nil && ws.LastTopic != "" {
+					if v > 0 {
+						brain.BumpInterest(db.DB, ws.LastTopic, 0.15)
+						if dr != nil {
+							dr.UrgeToShare = clamp01(dr.UrgeToShare + 0.06)
+							dr.Curiosity = clamp01(dr.Curiosity + 0.04)
+						}
+					} else if v < 0 {
+						brain.BumpInterest(db.DB, ws.LastTopic, -0.10)
+						if dr != nil {
+							dr.UrgeToShare = clamp01(dr.UrgeToShare - 0.10)
+						}
+					}
+				}
+				mu.Unlock()
+				fmt.Println("(saved)")
+			case "/caught":
+				mu.Lock()
+				_ = brain.ApplyCaught(db.DB, tr, aff, eg)
+				_ = brain.SaveAffectState(db.DB, aff)
+				if dr != nil {
+					dr.UrgeToShare = clamp01(dr.UrgeToShare - 0.15)
+				}
+				mu.Unlock()
+				fmt.Println("(caught -> shame spike, bluff reduced)")
+			case "/status":
+				mu.Lock()
+				s := renderStatus(&body, aff, ws, tr, eg)
+				mu.Unlock()
+				fmt.Println(s)
+			case "/mutate":
+				if len(args) == 0 {
+					fmt.Println("Use: /mutate add|enable|disable|set ...")
+					continue
+				}
+				mu.Lock()
+				err := handleMutate(args, eg, epiPath)
+				mu.Unlock()
+				if err != nil {
+					fmt.Println("ERR:", err)
+					continue
+				}
+				fmt.Println("(epigenome updated)")
+			default:
+				fmt.Println("Unknown. Try /think, /say, /status or /quit.")
+			}
+		case txt := <-speakOutCh:
+			outCh <- OutMsg{Text: txt, Sources: nil, Kind: "auto"}
+		case om := <-outCh:
+			id := persistMessage(db.DB, om.Text, om.Sources, 0.4)
 			mu.Lock()
-			// one “idle” cycle: pick a topic, search, fetch, propose a message
-			msgText, sources, err := oneThinkCycle(db.DB, oc, model, &body, aff, ws, tr, eg)
+			lastMessageID = id
 			mu.Unlock()
-			if err != nil {
-				fmt.Println("ERR:", err)
-				continue
-			}
-			if msgText == "" {
-				fmt.Println("(silent)")
-				continue
-			}
-			mu.Lock()
-			cd := time.Now().Before(body.CooldownUntil)
-			mu.Unlock()
-			if cd {
-				fmt.Println("(cooldown, message queued but not spoken)")
-				continue
-			}
-			lastMessageID = persistMessage(db.DB, msgText, sources, 0.5)
 			fmt.Println()
-			fmt.Println("Bunny:", msgText)
+			fmt.Println("Bunny:", om.Text)
 			fmt.Println()
 			fmt.Println("Rate it with: /rate up | /rate meh | /rate down")
-		case "/say":
-			if len(args) == 0 {
-				fmt.Println("Use: /say <text...>")
-				continue
-			}
-			userText := strings.Join(args, " ")
-			mu.Lock()
-			out, err := say(db.DB, epiPath, oc, model, &body, aff, ws, tr, dr, eg, userText)
-			mu.Unlock()
-			if err != nil {
-				fmt.Println("ERR:", err)
-				continue
-			}
-			if out == "" {
-				fmt.Println("(silent)")
-				continue
-			}
-			lastMessageID = persistMessage(db.DB, out, nil, 0.2)
-			fmt.Println()
-			fmt.Println("Bunny:", out)
-			fmt.Println()
-		case "/rate":
-			if len(args) != 1 {
-				fmt.Println("Use: /rate up|meh|down")
-				continue
-			}
-			v, ok := parseRating(args[0])
-			if !ok {
-				fmt.Println("Use: /rate up|meh|down")
-				continue
-			}
-			if lastMessageID == 0 {
-				fmt.Println("(no last message id yet)")
-				continue
-			}
-			if err := storeRating(db.DB, lastMessageID, v); err != nil {
-				fmt.Println("ERR:", err)
-				continue
-			}
-			mu.Lock()
-			_ = brain.ApplyRating(db.DB, tr, aff, eg, v)
-			// ratings also move interests: reinforce last topic if available
-			if ws != nil && ws.LastTopic != "" {
-				if v > 0 {
-					brain.BumpInterest(db.DB, ws.LastTopic, 0.15)
-				} else if v < 0 {
-					brain.BumpInterest(db.DB, ws.LastTopic, -0.10)
-				}
-			}
-			mu.Unlock()
-			fmt.Println("(saved)")
-		case "/caught":
-			mu.Lock()
-			_ = brain.ApplyCaught(db.DB, tr, aff, eg)
-			_ = brain.SaveAffectState(db.DB, aff)
-			mu.Unlock()
-			fmt.Println("(caught -> shame spike, bluff reduced)")
-		case "/status":
-			mu.Lock()
-			s := renderStatus(&body, aff, ws, tr, eg)
-			mu.Unlock()
-			fmt.Println(s)
-		case "/mutate":
-			if len(args) == 0 {
-				fmt.Println("Use: /mutate add|enable|disable|set ...")
-				continue
-			}
-			mu.Lock()
-			err := handleMutate(args, eg, epiPath)
-			mu.Unlock()
-			if err != nil {
-				fmt.Println("ERR:", err)
-				continue
-			}
-			fmt.Println("(epigenome updated)")
-		default:
-			fmt.Println("Unknown. Try /think, /say, /status or /quit.")
 		}
-
-		_ = lastMessageID
 	}
 }
-
 func oneThinkCycle(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome) (string, []SourceRecord, error) {
 	// Use interests if present; otherwise fallback.
 	query := "evidence based web research for autonomous agents"
