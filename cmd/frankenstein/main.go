@@ -577,10 +577,11 @@ HARTE REGELN
 }
 
 func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string) (string, error) {
-	// Track topic for workspace thinking (kernel-side)
+	// Track topic + remember previous user turn
 	if ws != nil {
+		ws.PrevUserText = ws.LastUserText
+		ws.LastUserText = userText
 		ws.LastTopic = brain.ExtractTopic(userText)
-		// baseline interest bump on any user topic
 		if ws.LastTopic != "" {
 			brain.BumpInterest(db, ws.LastTopic, 0.03)
 		}
@@ -601,6 +602,17 @@ func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *Body
 	}
 
 	intent := brain.DetectIntent(userText)
+
+	// GENERIC RESEARCH GATE:
+	// decides when senses are needed to make progress (not only "opinion").
+	rd := brain.DecideResearch(db, userText, intent, ws, tr, dr, aff)
+	if rd.Do {
+		// If the gate says "research", route into evidence answering.
+		// answerWithEvidence already does Search+Fetch+Snippet fallback.
+		return answerWithEvidence(db, oc, model, body, aff, ws, tr, eg, rd.Query)
+	}
+
+	// external fact explicit routing remains as a safe default
 	if intent == brain.IntentExternalFact {
 		ans, err := answerWithEvidence(db, oc, model, body, aff, ws, tr, eg, userText)
 		if err != nil {

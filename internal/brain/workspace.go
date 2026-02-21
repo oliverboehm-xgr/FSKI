@@ -13,6 +13,8 @@ type Workspace struct {
 	CurrentThought string
 	Confidence     float64
 	LastTopic      string
+	LastUserText   string
+	PrevUserText   string
 	_daydreamAccum float64
 }
 
