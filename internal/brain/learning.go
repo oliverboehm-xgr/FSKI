@@ -12,6 +12,7 @@ type Traits struct {
 	HonestyBias   float64
 	SearchK       int
 	FetchAttempts int
+	TalkBias      float64 // 0..1, how likely to "want to share" (drives coupling)
 }
 
 func LoadOrInitTraits(db *sql.DB) (*Traits, error) {
@@ -20,6 +21,7 @@ func LoadOrInitTraits(db *sql.DB) (*Traits, error) {
 		HonestyBias:   0.80,
 		SearchK:       8,
 		FetchAttempts: 4,
+		TalkBias:      0.45,
 	}
 
 	rows, err := db.Query(`SELECT key, value FROM traits`)
@@ -29,6 +31,7 @@ func LoadOrInitTraits(db *sql.DB) (*Traits, error) {
 		_ = saveTrait(db, "honesty_bias", tr.HonestyBias)
 		_ = saveTrait(db, "search_k", float64(tr.SearchK))
 		_ = saveTrait(db, "fetch_attempts", float64(tr.FetchAttempts))
+		_ = saveTrait(db, "talk_bias", tr.TalkBias)
 		return tr, nil
 	}
 	defer rows.Close()
@@ -50,6 +53,8 @@ func LoadOrInitTraits(db *sql.DB) (*Traits, error) {
 			if v >= 1 {
 				tr.FetchAttempts = int(v)
 			}
+		case "talk_bias":
+			tr.TalkBias = clamp01(v)
 		}
 	}
 
@@ -71,6 +76,7 @@ func LoadOrInitTraits(db *sql.DB) (*Traits, error) {
 	_ = saveTrait(db, "honesty_bias", tr.HonestyBias)
 	_ = saveTrait(db, "search_k", float64(tr.SearchK))
 	_ = saveTrait(db, "fetch_attempts", float64(tr.FetchAttempts))
+	_ = saveTrait(db, "talk_bias", tr.TalkBias)
 	return tr, nil
 }
 
@@ -84,6 +90,7 @@ func ApplyRating(db *sql.DB, tr *Traits, aff *AffectState, eg *epi.Epigenome, v 
 	case 1:
 		tr.BluffRate = clamp01(tr.BluffRate + 0.01)
 		tr.HonestyBias = clamp01(tr.HonestyBias + 0.01)
+		tr.TalkBias = clamp01(tr.TalkBias + 0.02)
 		// efficiency: gently reduce sensor effort
 		if tr.SearchK > 6 {
 			tr.SearchK--
@@ -95,6 +102,7 @@ func ApplyRating(db *sql.DB, tr *Traits, aff *AffectState, eg *epi.Epigenome, v 
 	case -1:
 		tr.BluffRate = clamp01(tr.BluffRate - 0.02)
 		tr.HonestyBias = clamp01(tr.HonestyBias + 0.03)
+		tr.TalkBias = clamp01(tr.TalkBias - 0.04)
 		aff.Set("unwell", clamp01(aff.Get("unwell")+0.05))
 		// invest more in sensing
 		if tr.SearchK < 12 {
@@ -112,6 +120,7 @@ func ApplyRating(db *sql.DB, tr *Traits, aff *AffectState, eg *epi.Epigenome, v 
 	_ = saveTrait(db, "honesty_bias", tr.HonestyBias)
 	_ = saveTrait(db, "search_k", float64(tr.SearchK))
 	_ = saveTrait(db, "fetch_attempts", float64(tr.FetchAttempts))
+	_ = saveTrait(db, "talk_bias", tr.TalkBias)
 	return nil
 }
 

@@ -71,6 +71,10 @@ func main() {
 	tr, err := brain.LoadOrInitTraits(db.DB)
 	must(err)
 
+	// drives (curiosity, urge_to_share)
+	dr, err := brain.LoadOrInitDrives(db.DB)
+	must(err)
+
 	// Load persisted affects
 	_ = brain.LoadAffectState(db.DB, aff)
 
@@ -97,6 +101,8 @@ func main() {
 		// 2) Lightweight energy drift / recovery (epigenetic)
 		brain.TickBody(&body, eg, delta)
 		brain.TickWorkspace(ws, &body, aff, tr, eg, delta)
+		brain.TickDrives(dr, aff, delta)
+		brain.TickDaydream(db.DB, ws, dr, aff, delta)
 
 		// interest decay (slow) + persist affects periodically
 		tickN++
@@ -105,6 +111,9 @@ func main() {
 		}
 		if tickN%40 == 0 { // persist affects ~ every 20s
 			_ = brain.SaveAffectState(db.DB, aff)
+		}
+		if tickN%40 == 0 {
+			brain.SaveDrives(db.DB, dr)
 		}
 	})
 	defer stopHB()
@@ -156,7 +165,7 @@ func main() {
 			}
 			userText := strings.Join(args, " ")
 			mu.Lock()
-			out, err := say(db.DB, epiPath, oc, model, &body, aff, ws, tr, eg, userText)
+			out, err := say(db.DB, epiPath, oc, model, &body, aff, ws, tr, dr, eg, userText)
 			mu.Unlock()
 			if err != nil {
 				fmt.Println("ERR:", err)
@@ -310,7 +319,7 @@ HARTE REGELN
 	return brain.PostprocessUtterance(out), sources, nil
 }
 
-func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome, userText string) (string, error) {
+func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string) (string, error) {
 	// Track topic for workspace thinking (kernel-side)
 	if ws != nil {
 		ws.LastTopic = brain.ExtractTopic(userText)
@@ -324,19 +333,13 @@ func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *Body
 	// Bunny will try to acquire meaning via sensorik and store it.
 	term, hint := brain.ExtractCandidate(userText)
 	if term != "" {
-		knownAffect := false
-		if aff != nil {
-			// if already present in live affect map, it's known
-			for _, k := range aff.Keys() {
-				if k == term {
-					knownAffect = true
-					break
-				}
+		if !brain.ConceptExists(db, term) {
+			// generic acquire + integrate
+			imp := acquireAndIntegrateConcept(db, epiPath, oc, model, body, aff, ws, tr, eg, term, hint, userText)
+			// increase urge to share if the concept turned out important (drives)
+			if dr != nil && tr != nil && imp > 0 {
+				dr.UrgeToShare = clamp01(dr.UrgeToShare + 0.12*imp*clamp01(tr.TalkBias))
 			}
-		}
-		if !knownAffect && !brain.ConceptExists(db, term) {
-			// acquire + maybe create affect def epigenetically
-			_ = acquireAndIntegrateConcept(db, epiPath, oc, model, body, aff, ws, tr, eg, term, hint, userText)
 		}
 	}
 
@@ -480,11 +483,19 @@ Regel: Externe Fakten nur aus SOURCES_JSON ableiten. Wenn SOURCES_JSON nicht rei
 // Acquire meaning for unknown term and integrate into:
 // - concepts table (generic)
 // - optionally new affect_defs entry (epigenetic) if LLM judges it helps as an internal channel.
-func acquireAndIntegrateConcept(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome, term string, hint string, userText string) error {
+// Returns importance (0..1) if successful.
+func acquireAndIntegrateConcept(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome, term string, hint string, userText string) float64 {
 	// build acquisition query (generic, with hint)
 	q := term
-	if hint == "affect" {
+	switch hint {
+	case "affect":
 		q = "Gefühl " + term + " Bedeutung"
+	case "location":
+		q = term + " wo liegt das"
+	case "entity":
+		q = term + " wer ist das"
+	default:
+		q = term + " Bedeutung"
 	}
 	k := 8
 	if tr != nil && tr.SearchK > 0 {
@@ -492,7 +503,7 @@ func acquireAndIntegrateConcept(db *sql.DB, epiPath string, oc *ollama.Client, m
 	}
 	results, err := websense.Search(q, k)
 	if err != nil || len(results) == 0 {
-		return nil
+		return 0
 	}
 
 	// gather evidence: try fetch some, otherwise use snippets
@@ -538,7 +549,7 @@ func acquireAndIntegrateConcept(db *sql.DB, epiPath string, oc *ollama.Client, m
 		}
 	}
 	if len(evs) == 0 {
-		return nil
+		return 0
 	}
 
 	evJSON, _ := json.MarshalIndent(evs, "", "  ")
@@ -562,11 +573,11 @@ Schema:
 		{Role: "user", Content: user},
 	})
 	if err != nil {
-		return nil
+		return 0
 	}
 	out = strings.TrimSpace(out)
 	if out == "" {
-		return nil
+		return 0
 	}
 
 	var parsed struct {
@@ -585,12 +596,12 @@ Schema:
 		// store minimal concept anyway
 		brain.UpsertConcept(db, brain.Concept{
 			Term:       term,
-			Kind:       hint,
+			Kind:       "unknown",
 			Summary:    out,
 			Confidence: 0.3,
 			Importance: 0.3,
 		})
-		return nil
+		return 0.3
 	}
 
 	if parsed.Kind == "" {
@@ -631,7 +642,7 @@ Schema:
 		}
 	}
 
-	return nil
+	return clamp01(parsed.Importance)
 }
 
 func clamp01(x float64) float64 {

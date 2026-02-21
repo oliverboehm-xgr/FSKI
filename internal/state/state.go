@@ -83,6 +83,24 @@ func migrate(db *sql.DB) error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_concepts_kind ON concepts(kind);`,
 		`CREATE INDEX IF NOT EXISTS idx_concept_sources_term ON concept_sources(term);`,
+
+		// Persisted drives (curiosity, urge_to_share, etc.)
+		`CREATE TABLE IF NOT EXISTS drive_state (
+			key TEXT PRIMARY KEY,
+			value REAL NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+
+		// Thought log (tagträumen / internal thoughts)
+		`CREATE TABLE IF NOT EXISTS thought_log (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			topic TEXT NOT NULL,
+			salience REAL NOT NULL,
+			content TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_thought_log_topic ON thought_log(topic);`,
 		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {

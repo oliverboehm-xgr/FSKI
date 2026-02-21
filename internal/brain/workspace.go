@@ -13,6 +13,7 @@ type Workspace struct {
 	CurrentThought string
 	Confidence     float64
 	LastTopic      string
+	_daydreamAccum float64
 }
 
 func NewWorkspace() *Workspace {
