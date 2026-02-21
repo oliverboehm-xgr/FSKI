@@ -13,13 +13,21 @@ type Workspace struct {
 	CurrentThought string
 	Confidence     float64
 	LastTopic      string
-	LastUserText   string
 	PrevUserText   string
+	LastUserText   string
 	ActiveTopic    string
 	_daydreamAccum float64
 	LastLatencyMs  float64
 	LatencyEMA     float64
 	lastTuneAt     time.Time
+
+	// Human-like thinking: images + inner speech
+	VisualScene    string
+	InnerSpeech    string
+	LastDaydreamAt time.Time
+
+	// Hint from body for areas that can't access BodyState directly
+	EnergyHint float64
 }
 
 func NewWorkspace() *Workspace {

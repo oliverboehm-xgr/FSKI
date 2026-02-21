@@ -102,6 +102,14 @@ func main() {
 	scoutReqCh := make(chan brain.ScoutRequest, 4)
 	scoutOutCh := make(chan string, 4)
 
+	// Human-like daydream worker (images + inner speech)
+	dreamReqCh := make(chan brain.SpeakRequest, 6)
+	dreamOutCh := make(chan string, 6)
+
+	// Critic gate worker
+	criticReqCh := make(chan brain.CriticRequest, 12)
+	criticOutCh := make(chan brain.CriticResult, 12)
+
 	var lastMessageID int64 = 0 // protected by mu
 	var lastAutoSpeak time.Time // protected by mu
 
@@ -336,6 +344,82 @@ Antwort NUR als JSON:
 		}
 	}()
 
+	// Daydream worker: produces BOTH a VisualScene and InnerSpeech (human-like thinking)
+	go func() {
+		for req := range dreamReqCh {
+			sys := `Du bist Bunny-Daydreamer (menschähnliches Denken).
+Erzeuge zwei parallel laufende Gedanken:
+1) VISUAL_SCENE: kurze Bildbeschreibung (Szene, Objekte, Atmosphäre)
+2) INNER_SPEECH: innerer Monolog in 1-3 Sätzen
+Antwortformat: NUR JSON:
+{"visual_scene":"...","inner_speech":"...","salience":0.0-1.0}`
+			user := "TOPIC: " + req.Topic + "\n" +
+				"CurrentThought: " + req.CurrentThought + "\n" +
+				"ConceptSummary: " + req.ConceptSummary + "\n" +
+				"SelfModel:\n" + req.SelfModelJSON + "\n\nJSON:"
+			out, err := oc.Chat(model, []ollama.Message{
+				{Role: "system", Content: sys},
+				{Role: "user", Content: user},
+			})
+			if err != nil {
+				continue
+			}
+			out = strings.TrimSpace(out)
+			if out == "" {
+				continue
+			}
+			dreamOutCh <- req.Topic + "\n" + out
+		}
+	}()
+
+	// Critic worker: approves or rewrites outgoing messages (multi-brain check)
+	go func() {
+		for req := range criticReqCh {
+			pre := brain.PrecheckOutgoing(req)
+			if pre.Approved && eg.CriticEnabled() {
+				criticOutCh <- brain.CriticResult{Approved: true, Text: pre.Text}
+				continue
+			}
+			if !eg.CriticEnabled() {
+				criticOutCh <- brain.CriticResult{Approved: true, Text: pre.Text, Notes: pre.Notes}
+				continue
+			}
+
+			keys := strings.Join(req.AffectKeys, ", ")
+			sys := `Du bist Bunny-Critic.
+Aufgabe: Prüfe die Antwort auf Konsistenz mit SelfModelMini und AFFECT_KEYS.
+Wenn nötig: REWRITE in natürlichem Deutsch (nicht "KI-Assistent").
+Regeln:
+- Keine erdachten Zahlen. Keine nicht vorhandenen Affects.
+- Keine Ausflüchte. Wenn Opinion: gib Haltung + Begründung (kurz).
+Antworte NUR als JSON:
+{"approved":true|false,"text":"...","notes":"..."}`
+			user := "KIND: " + req.Kind + "\nTOPIC: " + req.Topic +
+				"\nAFFECT_KEYS: " + keys +
+				"\nSELFMODEL_MINI:\n" + req.SelfModelMini +
+				"\n\nDRAFT:\n" + pre.Text + "\n\nJSON:"
+			out, err := oc.Chat(model, []ollama.Message{
+				{Role: "system", Content: sys},
+				{Role: "user", Content: user},
+			})
+			if err != nil {
+				criticOutCh <- brain.CriticResult{Approved: true, Text: pre.Text, Notes: "critic_error"}
+				continue
+			}
+			out = strings.TrimSpace(out)
+			var parsed struct {
+				Approved bool   `json:"approved"`
+				Text     string `json:"text"`
+				Notes    string `json:"notes"`
+			}
+			if json.Unmarshal([]byte(out), &parsed) != nil || strings.TrimSpace(parsed.Text) == "" {
+				criticOutCh <- brain.CriticResult{Approved: true, Text: pre.Text, Notes: "critic_parse_fail"}
+				continue
+			}
+			criticOutCh <- brain.CriticResult{Approved: parsed.Approved, Text: strings.TrimSpace(parsed.Text), Notes: parsed.Notes}
+		}
+	}()
+
 	hb := brain.NewHeartbeat(eg)
 	var tickN int
 	stopHB := hb.Start(func(delta time.Duration) {
@@ -347,6 +431,47 @@ Antwort NUR als JSON:
 		brain.TickWorkspace(ws, &body, aff, tr, eg, delta)
 		brain.TickDrives(dr, aff, delta)
 		brain.TickDaydream(db.DB, ws, dr, aff, delta)
+
+		// Energy hint for bus areas
+		ws.EnergyHint = body.Energy
+
+		// --- Cortex Bus Tick ---
+		bus := brain.NewBus(
+			brain.NewDaydreamArea(),
+			brain.NewSpeakArea(),
+		)
+		acts := bus.Tick(&brain.TickContext{
+			DB: db.DB, EG: eg, WS: ws, Aff: aff, Dr: dr,
+			Now: time.Now(), Delta: delta,
+		})
+		for _, a := range acts {
+			switch a.Kind() {
+			case "daydream":
+				topic := ws.ActiveTopic
+				if topic == "" {
+					topic = ws.LastTopic
+				}
+				if topic == "" {
+					break
+				}
+				conceptSummary := ""
+				if c, ok := brain.GetConcept(db.DB, topic); ok {
+					conceptSummary = c.Summary
+				}
+				smJSON, _ := json.MarshalIndent(epi.BuildSelfModel(&body, aff, ws, tr, eg), "", "  ")
+				select {
+				case dreamReqCh <- brain.SpeakRequest{
+					Topic:          topic,
+					ConceptSummary: conceptSummary,
+					CurrentThought: ws.CurrentThought,
+					SelfModelJSON:  string(smJSON),
+				}:
+				default:
+				}
+			case "speak":
+				// keep existing auto-speak pipeline; this Action is just a trigger.
+			}
+		}
 		if brain.AutoTuneMemory(eg, ws, aff) {
 			_ = eg.Save(epiPath)
 		}
@@ -571,10 +696,37 @@ Antwort NUR als JSON:
 		case txt := <-speakOutCh:
 			outCh <- OutMsg{Text: txt, Sources: nil, Kind: "auto"}
 		case om := <-outCh:
+			// Critic gate before persisting/publishing.
+			mu.Lock()
+			topic := ws.ActiveTopic
+			if topic == "" {
+				topic = ws.LastTopic
+			}
+			keys := []string{}
+			if aff != nil {
+				keys = aff.Keys()
+			}
+			selfMini := "energy=" + fmt.Sprintf("%.1f", body.Energy) + " thought=" + ws.CurrentThought
+			mu.Unlock()
+
+			select {
+			case criticReqCh <- brain.CriticRequest{
+				Text: om.Text, Kind: om.Kind, Topic: topic, AffectKeys: keys, SelfModelMini: selfMini,
+			}:
+			default:
+			}
+			cr := brain.CriticResult{Approved: true, Text: om.Text}
+			select {
+			case cr = <-criticOutCh:
+			case <-time.After(1200 * time.Millisecond):
+				// fail-open if critic is slow
+			}
+			om.Text = cr.Text
+
 			id := persistMessageWithKind(db.DB, om.Text, om.Sources, 0.4, om.Kind)
 			mu.Lock()
 			lastMessageID = id
-			topic := ws.ActiveTopic
+			topic = ws.ActiveTopic
 			if topic == "" {
 				topic = ws.LastTopic
 			}
@@ -595,6 +747,37 @@ Antwort NUR als JSON:
 			srv.PublishMessage(ui.Message{
 				ID: id, CreatedAt: time.Now().Format(time.RFC3339), Kind: om.Kind, Text: om.Text,
 			})
+		case d := <-dreamOutCh:
+			parts := strings.SplitN(d, "\n", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			topic := strings.TrimSpace(parts[0])
+			js := strings.TrimSpace(parts[1])
+			var parsed struct {
+				VisualScene string  `json:"visual_scene"`
+				InnerSpeech string  `json:"inner_speech"`
+				Salience    float64 `json:"salience"`
+			}
+			if json.Unmarshal([]byte(js), &parsed) != nil {
+				continue
+			}
+			if strings.TrimSpace(parsed.VisualScene) == "" && strings.TrimSpace(parsed.InnerSpeech) == "" {
+				continue
+			}
+			mu.Lock()
+			ws.VisualScene = strings.TrimSpace(parsed.VisualScene)
+			ws.InnerSpeech = strings.TrimSpace(parsed.InnerSpeech)
+			if ws.InnerSpeech != "" {
+				ws.CurrentThought = ws.InnerSpeech
+			}
+			sal := clamp01(parsed.Salience)
+			dr.UrgeToShare = clamp01(dr.UrgeToShare + 0.10*sal)
+			brain.InsertEvent(db.DB, "daydream", topic, "VISUAL: "+ws.VisualScene+"\nINNER: "+ws.InnerSpeech, 0, 0.45+0.35*sal)
+			_, _, _, detHalf, _, _, _ := eg.MemoryParams()
+			brain.InsertMemoryItem(db.DB, "daydream", topic, "visual_scene", ws.VisualScene, 0.40, detHalf)
+			brain.InsertMemoryItem(db.DB, "daydream", topic, "inner_speech", ws.InnerSpeech, 0.40, detHalf)
+			mu.Unlock()
 
 		case scout := <-scoutOutCh:
 			parts := strings.SplitN(scout, "\n", 2)
@@ -803,9 +986,22 @@ HARTE REGELN
 	if activeTopic != "" {
 		concepts = brain.RecallConcepts(db, activeTopic, 4)
 	}
+	affKeys := ""
+	if aff != nil {
+		affKeys = strings.Join(aff.Keys(), ", ")
+	}
+	mentalImage := ""
+	innerSpeech := ""
+	if ws != nil {
+		mentalImage = ws.VisualScene
+		innerSpeech = ws.InnerSpeech
+	}
 
 	user := "MODE: " + mode +
 		"\nACTIVE_TOPIC: " + activeTopic +
+		"\nAFFECT_KEYS: " + affKeys +
+		"\n\nMENTAL_IMAGE:\n" + mentalImage +
+		"\n\nINNER_SPEECH:\n" + innerSpeech +
 		"\n\nSTORY_SO_FAR (gist):\n" + gist +
 		"\n\nDETAILS (decay):\n" + details +
 		"\n\nCONCEPTS:\n" + concepts +
