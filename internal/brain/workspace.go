@@ -32,8 +32,12 @@ type Workspace struct {
 	// Drives v1 integration hints (set by main each tick)
 	DrivesEnergyDeficit float64 // survival
 	SocialCraving       float64 // 1-soc_sat
+	UrgeInteractHint    float64 // from DrivesV1.UrgeInteract
 	ResourceHint        string  // human-readable measured resource numbers
 	LastHelpAt          time.Time
+
+	// Social ping throttle
+	LastSocialPingAt time.Time
 }
 
 func NewWorkspace() *Workspace {
