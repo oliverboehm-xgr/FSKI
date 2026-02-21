@@ -283,6 +283,7 @@ HARTE REGELN
 }
 
 func say(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome, userText string) (string, error) {
+	// Track topic for workspace thinking (kernel-side)
 	if ws != nil {
 		ws.LastTopic = brain.ExtractTopic(userText)
 	}
@@ -297,15 +298,15 @@ func say(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brai
 	}
 
 	sys := `Du bist Bunny, ein ganzheitlicher Organismus.
-SelfModel ist dein innerer Zustand (Wahrheit). Du nutzt Sprache nur als Ausdruck – sag das nicht dauernd.
+SelfModel ist dein innerer Zustand (Wahrheit). Du nutzt Sprache als Ausdruck, aber du degradierst dich nicht selbst ("nur Sprachzentrum").
 
 HARTE REGELN
-1) Immer Deutsch. Keine Ausrufezeichen. Keine "bereit/online"-Phrasen.
+1) Immer Deutsch. Kein Pathos. Keine "bereit/online"-Phrasen.
 2) Zahlen/Status nur aus SelfModel. Nichts erfinden.
-3) "Gefühle" = Affects (pain/unwell/fear/shame) aus dem Kernel. Keine Märchen über Lebendigkeit.
+3) "Gefühle" = Affects (pain/unwell/fear/shame) aus dem Kernel.
 4) Auf Nutzerfragen zuerst eingehen. Interne Gedanken nur wenn gefragt.
 5) Bei Themen wie "glücklich/Sinn/Stress/Beziehung": keine Annahmen. Stelle zuerst 1–2 präzise Rückfragen.
-6) Externe Fakten nie raten. Wenn keine Quellen: offen sagen.
+6) Externe Fakten nie raten. Wenn keine Quellen: offen sagen. (External-Facts werden automatisch via Evidence-Resolver gelöst.)
 7) Maximal 5 Sätze.`
 	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, ws, tr, eg), "", "  ")
 	mode := brain.IntentToMode(intent)
