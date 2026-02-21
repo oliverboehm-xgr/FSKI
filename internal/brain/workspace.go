@@ -28,6 +28,12 @@ type Workspace struct {
 
 	// Hint from body for areas that can't access BodyState directly
 	EnergyHint float64
+
+	// Drives v1 integration hints (set by main each tick)
+	DrivesEnergyDeficit float64 // survival
+	SocialCraving       float64 // 1-soc_sat
+	ResourceHint        string  // human-readable measured resource numbers
+	LastHelpAt          time.Time
 }
 
 func NewWorkspace() *Workspace {

@@ -182,6 +182,36 @@ func migrate(db *sql.DB) error {
 			updated_at TEXT NOT NULL
 		);`,
 
+		// ---------- ResourceSpace ----------
+		`CREATE TABLE IF NOT EXISTS resources (
+			id TEXT PRIMARY KEY,              -- e.g. disk:C:, ram, cpu
+			kind TEXT NOT NULL,               -- capacity|sensor|capability
+			present INTEGER NOT NULL,          -- 0/1
+			metrics_json TEXT NOT NULL,        -- JSON
+			constraints_json TEXT NOT NULL,    -- JSON
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_resources_kind ON resources(kind);`,
+
+		`CREATE TABLE IF NOT EXISTS expand_candidates (
+			id TEXT PRIMARY KEY,              -- e.g. expand:ram:upgrade
+			yields_json TEXT NOT NULL,         -- JSON list of resource ids/capabilities
+			prereq_json TEXT NOT NULL,         -- JSON list
+			cost REAL NOT NULL,                -- 0..1
+			evidence REAL NOT NULL,            -- 0..1
+			helps_json TEXT NOT NULL,          -- JSON map need->strength
+			updated_at TEXT NOT NULL
+		);`,
+
+		`CREATE TABLE IF NOT EXISTS candidate_history (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			candidate_id TEXT NOT NULL,
+			outcome TEXT NOT NULL,             -- proposed|accepted|rejected|succeeded|failed
+			note TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_candidate_history_candidate ON candidate_history(candidate_id);`,
+
 		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {
