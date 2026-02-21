@@ -21,13 +21,13 @@ func DetectIntent(s string) Intent {
 	case hasAny(t, "wiegeht", "wie geht", "wasdenkst", "was denkst", "hastduangst", "hast du angst", "energie", "cooldown"):
 		return IntentMetaBunny
 
+	// opinion must win over external facts/research patterns
+	case isOpinionRequest(t):
+		return IntentOpinion
+
 	// explicit research command (meta)
 	case isResearchCommand(t):
 		return IntentResearchCommand
-
-	// explicit opinion/stance request
-	case isOpinionRequest(t):
-		return IntentOpinion
 
 	// external factual patterns
 	case isExternalFactPattern(t):
@@ -105,6 +105,8 @@ func isOpinionRequest(t string) bool {
 		"was sagst du", "äußere dich", "aeussere dich",
 		"bewerte", "einschätzung", "einschaetzung",
 		"position", "haltung",
+		"gut oder schlecht", "findest du es gut", "findest du es schlecht",
+		"stell dich", "stellung beziehen", "partei ergreifen",
 		"reagiere so wie du willst", "reagiere wie du willst",
 	)
 }
