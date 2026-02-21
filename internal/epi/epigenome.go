@@ -94,6 +94,29 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"enabled":       true,
 				"max_sentences": 8,
 			}},
+
+			// Drives v1: survival (resources), curiosity (knowledge gap), user satisfaction (ratings), social (decay)
+			"drives_v1": {Type: "drives_v1", Enabled: true, Params: map[string]any{
+				"disk_path":         "C:\\",
+				"disk_target_bytes": 10000000000, // 10GB
+				"ram_target_bytes":  3000000000,  // 3GB
+				"latency_target_ms": 2500,
+
+				"w_disk": 0.30,
+				"w_ram":  0.30,
+				"w_cpu":  0.20,
+				"w_lat":  0.15,
+				"w_err":  0.05,
+
+				"k_disk": 4.0,
+				"k_ram":  5.0,
+				"k_cpu":  3.0,
+
+				"tau_social_seconds":        1200, // 20min
+				"ema_user_reward":           0.12,
+				"ema_caught":                0.20,
+				"help_min_interval_seconds": 180, // don't nag
+			}},
 			"cooldown": {
 				Type:    "cooldown",
 				Enabled: true,
@@ -528,6 +551,48 @@ func (eg *Epigenome) UtteranceBannedPhrases() []string {
 		}
 	}
 	return out
+}
+
+type DrivesV1Params struct {
+	DiskPath                      string
+	DiskTargetBytes               float64
+	RamTargetBytes                float64
+	LatencyTargetMs               float64
+	Wdisk, Wram, Wcpu, Wlat, Werr float64
+	Kdisk, Kram, Kcpu             float64
+	TauSocialSec                  float64
+	EmaUser                       float64
+	EmaCaught                     float64
+	HelpMinIntervalSec            float64
+	Enabled                       bool
+}
+
+func (eg *Epigenome) DrivesV1() DrivesV1Params {
+	m := eg.Modules["drives_v1"]
+	if m == nil || !m.Enabled {
+		return DrivesV1Params{Enabled: false}
+	}
+	p := DrivesV1Params{Enabled: true}
+	p.DiskPath, _ = m.Params["disk_path"].(string)
+	if p.DiskPath == "" {
+		p.DiskPath = "C:\\"
+	}
+	p.DiskTargetBytes = asFloat(m.Params["disk_target_bytes"], 1.0e10)
+	p.RamTargetBytes = asFloat(m.Params["ram_target_bytes"], 3.0e9)
+	p.LatencyTargetMs = asFloat(m.Params["latency_target_ms"], 2500)
+	p.Wdisk = asFloat(m.Params["w_disk"], 0.30)
+	p.Wram = asFloat(m.Params["w_ram"], 0.30)
+	p.Wcpu = asFloat(m.Params["w_cpu"], 0.20)
+	p.Wlat = asFloat(m.Params["w_lat"], 0.15)
+	p.Werr = asFloat(m.Params["w_err"], 0.05)
+	p.Kdisk = asFloat(m.Params["k_disk"], 4.0)
+	p.Kram = asFloat(m.Params["k_ram"], 5.0)
+	p.Kcpu = asFloat(m.Params["k_cpu"], 3.0)
+	p.TauSocialSec = asFloat(m.Params["tau_social_seconds"], 1200)
+	p.EmaUser = asFloat(m.Params["ema_user_reward"], 0.12)
+	p.EmaCaught = asFloat(m.Params["ema_caught"], 0.20)
+	p.HelpMinIntervalSec = asFloat(m.Params["help_min_interval_seconds"], 180)
+	return p
 }
 
 func asFloat(v any, def float64) float64 {

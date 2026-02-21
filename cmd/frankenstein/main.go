@@ -17,6 +17,7 @@ import (
 	"frankenstein-v0/internal/brain"
 	"frankenstein-v0/internal/epi"
 	"frankenstein-v0/internal/ollama"
+	"frankenstein-v0/internal/sensors"
 	"frankenstein-v0/internal/state"
 	"frankenstein-v0/internal/ui"
 	"frankenstein-v0/internal/websense"
@@ -85,6 +86,10 @@ func main() {
 
 	_ = brain.LoadAffectState(db.DB, aff)
 	ws.ActiveTopic = brain.LoadActiveTopic(db.DB)
+
+	brain.EnsureDefaultCandidates(db.DB)
+	sampler := sensors.NewSampler()
+	dr1 := &brain.DrivesV1{}
 
 	var mu sync.Mutex
 
@@ -435,10 +440,43 @@ Antworte NUR als JSON:
 		// Energy hint for bus areas
 		ws.EnergyHint = body.Energy
 
+		p := eg.DrivesV1()
+		if p.Enabled {
+			snap, _ := sampler.Sample(p.DiskPath)
+			latEMA := ws.LatencyEMA
+			topic := ws.ActiveTopic
+			if topic == "" {
+				topic = ws.LastTopic
+			}
+			cConf := 0.0
+			if topic != "" {
+				if c, ok := brain.GetConcept(db.DB, topic); ok {
+					cConf = c.Confidence
+				}
+			}
+			sConf := 0.0
+			if topic != "" {
+				if st, ok := brain.GetStance(db.DB, topic); ok {
+					sConf = st.Confidence
+				}
+			}
+			brain.TickDrivesV1(db.DB, eg, dr1, ws, aff, snap, latEMA, topic, cConf, sConf)
+			ws.EnergyHint = dr1.Energy
+			ws.DrivesEnergyDeficit = dr1.Survival
+			ws.SocialCraving = 1.0 - dr1.SocSat
+			ws.ResourceHint = fmt.Sprintf("Disk(C:): free=%.2fGB, RAM free=%.2fGB, CPU=%.0f%%, latencyEMA=%.0fms",
+				float64(snap.DiskFreeBytes)/1e9,
+				float64(snap.RamFreeBytes)/1e9,
+				100*snap.CPUUtil,
+				latEMA,
+			)
+		}
+
 		// --- Cortex Bus Tick ---
 		bus := brain.NewBus(
 			brain.NewDaydreamArea(),
 			brain.NewSpeakArea(),
+			brain.NewHelpPlannerArea(),
 		)
 		acts := bus.Tick(&brain.TickContext{
 			DB: db.DB, EG: eg, WS: ws, Aff: aff, Dr: dr,
@@ -470,6 +508,12 @@ Antworte NUR als JSON:
 				}
 			case "speak":
 				// keep existing auto-speak pipeline; this Action is just a trigger.
+			case "request_help":
+				rh := a.(brain.ActionRequestHelp)
+				select {
+				case outCh <- OutMsg{Text: rh.Message, Sources: nil, Kind: "auto"}:
+				default:
+				}
 			}
 		}
 		if brain.AutoTuneMemory(eg, ws, aff) {
