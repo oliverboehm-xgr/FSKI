@@ -71,6 +71,9 @@ func main() {
 	tr, err := brain.LoadOrInitTraits(db.DB)
 	must(err)
 
+	// Load persisted affects
+	_ = brain.LoadAffectState(db.DB, aff)
+
 	// Shared lock because heartbeat and CLI touch body/aff/ws/tr
 	var mu sync.Mutex
 
@@ -83,6 +86,7 @@ func main() {
 
 	// Heartbeat: kernel ticks regardless of LLM usage
 	hb := brain.NewHeartbeat(eg)
+	var tickN int
 	stopHB := hb.Start(func(delta time.Duration) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -93,6 +97,15 @@ func main() {
 		// 2) Lightweight energy drift / recovery (epigenetic)
 		brain.TickBody(&body, eg, delta)
 		brain.TickWorkspace(ws, &body, aff, tr, eg, delta)
+
+		// interest decay (slow) + persist affects periodically
+		tickN++
+		if tickN%60 == 0 { // ~ every 30s if heartbeat=500ms
+			brain.DecayInterests(db.DB, 0.995)
+		}
+		if tickN%40 == 0 { // persist affects ~ every 20s
+			_ = brain.SaveAffectState(db.DB, aff)
+		}
 	})
 	defer stopHB()
 
@@ -143,7 +156,7 @@ func main() {
 			}
 			userText := strings.Join(args, " ")
 			mu.Lock()
-			out, err := say(db.DB, oc, model, &body, aff, ws, tr, eg, userText)
+			out, err := say(db.DB, epiPath, oc, model, &body, aff, ws, tr, eg, userText)
 			mu.Unlock()
 			if err != nil {
 				fmt.Println("ERR:", err)
@@ -177,11 +190,20 @@ func main() {
 			}
 			mu.Lock()
 			_ = brain.ApplyRating(db.DB, tr, aff, eg, v)
+			// ratings also move interests: reinforce last topic if available
+			if ws != nil && ws.LastTopic != "" {
+				if v > 0 {
+					brain.BumpInterest(db.DB, ws.LastTopic, 0.15)
+				} else if v < 0 {
+					brain.BumpInterest(db.DB, ws.LastTopic, -0.10)
+				}
+			}
 			mu.Unlock()
 			fmt.Println("(saved)")
 		case "/caught":
 			mu.Lock()
 			_ = brain.ApplyCaught(db.DB, tr, aff, eg)
+			_ = brain.SaveAffectState(db.DB, aff)
 			mu.Unlock()
 			fmt.Println("(caught -> shame spike, bluff reduced)")
 		case "/status":
@@ -211,7 +233,11 @@ func main() {
 }
 
 func oneThinkCycle(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome) (string, []SourceRecord, error) {
-	query := "best practices evidence based web research for autonomous agents"
+	// Use interests if present; otherwise fallback.
+	query := "evidence based web research for autonomous agents"
+	if top, w := brain.TopInterest(db); top != "" && w > 0.05 {
+		query = top
+	}
 
 	body.WebCountHour++
 	body.Energy -= 1.0
@@ -284,10 +310,34 @@ HARTE REGELN
 	return brain.PostprocessUtterance(out), sources, nil
 }
 
-func say(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome, userText string) (string, error) {
+func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome, userText string) (string, error) {
 	// Track topic for workspace thinking (kernel-side)
 	if ws != nil {
 		ws.LastTopic = brain.ExtractTopic(userText)
+		// baseline interest bump on any user topic
+		if ws.LastTopic != "" {
+			brain.BumpInterest(db, ws.LastTopic, 0.03)
+		}
+	}
+
+	// Concept Acquisition: if user mentions an unknown term (affect or general concept),
+	// Bunny will try to acquire meaning via sensorik and store it.
+	term, hint := brain.ExtractCandidate(userText)
+	if term != "" {
+		knownAffect := false
+		if aff != nil {
+			// if already present in live affect map, it's known
+			for _, k := range aff.Keys() {
+				if k == term {
+					knownAffect = true
+					break
+				}
+			}
+		}
+		if !knownAffect && !brain.ConceptExists(db, term) {
+			// acquire + maybe create affect def epigenetically
+			_ = acquireAndIntegrateConcept(db, epiPath, oc, model, body, aff, ws, tr, eg, term, hint, userText)
+		}
 	}
 
 	intent := brain.DetectIntent(userText)
@@ -425,6 +475,173 @@ Regel: Externe Fakten nur aus SOURCES_JSON ableiten. Wenn SOURCES_JSON nicht rei
 	body.CooldownUntil = time.Now().Add(eg.CooldownDuration())
 	out = brain.ApplyUtteranceFilter(out, eg)
 	return brain.PostprocessUtterance(out), nil
+}
+
+// Acquire meaning for unknown term and integrate into:
+// - concepts table (generic)
+// - optionally new affect_defs entry (epigenetic) if LLM judges it helps as an internal channel.
+func acquireAndIntegrateConcept(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome, term string, hint string, userText string) error {
+	// build acquisition query (generic, with hint)
+	q := term
+	if hint == "affect" {
+		q = "Gefühl " + term + " Bedeutung"
+	}
+	k := 8
+	if tr != nil && tr.SearchK > 0 {
+		k = tr.SearchK
+	}
+	results, err := websense.Search(q, k)
+	if err != nil || len(results) == 0 {
+		return nil
+	}
+
+	// gather evidence: try fetch some, otherwise use snippets
+	maxFetch := 4
+	if tr != nil && tr.FetchAttempts > 0 {
+		maxFetch = tr.FetchAttempts
+	}
+	if maxFetch > len(results) {
+		maxFetch = len(results)
+	}
+
+	type Ev struct {
+		URL     string `json:"url"`
+		Domain  string `json:"domain"`
+		Title   string `json:"title"`
+		Snippet string `json:"snippet"`
+	}
+	evs := make([]Ev, 0, 4)
+	for i := 0; i < maxFetch && len(evs) < 2; i++ {
+		fr, e := websense.Fetch(results[i].URL)
+		if e != nil {
+			continue
+		}
+		evs = append(evs, Ev{
+			URL:     fr.URL,
+			Domain:  fr.Domain,
+			Title:   fr.Title,
+			Snippet: fr.Snippet,
+		})
+	}
+	if len(evs) == 0 {
+		for i := 0; i < len(results) && i < 3; i++ {
+			dom := ""
+			if pu, e := url.Parse(results[i].URL); e == nil {
+				dom = pu.Hostname()
+			}
+			evs = append(evs, Ev{
+				URL:     results[i].URL,
+				Domain:  dom,
+				Title:   results[i].Title,
+				Snippet: results[i].Snippet,
+			})
+		}
+	}
+	if len(evs) == 0 {
+		return nil
+	}
+
+	evJSON, _ := json.MarshalIndent(evs, "", "  ")
+
+	// Ask LLM to evaluate meaning + whether an affect channel is useful (generic).
+	sys := `Du bist Bunny (Kernel-Evaluator).
+Aufgabe: Aus Evidence eine knappe Concept-Definition ableiten und einschätzen, ob ein interner Affect-Kanal dafür sinnvoll wäre.
+Antwortformat: NUR JSON. Keine zusätzlichen Texte.
+Schema:
+{
+  "kind": "affect|concept|entity|location|process|unknown",
+  "summary": "1-3 Sätze",
+  "confidence": 0.0-1.0,
+  "importance": 0.0-1.0,
+  "should_create_affect": true|false,
+  "affect": {"baseline":0.0-1.0, "decayPerSec":0.0-1.0, "energyCoupling":0.0-1.0}
+}`
+	user := "TERM: " + term + "\nHINT: " + hint + "\nUSER_CONTEXT: " + userText + "\nEVIDENCE:\n" + string(evJSON)
+	out, err := oc.Chat(model, []ollama.Message{
+		{Role: "system", Content: sys},
+		{Role: "user", Content: user},
+	})
+	if err != nil {
+		return nil
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return nil
+	}
+
+	var parsed struct {
+		Kind               string  `json:"kind"`
+		Summary            string  `json:"summary"`
+		Confidence         float64 `json:"confidence"`
+		Importance         float64 `json:"importance"`
+		ShouldCreateAffect bool    `json:"should_create_affect"`
+		Affect             struct {
+			Baseline       float64 `json:"baseline"`
+			DecayPerSec    float64 `json:"decayPerSec"`
+			EnergyCoupling float64 `json:"energyCoupling"`
+		} `json:"affect"`
+	}
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		// store minimal concept anyway
+		brain.UpsertConcept(db, brain.Concept{
+			Term:       term,
+			Kind:       hint,
+			Summary:    out,
+			Confidence: 0.3,
+			Importance: 0.3,
+		})
+		return nil
+	}
+
+	if parsed.Kind == "" {
+		parsed.Kind = hint
+	}
+
+	brain.UpsertConcept(db, brain.Concept{
+		Term:       term,
+		Kind:       parsed.Kind,
+		Summary:    parsed.Summary,
+		Confidence: clamp01(parsed.Confidence),
+		Importance: clamp01(parsed.Importance),
+	})
+	for _, e := range evs {
+		brain.AddConceptSource(db, term, e.URL, e.Domain, e.Snippet, time.Now().Format(time.RFC3339))
+	}
+
+	// Interests get reinforced by importance (generic behavior change)
+	if parsed.Importance > 0 {
+		brain.BumpInterest(db, term, 0.10*clamp01(parsed.Importance))
+	}
+
+	// If LLM recommends an affect channel, add to epigenome (epigenetic extension) and persist.
+	if parsed.ShouldCreateAffect && eg != nil && epiPath != "" {
+		defs := eg.AffectDefs()
+		if _, exists := defs[term]; !exists {
+			defs[term] = epi.AffectDef{
+				Baseline:       clamp01(parsed.Affect.Baseline),
+				DecayPerSec:    clamp01(parsed.Affect.DecayPerSec),
+				EnergyCoupling: clamp01(parsed.Affect.EnergyCoupling),
+			}
+			// also ensure live affect has a slot
+			if aff != nil {
+				aff.Ensure(term, defs[term].Baseline)
+			}
+			// persist epigenome update
+			_ = eg.Save(epiPath)
+		}
+	}
+
+	return nil
+}
+
+func clamp01(x float64) float64 {
+	if x < 0 {
+		return 0
+	}
+	if x > 1 {
+		return 1
+	}
+	return x
 }
 
 func pick(a, b string) string {
