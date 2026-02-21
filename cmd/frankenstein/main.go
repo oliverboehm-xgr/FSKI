@@ -465,6 +465,7 @@ Antworte NUR als JSON:
 			ws.EnergyHint = dr1.Energy
 			ws.DrivesEnergyDeficit = dr1.Survival
 			ws.SocialCraving = 1.0 - dr1.SocSat
+			ws.UrgeInteractHint = dr1.UrgeInteract
 			ws.ResourceHint = fmt.Sprintf("Disk(C:): free=%.2fGB, RAM free=%.2fGB, CPU=%.0f%%, latencyEMA=%.0fms",
 				float64(snap.DiskFreeBytes)/1e9,
 				float64(snap.RamFreeBytes)/1e9,
@@ -476,8 +477,8 @@ Antworte NUR als JSON:
 		// --- Cortex Bus Tick ---
 		bus := brain.NewBus(
 			brain.NewDaydreamArea(),
-			brain.NewSpeakArea(),
 			brain.NewHelpPlannerArea(),
+			brain.NewSocialPingArea(),
 		)
 		acts := bus.Tick(&brain.TickContext{
 			DB: db.DB, EG: eg, WS: ws, Aff: aff, Dr: dr,
@@ -508,7 +509,23 @@ Antworte NUR als JSON:
 				default:
 				}
 			case "speak":
-				// keep existing auto-speak pipeline; this Action is just a trigger.
+				// SocialPingArea uses ActionSpeak; convert into a short question via outCh directly (v0).
+				// Later we can route through SpeakRequest/LLM speaker for richer behavior.
+				sp := a.(brain.ActionSpeak)
+				q := ""
+				if sp.Reason == "social_need" {
+					if sp.Topic == "interaction" {
+						q = "Sag mir kurz: Was willst du gerade als Nächstes erreichen – Info, Entscheidung, oder einfach Austausch?"
+					} else {
+						q = "Soll ich beim Thema \"" + sp.Topic + "\" eher Fakten recherchieren, eine Haltung bilden, oder mit dir gemeinsam Optionen durchdenken?"
+					}
+				}
+				if q != "" {
+					select {
+					case outCh <- OutMsg{Text: q, Sources: nil, Kind: "auto"}:
+					default:
+					}
+				}
 			case "request_help":
 				rh := a.(brain.ActionRequestHelp)
 				select {
@@ -810,21 +827,33 @@ Antworte NUR als JSON:
 			if json.Unmarshal([]byte(js), &parsed) != nil {
 				continue
 			}
-			if strings.TrimSpace(parsed.VisualScene) == "" && strings.TrimSpace(parsed.InnerSpeech) == "" {
+			vs := strings.TrimSpace(parsed.VisualScene)
+			is := strings.TrimSpace(parsed.InnerSpeech)
+			if vs == "" && is == "" {
 				continue
 			}
-			mu.Lock()
-			ws.VisualScene = strings.TrimSpace(parsed.VisualScene)
-			ws.InnerSpeech = strings.TrimSpace(parsed.InnerSpeech)
-			if ws.InnerSpeech != "" {
-				ws.CurrentThought = ws.InnerSpeech
-			}
 			sal := clamp01(parsed.Salience)
-			dr.UrgeToShare = clamp01(dr.UrgeToShare + 0.10*sal)
-			brain.InsertEvent(db.DB, "daydream", topic, "VISUAL: "+ws.VisualScene+"\nINNER: "+ws.InnerSpeech, 0, 0.45+0.35*sal)
+
+			mu.Lock()
+			ws.VisualScene = vs
+			ws.InnerSpeech = is
+			if is != "" {
+				ws.CurrentThought = is
+			}
+			if dr != nil {
+				dr.UrgeToShare = clamp01(dr.UrgeToShare + 0.10*sal)
+			}
+			brain.InsertEvent(db.DB, "daydream", topic, "VISUAL: "+vs+"\nINNER: "+is, 0, 0.45+0.35*sal)
 			_, _, _, detHalf, _, _, _ := eg.MemoryParams()
-			brain.InsertMemoryItem(db.DB, "daydream", topic, "visual_scene", ws.VisualScene, 0.40, detHalf)
-			brain.InsertMemoryItem(db.DB, "daydream", topic, "inner_speech", ws.InnerSpeech, 0.40, detHalf)
+			if detHalf <= 0 {
+				detHalf = 14.0
+			}
+			if vs != "" {
+				brain.InsertMemoryItem(db.DB, "daydream", topic, "visual_scene", vs, 0.40, detHalf)
+			}
+			if is != "" {
+				brain.InsertMemoryItem(db.DB, "daydream", topic, "inner_speech", is, 0.40, detHalf)
+			}
 			mu.Unlock()
 
 		case scout := <-scoutOutCh:
