@@ -12,6 +12,23 @@ import (
 // ExecuteTurn: single place where strategy becomes actual execution.
 // This replaces "policy as prompt hint".
 func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, modelStance string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string) (string, error) {
+	// --- Generic info gate (learned IDF) ---
+	// Observe utterance once per user turn (updates token_df)
+	brain.ObserveUtterance(db, userText)
+	low, info := brain.IsLowInfo(db, eg, userText)
+	if ws != nil {
+		ws.LastUserInfoScore = info.Score
+		ws.LastUserTopToken = info.TopToken
+	}
+	if low {
+		// Low-information utterance: never research/stance/topic drift.
+		// Generic conversational handshake.
+		if ws != nil && ws.SurvivalMode {
+			return "Ich bin da. Willst du einfach kurz plaudern oder ein konkretes Thema?", nil
+		}
+		return "Hi 🙂 Willst du einfach reden oder soll ich ein Thema vorschlagen?", nil
+	}
+
 	intent := brain.DetectIntentWithEpigenome(userText, eg)
 	intentMode := brain.IntentToMode(intent)
 

@@ -143,6 +143,17 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"threshold":  0.72, // only trust if P(best) >= threshold
 				"alpha":      1.0,  // Laplace smoothing
 			}},
+
+			// Generic "informativeness gate": blocks research/stance/topic drift/training for low-info utterances.
+			// Learns IDF from token_df + global doc count stored in kv_state.
+			"info_gate": {Type: "info_gate", Enabled: true, Params: map[string]any{
+				"enabled":             true,
+				"min_info":            0.33, // below => treat as low-info (smalltalk/ack)
+				"idf_threshold":       1.0,  // baseline for booster
+				"idf_2char_threshold": 3.0,  // allow rare 2-char tokens (AI, VW) if truly informative
+				"stopword_ratio":      0.35, // df/N above => treated as non-informative
+				"min_tokens":          1,    // gate considers even 1-word utterances
+			}},
 			"cooldown": {
 				Type:    "cooldown",
 				Enabled: true,
@@ -669,6 +680,48 @@ func (eg *Epigenome) IntentNBParams() (enabled bool, minTokens int, threshold fl
 	}
 	if alpha <= 0 {
 		alpha = 1.0
+	}
+	return
+}
+
+func (eg *Epigenome) InfoGateParams() (enabled bool, minInfo float64, idfThreshold float64, idf2charThreshold float64, stopwordRatio float64, minTokens int) {
+	m := eg.Modules["info_gate"]
+	if m == nil || !m.Enabled {
+		return false, 0.33, 1.0, 3.0, 0.35, 1
+	}
+	if v, ok := m.Params["enabled"].(bool); ok {
+		enabled = v
+	} else {
+		enabled = true
+	}
+	minInfo = asFloat(m.Params["min_info"], 0.33)
+	idfThreshold = asFloat(m.Params["idf_threshold"], 1.0)
+	idf2charThreshold = asFloat(m.Params["idf_2char_threshold"], 3.0)
+	stopwordRatio = asFloat(m.Params["stopword_ratio"], 0.35)
+	minTokens = int(asFloat(m.Params["min_tokens"], 1))
+	if minInfo < 0 {
+		minInfo = 0
+	}
+	if minInfo > 0.95 {
+		minInfo = 0.95
+	}
+	if idfThreshold < 0.1 {
+		idfThreshold = 0.1
+	}
+	if idf2charThreshold < idfThreshold {
+		idf2charThreshold = idfThreshold
+	}
+	if stopwordRatio < 0.05 {
+		stopwordRatio = 0.05
+	}
+	if stopwordRatio > 0.90 {
+		stopwordRatio = 0.90
+	}
+	if minTokens < 1 {
+		minTokens = 1
+	}
+	if minTokens > 10 {
+		minTokens = 10
 	}
 	return
 }

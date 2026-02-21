@@ -59,6 +59,10 @@ type Workspace struct {
 	ActivePlanTopic string
 	PlanSteps       []string
 	PlanIndex       int
+
+	// Generic info-gate traces (debug/telemetry)
+	LastUserInfoScore float64
+	LastUserTopToken  string
 }
 
 func NewWorkspace() *Workspace {

@@ -247,18 +247,22 @@ func main() {
 		// NB learning: apply feedback based on reply_context
 		ut, in, ok := brain.LoadReplyContext(db.DB, messageID)
 		if ok {
-			// weights: up reinforces, meh slight reinforce, down/caught unlearn
-			w := 0.0
-			switch value {
-			case 1:
-				w = 1.0
-			case 0:
-				w = 0.30
-			case -1:
-				w = -0.70
-			}
-			if w != 0 {
-				nb.ApplyFeedback(in, ut, w)
+			// Do not train on low-information utterances (generic noise protection)
+			low, _ := brain.IsLowInfo(db.DB, eg, ut)
+			if !low {
+				// weights: up reinforces, meh slight reinforce, down/caught unlearn
+				w := 0.0
+				switch value {
+				case 1:
+					w = 1.0
+				case 0:
+					w = 0.30
+				case -1:
+					w = -0.70
+				}
+				if w != 0 {
+					nb.ApplyFeedback(in, ut, w)
+				}
 			}
 		}
 		mu.Lock()
@@ -273,22 +277,24 @@ func main() {
 		mu.Unlock()
 
 		ut2, intentMode, pctx, act, sty, ok2 := brain.LoadReplyContextV2(db.DB, messageID)
-		_ = ut2
 		if ok2 {
-			reward01 := 0.5
-			reward11 := 0.0
-			switch value {
-			case 1:
-				reward01, reward11 = 1.0, 1.0
-			case 0:
-				reward01, reward11 = 0.6, 0.2
-			case -1:
-				reward01, reward11 = 0.2, -0.7
+			low, _ := brain.IsLowInfo(db.DB, eg, ut2)
+			if !low {
+				reward01 := 0.5
+				reward11 := 0.0
+				switch value {
+				case 1:
+					reward01, reward11 = 1.0, 1.0
+				case 0:
+					reward01, reward11 = 0.6, 0.2
+				case -1:
+					reward01, reward11 = 0.2, -0.7
+				}
+				brain.UpdatePolicy(db.DB, pctx, act, reward01)
+				brain.UpdatePreferenceEMA(db.DB, "style:"+sty, reward11, 0.12)
+				brain.UpdatePreferenceEMA(db.DB, "strat:"+act, reward11, 0.12)
+				brain.UpdatePreferenceEMA(db.DB, "intent:"+intentMode, reward11, 0.10)
 			}
-			brain.UpdatePolicy(db.DB, pctx, act, reward01)
-			brain.UpdatePreferenceEMA(db.DB, "style:"+sty, reward11, 0.12)
-			brain.UpdatePreferenceEMA(db.DB, "strat:"+act, reward11, 0.12)
-			brain.UpdatePreferenceEMA(db.DB, "intent:"+intentMode, reward11, 0.10)
 		}
 		return nil
 	}
@@ -296,14 +302,20 @@ func main() {
 		// NB learning: caught is strong negative feedback for the routed intent.
 		ut, in, ok := brain.LoadReplyContext(db.DB, messageID)
 		if ok {
-			nb.ApplyFeedback(in, ut, -1.0)
+			low, _ := brain.IsLowInfo(db.DB, eg, ut)
+			if !low {
+				nb.ApplyFeedback(in, ut, -1.0)
+			}
 		}
 		_, intentMode, pctx, act, sty, ok2 := brain.LoadReplyContextV2(db.DB, messageID)
 		if ok2 {
-			brain.UpdatePolicy(db.DB, pctx, act, 0.0)
-			brain.UpdatePreferenceEMA(db.DB, "style:"+sty, -1.0, 0.20)
-			brain.UpdatePreferenceEMA(db.DB, "strat:"+act, -1.0, 0.20)
-			brain.UpdatePreferenceEMA(db.DB, "intent:"+intentMode, -1.0, 0.20)
+			low, _ := brain.IsLowInfo(db.DB, eg, ut)
+			if !low {
+				brain.UpdatePolicy(db.DB, pctx, act, 0.0)
+				brain.UpdatePreferenceEMA(db.DB, "style:"+sty, -1.0, 0.20)
+				brain.UpdatePreferenceEMA(db.DB, "strat:"+act, -1.0, 0.20)
+				brain.UpdatePreferenceEMA(db.DB, "intent:"+intentMode, -1.0, 0.20)
+			}
 		}
 		mu.Lock()
 		_ = brain.ApplyCaught(db.DB, tr, aff, eg)
