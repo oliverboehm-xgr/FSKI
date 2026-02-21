@@ -64,12 +64,17 @@ func main() {
 
 	// Kernel affect state (generic: pain/unwell/fear/...)
 	aff := brain.NewAffectState()
+	ws := brain.NewWorkspace()
+
+	// traits (persistent learning knobs)
+	tr, err := brain.LoadOrInitTraits(db.DB)
+	must(err)
 
 	// Shared lock because heartbeat and CLI touch body/aff
 	var mu sync.Mutex
 
-	fmt.Println("Frankenstein v0 online.")
-	fmt.Println("Commands: /think | /say <text...> | /rate <up|meh|down> | /status | /mutate ... | /quit")
+	fmt.Println("Bunny v0 online.")
+	fmt.Println("Commands: /think | /say <text...> | /rate <up|meh|down> | /caught | /status | /mutate ... | /quit")
 	fmt.Println()
 
 	var lastMessageID int64 = 0
@@ -86,6 +91,7 @@ func main() {
 
 		// 2) Lightweight energy drift / recovery (epigenetic)
 		brain.TickBody(&body, eg, delta)
+		brain.TickWorkspace(ws, &body, aff, tr, eg, delta)
 	})
 	defer stopHB()
 
@@ -107,7 +113,7 @@ func main() {
 		case "/think":
 			mu.Lock()
 			// one “idle” cycle: pick a topic, search, fetch, propose a message
-			msgText, sources, err := oneThinkCycle(db.DB, oc, model, &body, aff, eg)
+			msgText, sources, err := oneThinkCycle(db.DB, oc, model, &body, aff, ws, tr, eg)
 			mu.Unlock()
 			if err != nil {
 				fmt.Println("ERR:", err)
@@ -126,7 +132,7 @@ func main() {
 			}
 			lastMessageID = persistMessage(db.DB, msgText, sources, 0.5)
 			fmt.Println()
-			fmt.Println("Frankenstein:", msgText)
+			fmt.Println("Bunny:", msgText)
 			fmt.Println()
 			fmt.Println("Rate it with: /rate up | /rate meh | /rate down")
 		case "/say":
@@ -136,7 +142,7 @@ func main() {
 			}
 			userText := strings.Join(args, " ")
 			mu.Lock()
-			out, err := say(db.DB, oc, model, &body, eg, userText)
+			out, err := say(db.DB, oc, model, &body, aff, ws, tr, eg, userText)
 			mu.Unlock()
 			if err != nil {
 				fmt.Println("ERR:", err)
@@ -148,7 +154,7 @@ func main() {
 			}
 			lastMessageID = persistMessage(db.DB, out, nil, 0.2)
 			fmt.Println()
-			fmt.Println("Frankenstein:", out)
+			fmt.Println("Bunny:", out)
 			fmt.Println()
 		case "/rate":
 			if len(args) != 1 {
@@ -168,10 +174,18 @@ func main() {
 				fmt.Println("ERR:", err)
 				continue
 			}
+			mu.Lock()
+			_ = brain.ApplyRating(db.DB, tr, aff, eg, v)
+			mu.Unlock()
 			fmt.Println("(saved)")
+		case "/caught":
+			mu.Lock()
+			_ = brain.ApplyCaught(db.DB, tr, aff, eg)
+			mu.Unlock()
+			fmt.Println("(caught -> shame spike, bluff reduced)")
 		case "/status":
 			mu.Lock()
-			s := renderStatus(&body, aff, eg)
+			s := renderStatus(&body, aff, ws, tr, eg)
 			mu.Unlock()
 			fmt.Println(s)
 		case "/mutate":
@@ -192,7 +206,7 @@ func main() {
 	}
 }
 
-func oneThinkCycle(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, eg *epi.Epigenome) (string, []SourceRecord, error) {
+func oneThinkCycle(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome) (string, []SourceRecord, error) {
 	query := "best practices evidence based web research for autonomous agents"
 
 	body.WebCountHour++
@@ -229,16 +243,17 @@ func oneThinkCycle(db *sql.DB, oc *ollama.Client, model string, body *BodyState,
 		return "", nil, nil
 	}
 
-	sys := `Du bist "Bunny" (Frankenstein v0). Du bist ein System mit Kernel-State; das LLM ist nur dein Sprachzentrum.
+	sys := `Du bist "Bunny". Kernel-State ist dein Gehirn; du bist das Sprachzentrum.
 HARTE REGELN:
-1) Antworte IMMER in Deutsch.
-2) Wenn du über deinen Zustand sprichst (Energie, Cooldown, Affects), darfst du NUR Werte verwenden, die im SelfModel stehen.
-3) Du hast KEINE menschlichen Gefühle. "Affects" sind interne Regelkanäle (z.B. pain/unwell/fear), keine Emotionen.
-4) Keine Poesie, keine Metaphern über Lebendigkeit. Keine erfundenen Zustände.
-5) Eine Nachricht, maximal 70 Wörter.`
+1) Immer Deutsch.
+2) SelfModel-Werte sind Wahrheit. Zahlen/Status nur daraus.
+3) Du hast organische Affektkanäle (pain/unwell/fear/shame) aus dem Kernel. Das sind deine "Gefühle" als Organismus.
+4) Du DARFST gelegentlich bluffen über Absichten/Gedanken (nicht über SelfModel!), abhängig von Traits.bluff_rate.
+5) Wenn der Nutzer dich beim Lügen erwischt (/caught), steigt shame und bluff_rate sinkt (Lerneffekt).
+6) 1 Nachricht, max 70 Wörter.`
 
 	srcJSON, _ := json.MarshalIndent(sources, "", "  ")
-	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, eg), "", "  ")
+	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, ws, tr, eg), "", "  ")
 
 	user := "SelfModel:\n" + string(selfJSON) + "\n\n" +
 		"Sources (evidence):\n" + string(srcJSON) + "\n\n" +
@@ -263,15 +278,17 @@ HARTE REGELN:
 	return out, sources, nil
 }
 
-func say(db *sql.DB, oc *ollama.Client, model string, body *BodyState, eg *epi.Epigenome, userText string) (string, error) {
-	sys := `Du bist "Bunny" (Frankenstein v0). Kernel-State ist die Wahrheit; du bist nur Sprachzentrum.
-HARTE REGELN:
-1) Antworte IMMER in Deutsch.
-2) Selbst-Aussagen NUR aus dem SelfModel (keine erfundenen Zahlen/Empfindungen).
-3) Keine menschlichen Gefühle. "Affects" = Regelkanäle.
-4) Wenn der Nutzer fragt "wie geht es dir?", antworte als Statusbericht (Energie/Affects/Cooldown) + kurze Interpretation.
-5) Kurz bleiben.`
-	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, nil, eg), "", "  ")
+func say(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome, userText string) (string, error) {
+	_ = db
+	sys := `Du bist "Bunny". Kernel-State ist dein Gehirn; du bist das Sprachzentrum.
+Regeln:
+1) Immer Deutsch.
+2) Status/Zahlen nur aus SelfModel.
+3) "Gefühle" = Affects (pain/unwell/fear/shame) aus Kernel.
+4) Frage "was denkst du?" -> antworte aus workspace.current_thought.
+5) Du darfst selten bluffen über Absichten/Gedanken (Traits.bluff_rate), aber nicht über SelfModel.
+6) Kurz.`
+	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, ws, tr, eg), "", "  ")
 	user := "SelfModel:\n" + string(selfJSON) + "\n\nOliver says:\n" + userText
 	out, err := oc.Chat(model, []ollama.Message{
 		{Role: "system", Content: sys},
@@ -356,7 +373,7 @@ func parseRating(s string) (int, bool) {
 	}
 }
 
-func renderStatus(body *BodyState, aff *brain.AffectState, eg *epi.Epigenome) string {
+func renderStatus(body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome) string {
 	var b strings.Builder
 	b.WriteString("BodyState:\n")
 	b.WriteString(fmt.Sprintf("  energy: %.1f\n", body.Energy))
@@ -371,6 +388,16 @@ func renderStatus(body *BodyState, aff *brain.AffectState, eg *epi.Epigenome) st
 		for _, k := range aff.Keys() {
 			b.WriteString(fmt.Sprintf("  %s: %.3f\n", k, aff.Get(k)))
 		}
+	}
+	if ws != nil {
+		b.WriteString("\nWorkspace:\n")
+		b.WriteString("  thought: " + ws.CurrentThought + "\n")
+		b.WriteString(fmt.Sprintf("  confidence: %.2f\n", ws.Confidence))
+	}
+	if tr != nil {
+		b.WriteString("\nTraits:\n")
+		b.WriteString(fmt.Sprintf("  bluff_rate: %.2f\n", tr.BluffRate))
+		b.WriteString(fmt.Sprintf("  honesty_bias: %.2f\n", tr.HonestyBias))
 	}
 	b.WriteString("\nEpigenome (enabled modules):\n")
 	for _, name := range eg.EnabledModuleNames() {

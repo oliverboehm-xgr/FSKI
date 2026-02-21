@@ -20,6 +20,14 @@ type SelfModel struct {
 		AffectDefs     any      `json:"affectDefs,omitempty"`
 		Lang           string   `json:"lang"`
 	} `json:"epigenome"`
+	Workspace struct {
+		CurrentThought string  `json:"current_thought"`
+		Confidence     float64 `json:"confidence"`
+	} `json:"workspace"`
+	Traits struct {
+		BluffRate   float64 `json:"bluff_rate"`
+		HonestyBias float64 `json:"honesty_bias"`
+	} `json:"traits"`
 }
 
 // BuildSelfModel is intentionally minimal for v0.1.
@@ -29,7 +37,7 @@ type AffectReader interface {
 	Get(string) float64
 }
 
-func BuildSelfModel(body any, aff AffectReader, eg *Epigenome) *SelfModel {
+func BuildSelfModel(body any, aff AffectReader, ws any, tr any, eg *Epigenome) *SelfModel {
 	sm := &SelfModel{}
 	sm.Epigenome.EnabledModules = eg.EnabledModuleNames()
 	sm.Epigenome.Version = eg.Version
@@ -46,6 +54,26 @@ func BuildSelfModel(body any, aff AffectReader, eg *Epigenome) *SelfModel {
 		for _, k := range aff.Keys() {
 			sm.Affects[k] = aff.Get(k)
 		}
+	}
+	if ws != nil {
+		raw, _ := json.Marshal(ws)
+		var tmp struct {
+			CurrentThought string  `json:"CurrentThought"`
+			Confidence     float64 `json:"Confidence"`
+		}
+		_ = json.Unmarshal(raw, &tmp)
+		sm.Workspace.CurrentThought = tmp.CurrentThought
+		sm.Workspace.Confidence = tmp.Confidence
+	}
+	if tr != nil {
+		raw, _ := json.Marshal(tr)
+		var tmp struct {
+			BluffRate   float64 `json:"BluffRate"`
+			HonestyBias float64 `json:"HonestyBias"`
+		}
+		_ = json.Unmarshal(raw, &tmp)
+		sm.Traits.BluffRate = tmp.BluffRate
+		sm.Traits.HonestyBias = tmp.HonestyBias
 	}
 	sm.Epigenome.AffectDefs = eg.AffectDefs()
 	return sm
