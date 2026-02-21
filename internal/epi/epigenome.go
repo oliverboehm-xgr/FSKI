@@ -8,19 +8,22 @@ import (
 	"time"
 )
 
-// Epigenome = mutable "runtime policy layer".
-// Bunny can enable/disable modules and change parameters at runtime,
-// but only for module TYPES that exist in code (registry).
-
 type ModuleSpec struct {
 	Type    string         `json:"type"`
 	Enabled bool           `json:"enabled"`
 	Params  map[string]any `json:"params,omitempty"`
 }
 
+type AffectDef struct {
+	Baseline       float64 `json:"baseline"`
+	DecayPerSec    float64 `json:"decayPerSec"`
+	EnergyCoupling float64 `json:"energyCoupling"`
+}
+
 type Epigenome struct {
-	Version int                    `json:"version"`
-	Modules map[string]*ModuleSpec `json:"modules"`
+	Version       int                    `json:"version"`
+	Modules       map[string]*ModuleSpec `json:"modules"`
+	AffectDefsMap map[string]AffectDef   `json:"affect_defs,omitempty"`
 }
 
 func LoadOrInit(path string) (*Epigenome, error) {
@@ -33,6 +36,9 @@ func LoadOrInit(path string) (*Epigenome, error) {
 		if eg.Modules == nil {
 			eg.Modules = map[string]*ModuleSpec{}
 		}
+		if eg.AffectDefsMap == nil {
+			eg.AffectDefsMap = map[string]AffectDef{}
+		}
 		return &eg, nil
 	}
 	if !os.IsNotExist(err) {
@@ -42,6 +48,7 @@ func LoadOrInit(path string) (*Epigenome, error) {
 	eg := &Epigenome{
 		Version: 1,
 		Modules: map[string]*ModuleSpec{
+			"heartbeat": {Type: "heartbeat", Enabled: true, Params: map[string]any{"ms": 500}},
 			"cooldown": {
 				Type:    "cooldown",
 				Enabled: true,
@@ -56,6 +63,10 @@ func LoadOrInit(path string) (*Epigenome, error) {
 					"cost": 1.0,
 				},
 			},
+		},
+		AffectDefsMap: map[string]AffectDef{
+			"pain":   {Baseline: 0.05, DecayPerSec: 0.20, EnergyCoupling: 0.15},
+			"unwell": {Baseline: 0.05, DecayPerSec: 0.15, EnergyCoupling: 0.10},
 		},
 	}
 	if err := eg.Save(path); err != nil {
@@ -87,7 +98,6 @@ func (eg *Epigenome) EnabledModuleNames() []string {
 func (eg *Epigenome) Enable(name string, on bool) {
 	m := eg.Modules[name]
 	if m == nil {
-		// create as "unknown" placeholder - still useful as a switch for future code
 		m = &ModuleSpec{Type: "unknown", Enabled: on, Params: map[string]any{}}
 		eg.Modules[name] = m
 		return
@@ -107,7 +117,6 @@ func (eg *Epigenome) AddModule(name, typ string) error {
 		Enabled: true,
 		Params:  map[string]any{},
 	}
-	// seed sane defaults for known types
 	switch typ {
 	case "cooldown":
 		eg.Modules[name].Params["seconds"] = 120
@@ -129,10 +138,29 @@ func (eg *Epigenome) SetParam(name, key string, val any) error {
 	return nil
 }
 
+func (eg *Epigenome) AffectDefs() map[string]AffectDef {
+	if eg.AffectDefsMap == nil {
+		eg.AffectDefsMap = map[string]AffectDef{}
+	}
+	return eg.AffectDefsMap
+}
+
+func (eg *Epigenome) HeartbeatInterval() time.Duration {
+	m := eg.Modules["heartbeat"]
+	if m == nil || !m.Enabled {
+		return 500 * time.Millisecond
+	}
+	ms := asFloat(m.Params["ms"], 500)
+	if ms < 50 {
+		ms = 50
+	}
+	return time.Duration(ms * float64(time.Millisecond))
+}
+
 func (eg *Epigenome) CooldownDuration() time.Duration {
 	m := eg.Modules["cooldown"]
 	if m == nil || !m.Enabled {
-		return 2 * time.Minute // fallback: safe default
+		return 2 * time.Minute
 	}
 	sec := asFloat(m.Params["seconds"], 120)
 	if sec < 0 {
