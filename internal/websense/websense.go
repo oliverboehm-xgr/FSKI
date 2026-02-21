@@ -28,8 +28,7 @@ type FetchResult struct {
 	Domain    string
 }
 
-// Minimal: DuckDuckGo HTML endpoint (quick & dirty).
-// Für v0 reicht das. Später kannst du auf SearxNG (self-hosted) umstellen.
+// DuckDuckGo HTML (quick & dirty, reicht für v0)
 func Search(query string, k int) ([]SearchResult, error) {
 	if k <= 0 {
 		k = 5
@@ -38,7 +37,7 @@ func Search(query string, k int) ([]SearchResult, error) {
 	u := "https://duckduckgo.com/html/?q=" + q
 
 	req, _ := http.NewRequest("GET", u, nil)
-	req.Header.Set("User-Agent", "frankenstein-v0/0.1 (read-only)")
+	req.Header.Set("User-Agent", "FSKI/0.1 (read-only)")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -47,17 +46,19 @@ func Search(query string, k int) ([]SearchResult, error) {
 	if resp.StatusCode >= 400 {
 		return nil, errors.New("search http status: " + resp.Status)
 	}
+
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 2_000_000))
 	html := string(b)
 
-	// Very rough parse: find result links.
-	re := regexp.MustCompile(`<a rel="nofollow" class="result__a" href="([^"]+)">([^<]+)</a>`)
+	// Ergebnisse: <a rel="nofollow" class="result__a" href="...">TITLE</a>
+	re := regexp.MustCompile(`<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([^<]+)</a>`)
 	m := re.FindAllStringSubmatch(html, k)
+
 	out := make([]SearchResult, 0, len(m))
 	for _, mm := range m {
 		link := htmlUnescape(mm[1])
 		title := htmlUnescape(mm[2])
-		out = append(out, SearchResult{Title: title, URL: link, Snippet: ""})
+		out = append(out, SearchResult{Title: title, URL: link})
 	}
 	return out, nil
 }
@@ -67,8 +68,9 @@ func Fetch(rawURL string) (*FetchResult, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	req, _ := http.NewRequest("GET", rawURL, nil)
-	req.Header.Set("User-Agent", "frankenstein-v0/0.1 (read-only)")
+	req.Header.Set("User-Agent", "FSKI/0.1 (read-only)")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -82,11 +84,11 @@ func Fetch(rawURL string) (*FetchResult, error) {
 	html := string(b)
 
 	title := extractTitle(html)
-	text := stripHTML(html)
-	text = normalizeWhitespace(text)
+	text := normalizeWhitespace(stripHTML(html))
 
 	h := sha256.Sum256([]byte(text))
 	hash := hex.EncodeToString(h[:])
+
 	snippet := text
 	if len(snippet) > 400 {
 		snippet = snippet[:400]
@@ -113,12 +115,14 @@ func extractTitle(html string) string {
 }
 
 func stripHTML(s string) string {
-	// Remove scripts/styles
+	// scripts/styles raus
 	reSS := regexp.MustCompile(`(?is)<(script|style)[^>]*>.*?</\1>`)
 	s = reSS.ReplaceAllString(s, " ")
-	// Drop tags
+
+	// tags raus
 	reT := regexp.MustCompile(`(?is)<[^>]+>`)
 	s = reT.ReplaceAllString(s, " ")
+
 	return htmlUnescape(s)
 }
 
