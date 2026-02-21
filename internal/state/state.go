@@ -296,6 +296,14 @@ func migrate(db *sql.DB) error {
 			created_at TEXT NOT NULL
 		);`,
 
+		// ---------- Token stats for generic informativeness gate ----------
+		// Document frequency of tokens across user utterances. Used for learned IDF.
+		`CREATE TABLE IF NOT EXISTS token_df (
+			token TEXT PRIMARY KEY,
+			df INTEGER NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_token_df_df ON token_df(df);`,
+
 		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {
