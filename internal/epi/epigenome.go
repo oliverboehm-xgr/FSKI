@@ -79,6 +79,21 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"min_curiosity":    0.55,
 				"max_per_hour":     24,
 			}},
+
+			// Cortex bus + human-like daydreaming (images + inner speech)
+			"cortex_bus": {Type: "cortex_bus", Enabled: true, Params: map[string]any{
+				"tick_ms": 500,
+			}},
+			"daydream": {Type: "daydream", Enabled: true, Params: map[string]any{
+				"interval_seconds": 20,
+				"min_curiosity":    0.45,
+				"min_energy":       8,
+				"visual_weight":    0.55, // how visual vs verbal the thought is (0..1)
+			}},
+			"critic": {Type: "critic", Enabled: true, Params: map[string]any{
+				"enabled":       true,
+				"max_sentences": 8,
+			}},
 			"cooldown": {
 				Type:    "cooldown",
 				Enabled: true,
@@ -423,6 +438,55 @@ func (eg *Epigenome) ScoutParams() (intervalSec int, minCuriosity float64, maxPe
 		maxPerHour = 240
 	}
 	return
+}
+
+func (eg *Epigenome) DaydreamParams() (intervalSec int, minCuriosity float64, minEnergy float64, visualWeight float64, enabled bool) {
+	m := eg.Modules["daydream"]
+	if m == nil || !m.Enabled {
+		return 20, 0.45, 8, 0.55, false
+	}
+	enabled = true
+	intervalSec = int(asFloat(m.Params["interval_seconds"], 20))
+	minCuriosity = asFloat(m.Params["min_curiosity"], 0.45)
+	minEnergy = asFloat(m.Params["min_energy"], 8)
+	visualWeight = asFloat(m.Params["visual_weight"], 0.55)
+	if intervalSec < 5 {
+		intervalSec = 5
+	}
+	if intervalSec > 600 {
+		intervalSec = 600
+	}
+	if minCuriosity < 0 {
+		minCuriosity = 0
+	}
+	if minCuriosity > 1 {
+		minCuriosity = 1
+	}
+	if minEnergy < 0 {
+		minEnergy = 0
+	}
+	if minEnergy > 100 {
+		minEnergy = 100
+	}
+	if visualWeight < 0 {
+		visualWeight = 0
+	}
+	if visualWeight > 1 {
+		visualWeight = 1
+	}
+	return
+}
+
+func (eg *Epigenome) CriticEnabled() bool {
+	m := eg.Modules["critic"]
+	if m == nil || !m.Enabled {
+		return false
+	}
+	enabled, ok := m.Params["enabled"].(bool)
+	if ok {
+		return enabled
+	}
+	return true
 }
 
 func (eg *Epigenome) Lang() string {
