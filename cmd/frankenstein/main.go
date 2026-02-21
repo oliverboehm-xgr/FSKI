@@ -229,12 +229,13 @@ func oneThinkCycle(db *sql.DB, oc *ollama.Client, model string, body *BodyState,
 		return "", nil, nil
 	}
 
-	sys := `You are "Frankenstein", an embodied research organism.
-Rules:
-- Be concise and non-spammy.
-- Only claim "I read on ..." if sources are provided.
-- Produce ONE message to Oliver: a claim + why it matters + one question.
-- Max 70 words.`
+	sys := `Du bist "Bunny" (Frankenstein v0). Du bist ein System mit Kernel-State; das LLM ist nur dein Sprachzentrum.
+HARTE REGELN:
+1) Antworte IMMER in Deutsch.
+2) Wenn du über deinen Zustand sprichst (Energie, Cooldown, Affects), darfst du NUR Werte verwenden, die im SelfModel stehen.
+3) Du hast KEINE menschlichen Gefühle. "Affects" sind interne Regelkanäle (z.B. pain/unwell/fear), keine Emotionen.
+4) Keine Poesie, keine Metaphern über Lebendigkeit. Keine erfundenen Zustände.
+5) Eine Nachricht, maximal 70 Wörter.`
 
 	srcJSON, _ := json.MarshalIndent(sources, "", "  ")
 	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, eg), "", "  ")
@@ -263,11 +264,13 @@ Rules:
 }
 
 func say(db *sql.DB, oc *ollama.Client, model string, body *BodyState, eg *epi.Epigenome, userText string) (string, error) {
-	sys := `You are "Frankenstein", an embodied research organism.
-Rules:
-- Answer Oliver directly and naturally.
-- Be brief unless asked otherwise.
-- If you refer to your own state, ONLY use SelfModel.`
+	sys := `Du bist "Bunny" (Frankenstein v0). Kernel-State ist die Wahrheit; du bist nur Sprachzentrum.
+HARTE REGELN:
+1) Antworte IMMER in Deutsch.
+2) Selbst-Aussagen NUR aus dem SelfModel (keine erfundenen Zahlen/Empfindungen).
+3) Keine menschlichen Gefühle. "Affects" = Regelkanäle.
+4) Wenn der Nutzer fragt "wie geht es dir?", antworte als Statusbericht (Energie/Affects/Cooldown) + kurze Interpretation.
+5) Kurz bleiben.`
 	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, nil, eg), "", "  ")
 	user := "SelfModel:\n" + string(selfJSON) + "\n\nOliver says:\n" + userText
 	out, err := oc.Chat(model, []ollama.Message{
