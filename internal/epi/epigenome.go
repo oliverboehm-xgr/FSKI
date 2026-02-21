@@ -93,6 +93,42 @@ func LoadOrInit(path string) (*Epigenome, error) {
 					"cost": 1.0,
 				},
 			},
+			// Intent router (epigenetic, editable)
+			"intent_router": {Type: "intent_router", Enabled: true, Params: map[string]any{
+				// rules are evaluated by priority (high first)
+				"rules": []any{
+					map[string]any{
+						"name":     "meta_self",
+						"intent":   "META_BUNNY",
+						"priority": 100,
+						"contains": []any{"wie geht", "energie", "cooldown", "status", "was denkst"},
+					},
+					map[string]any{
+						"name":     "explicit_research",
+						"intent":   "RESEARCH_CMD",
+						"priority": 95,
+						"contains": []any{"recherch", "im internet", "nachsehen", "quelle", "quellen"},
+					},
+					map[string]any{
+						"name":     "opinion_request",
+						"intent":   "OPINION",
+						"priority": 90,
+						"contains": []any{"meinung", "haltung", "position", "gut oder schlecht", "findest du"},
+					},
+					map[string]any{
+						"name":     "external_fact",
+						"intent":   "EXTERNAL_FACT",
+						"priority": 70,
+						"contains": []any{"wetter", "vorhersage", "wo liegt", "wo ist", "wer ist", "aktuell", "kurs", "preis"},
+					},
+					map[string]any{
+						"name":     "task_tech",
+						"intent":   "TASK_TECH",
+						"priority": 50,
+						"contains": []any{"patch", "github", "go ", "sqlite", "ollama", "fski"},
+					},
+				},
+			}},
 		},
 		AffectDefsMap: map[string]AffectDef{
 			"pain":   {Baseline: 0.05, DecayPerSec: 0.20, EnergyCoupling: 0.15},
@@ -262,6 +298,69 @@ func (eg *Epigenome) SayEnergyCost() float64 {
 		return 1.0
 	}
 	return asFloat(m.Params["cost"], 1.0)
+}
+
+type IntentRule struct {
+	Name     string
+	Intent   string
+	Priority int
+	Contains []string
+	Regex    []string
+}
+
+func (eg *Epigenome) IntentRules() []IntentRule {
+	m := eg.Modules["intent_router"]
+	if m == nil || !m.Enabled {
+		return nil
+	}
+	raw, ok := m.Params["rules"]
+	if !ok || raw == nil {
+		return nil
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]IntentRule, 0, len(arr))
+	for _, it := range arr {
+		mm, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		r := IntentRule{}
+		if v, ok := mm["name"].(string); ok {
+			r.Name = v
+		}
+		if v, ok := mm["intent"].(string); ok {
+			r.Intent = v
+		}
+		r.Priority = int(asFloat(mm["priority"], 0))
+		if c, ok := mm["contains"].([]any); ok {
+			for _, x := range c {
+				if s, ok := x.(string); ok && s != "" {
+					r.Contains = append(r.Contains, s)
+				}
+			}
+		}
+		if c, ok := mm["regex"].([]any); ok {
+			for _, x := range c {
+				if s, ok := x.(string); ok && s != "" {
+					r.Regex = append(r.Regex, s)
+				}
+			}
+		}
+		if r.Intent != "" {
+			out = append(out, r)
+		}
+	}
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[j].Priority > out[i].Priority {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	return out
 }
 
 func (eg *Epigenome) Values() map[string]float64 {

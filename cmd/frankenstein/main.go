@@ -741,7 +741,7 @@ func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *Body
 		}
 	}
 
-	intent := brain.DetectIntent(userText)
+	intent := brain.DetectIntentWithEpigenome(userText, eg)
 	// Hard rule: Opinion -> stance engine (stance persists, becomes personality)
 	if intent == brain.IntentOpinion {
 		return answerWithStance(db, oc, model, body, aff, ws, tr, eg, userText)
