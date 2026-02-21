@@ -48,6 +48,8 @@ func LoadOrInit(path string) (*Epigenome, error) {
 	eg := &Epigenome{
 		Version: 1,
 		Modules: map[string]*ModuleSpec{
+			"locale":    {Type: "locale", Enabled: true, Params: map[string]any{"lang": "de"}},
+			"energy":    {Type: "energy", Enabled: true, Params: map[string]any{"max": 100}},
 			"heartbeat": {Type: "heartbeat", Enabled: true, Params: map[string]any{"ms": 500}},
 			"cooldown": {
 				Type:    "cooldown",
@@ -175,6 +177,25 @@ func (eg *Epigenome) SayEnergyCost() float64 {
 		return 1.0
 	}
 	return asFloat(m.Params["cost"], 1.0)
+}
+
+func (eg *Epigenome) Lang() string {
+	m := eg.Modules["locale"]
+	if m == nil || !m.Enabled {
+		return "de"
+	}
+	if s, ok := m.Params["lang"].(string); ok && s != "" {
+		return s
+	}
+	return "de"
+}
+
+func (eg *Epigenome) EnergyMax() float64 {
+	m := eg.Modules["energy"]
+	if m == nil || !m.Enabled {
+		return 100
+	}
+	return asFloat(m.Params["max"], 100)
 }
 
 func asFloat(v any, def float64) float64 {

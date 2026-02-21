@@ -8,6 +8,8 @@ import (
 type SelfModel struct {
 	Body struct {
 		Energy       float64 `json:"energy"`
+		EnergyMax    float64 `json:"energyMax"`
+		EnergyUnit   string  `json:"energyUnit"`
 		WebCountHour int     `json:"webCountHour"`
 		Cooldown     string  `json:"cooldownUntil"`
 	} `json:"body"`
@@ -16,6 +18,7 @@ type SelfModel struct {
 		EnabledModules []string `json:"enabledModules"`
 		Version        int      `json:"version"`
 		AffectDefs     any      `json:"affectDefs,omitempty"`
+		Lang           string   `json:"lang"`
 	} `json:"epigenome"`
 }
 
@@ -30,8 +33,11 @@ func BuildSelfModel(body any, aff AffectReader, eg *Epigenome) *SelfModel {
 	sm := &SelfModel{}
 	sm.Epigenome.EnabledModules = eg.EnabledModuleNames()
 	sm.Epigenome.Version = eg.Version
+	sm.Epigenome.Lang = eg.Lang()
 
 	sm.Body.Energy = ExtractEnergy(body)
+	sm.Body.EnergyMax = eg.EnergyMax()
+	sm.Body.EnergyUnit = "Energiepunkte (0..energyMax)"
 	sm.Body.WebCountHour = ExtractWebCountHour(body)
 	sm.Body.Cooldown = ExtractCooldown(body).Format(time.RFC3339)
 
