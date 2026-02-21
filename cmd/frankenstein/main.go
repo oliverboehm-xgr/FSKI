@@ -210,9 +210,18 @@ func main() {
 		mu.Lock()
 		// determine intent (rules + NB)
 		intent := brain.DetectIntentHybrid(text, eg, nb)
+		intentMode := brain.IntentToMode(intent)
+
+		// policy bandit chooses strategy/style from current context
+		ctxKey := brain.MakePolicyContext(intentMode, ws.DrivesEnergyDeficit, ws.SocialCraving)
+		choice := brain.ChoosePolicy(db.DB, ctxKey)
+
 		// store last routed intent for context (used below)
-		ws.LastRoutedIntent = brain.IntentToMode(intent)
+		ws.LastRoutedIntent = intentMode
 		ws.LastUserText = text
+		ws.LastPolicyCtx = choice.ContextKey
+		ws.LastPolicyAction = choice.Action
+		ws.LastPolicyStyle = choice.Style
 
 		out, err := say(db.DB, epiPath, oc, model, modelStance, &body, aff, ws, tr, dr, eg, text)
 		brain.LatencyAffect(ws, aff, eg, time.Since(start))
@@ -221,13 +230,17 @@ func main() {
 			return ui.Message{}, err
 		}
 		id := persistMessageWithKind(db.DB, out, nil, 0.2, "reply")
-		// link reply -> user_text + intent for learning
+		// link reply -> user_text + intent + policy for learning
 		mu.Lock()
 		ut := ws.LastUserText
 		in := ws.LastRoutedIntent
+		pctx := ws.LastPolicyCtx
+		act := ws.LastPolicyAction
+		sty := ws.LastPolicyStyle
 		lastMessageID = id
 		mu.Unlock()
-		brain.SaveReplyContext(db.DB, id, ut, in)
+		brain.SaveReplyContext(db.DB, id, ut, in) // v1 NB
+		brain.SaveReplyContextV2(db.DB, id, ut, in, pctx, act, sty)
 		return ui.Message{
 			ID:        id,
 			CreatedAt: time.Now().Format(time.RFC3339),
@@ -266,6 +279,25 @@ func main() {
 			dr.UrgeToShare = clamp01(dr.UrgeToShare - 0.10)
 		}
 		mu.Unlock()
+
+		ut2, intentMode, pctx, act, sty, ok2 := brain.LoadReplyContextV2(db.DB, messageID)
+		_ = ut2
+		if ok2 {
+			reward01 := 0.5
+			reward11 := 0.0
+			switch value {
+			case 1:
+				reward01, reward11 = 1.0, 1.0
+			case 0:
+				reward01, reward11 = 0.6, 0.2
+			case -1:
+				reward01, reward11 = 0.2, -0.7
+			}
+			brain.UpdatePolicy(db.DB, pctx, act, reward01)
+			brain.UpdatePreferenceEMA(db.DB, "style:"+sty, reward11, 0.12)
+			brain.UpdatePreferenceEMA(db.DB, "strat:"+act, reward11, 0.12)
+			brain.UpdatePreferenceEMA(db.DB, "intent:"+intentMode, reward11, 0.10)
+		}
 		return nil
 	}
 	srv.Caught = func(messageID int64) error {
@@ -273,6 +305,13 @@ func main() {
 		ut, in, ok := brain.LoadReplyContext(db.DB, messageID)
 		if ok {
 			nb.ApplyFeedback(in, ut, -1.0)
+		}
+		_, intentMode, pctx, act, sty, ok2 := brain.LoadReplyContextV2(db.DB, messageID)
+		if ok2 {
+			brain.UpdatePolicy(db.DB, pctx, act, 0.0)
+			brain.UpdatePreferenceEMA(db.DB, "style:"+sty, -1.0, 0.20)
+			brain.UpdatePreferenceEMA(db.DB, "strat:"+act, -1.0, 0.20)
+			brain.UpdatePreferenceEMA(db.DB, "intent:"+intentMode, -1.0, 0.20)
 		}
 		mu.Lock()
 		_ = brain.ApplyCaught(db.DB, tr, aff, eg)
@@ -1125,15 +1164,20 @@ HARTE REGELN
 	}
 	mentalImage := ""
 	innerSpeech := ""
+	policy := ""
 	if ws != nil {
 		mentalImage = ws.VisualScene
 		innerSpeech = ws.InnerSpeech
+		policy = "POLICY_CONTEXT: " + ws.LastPolicyCtx + "\n" +
+			"POLICY_ACTION: " + ws.LastPolicyAction + "\n" +
+			"STYLE_HINT: " + ws.LastPolicyStyle + "\n"
 	}
 
 	user := "MODE: " + mode +
 		"\nACTIVE_TOPIC: " + activeTopic +
 		"\nAFFECT_KEYS: " + affKeys +
-		"\n\nMENTAL_IMAGE:\n" + mentalImage +
+		"\n\n" + policy +
+		"\nMENTAL_IMAGE:\n" + mentalImage +
 		"\n\nINNER_SPEECH:\n" + innerSpeech +
 		"\n\nSTORY_SO_FAR (gist):\n" + gist +
 		"\n\nDETAILS (decay):\n" + details +
