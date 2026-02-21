@@ -657,48 +657,23 @@ Antworte NUR als JSON:
 		if now.Before(body.AutoCooldownUntil) {
 			return
 		}
-		minInterval := 25 * time.Second
-		if !lastAutoSpeak.IsZero() && now.Sub(lastAutoSpeak) < minInterval {
-			return
-		}
-		talkBias := 0.45
-		if tr != nil {
-			talkBias = tr.TalkBias
-		}
-		inhib := 0.0
-		inhib += 0.9 * aff.Get("shame")
-		inhib += 0.4 * aff.Get("unwell")
-		inhib += 0.3 * aff.Get("pain")
-		inhib += 0.3 * aff.Get("fear")
-		threshold := 0.78 - 0.22*talkBias + 0.25*inhib
-		if threshold < 0.45 {
-			threshold = 0.45
-		}
-		if dr != nil && dr.UrgeToShare >= threshold && body.Energy >= 5 {
-			topic, w := brain.TopInterest(db.DB)
-			if topic == "" || w < 0.05 {
-				topic = ws.LastTopic
-			}
-			conceptSummary := ""
-			if topic != "" {
-				if c, ok := brain.GetConcept(db.DB, topic); ok {
-					conceptSummary = c.Summary
-				}
-			}
-			smJSON, _ := json.MarshalIndent(epi.BuildSelfModel(&body, aff, ws, tr, eg), "", "  ")
 
+		autonomy := brain.LoadAutonomyParams(eg)
+		lastUserAt := brain.LastUserMessageAt(db.DB)
+		topics, _ := brain.TopInterests(db.DB, autonomy.TopicK)
+		msg, talkDrive := brain.TickAutonomy(now, lastUserAt, lastAutoSpeak, dr.Curiosity, aff, topics, autonomy)
+		if tr != nil {
+			tr.TalkBias = talkDrive
+		}
+		if msg != "" && body.Energy >= 5 {
 			body.Energy -= eg.SayEnergyCost()
 			if body.Energy < 0 {
 				body.Energy = 0
 			}
-			// IMPORTANT: auto-speak has its own cooldown so normal replies don't suppress autonomy
 			body.AutoCooldownUntil = now.Add(eg.AutoSpeakCooldownDuration())
-			dr.UrgeToShare = dr.UrgeToShare * 0.55
 			lastAutoSpeak = now
-
-			req := brain.SpeakRequest{Reason: "Mitteilungsbedürfnis ist hoch (UrgeToShare).", Topic: topic, ConceptSummary: conceptSummary, CurrentThought: ws.CurrentThought, SelfModelJSON: string(smJSON)}
 			select {
-			case speakReqCh <- req:
+			case outCh <- OutMsg{Text: msg, Kind: "auto"}:
 			default:
 			}
 		}

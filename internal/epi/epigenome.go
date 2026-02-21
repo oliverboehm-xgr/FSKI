@@ -40,6 +40,12 @@ func LoadOrInit(path string) (*Epigenome, error) {
 		if eg.AffectDefsMap == nil {
 			eg.AffectDefsMap = map[string]AffectDef{}
 		}
+		changed := eg.ensureDefaults()
+		if changed {
+			if err := eg.Save(path); err != nil {
+				fmt.Println("WARN: failed to persist epigenome migration:", err)
+			}
+		}
 		return &eg, nil
 	}
 	if !os.IsNotExist(err) {
@@ -217,12 +223,57 @@ func LoadOrInit(path string) (*Epigenome, error) {
 }
 
 func (eg *Epigenome) Save(path string) error {
-	b, _ := json.MarshalIndent(eg, "", "  ")
+	b, err := json.MarshalIndent(eg, "", "  ")
+	if err != nil {
+		return err
+	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+func (eg *Epigenome) ensureDefaults() (changed bool) {
+	add := func(name string, spec *ModuleSpec) {
+		if eg.Modules[name] == nil {
+			eg.Modules[name] = spec
+			changed = true
+		}
+	}
+	add("auto_speak", &ModuleSpec{Type: "auto_speak", Enabled: true, Params: map[string]any{"cooldown_seconds": 18}})
+	add("autonomy", &ModuleSpec{Type: "autonomy", Enabled: true, Params: map[string]any{
+		"idle_seconds":     45,
+		"min_talk_drive":   0.55,
+		"cooldown_seconds": 60,
+		"topic_k":          5,
+	}})
+
+	def := func(k string, base, decay, coupling float64) {
+		if _, ok := eg.AffectDefsMap[k]; !ok {
+			eg.AffectDefsMap[k] = AffectDef{Baseline: base, DecayPerSec: decay, EnergyCoupling: coupling}
+			changed = true
+		}
+	}
+	def("pain", 0.05, 0.02, 0.0)
+	def("sorrow", 0.02, 0.01, 0.0)
+	def("unwell", 0.05, 0.02, 0.0)
+	def("shame", 0.00, 0.03, 0.0)
+	def("fear", 0.00, 0.03, 0.0)
+	return changed
+}
+
+func (eg *Epigenome) ModuleEnabled(name string) bool {
+	m := eg.Modules[name]
+	return m != nil && m.Enabled
+}
+
+func (eg *Epigenome) ModuleParams(name string) map[string]any {
+	m := eg.Modules[name]
+	if m == nil || m.Params == nil {
+		return map[string]any{}
+	}
+	return m.Params
 }
 
 func (eg *Epigenome) EnabledModuleNames() []string {
