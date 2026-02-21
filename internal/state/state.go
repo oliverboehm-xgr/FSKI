@@ -51,6 +51,11 @@ func migrate(db *sql.DB) error {
 			message_id INTEGER NOT NULL,
 			value INTEGER NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS traits (
+			key TEXT PRIMARY KEY,
+			value REAL NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
 		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {
