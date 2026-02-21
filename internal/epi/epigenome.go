@@ -159,6 +159,8 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"idf_2char_threshold": 3.0,  // allow rare 2-char tokens (AI, VW) if truly informative
 				"stopword_ratio":      0.35, // df/N above => treated as non-informative
 				"min_tokens":          1,    // gate considers even 1-word utterances
+				"warmup_min_docs":     30,   // learned stopword filter starts only after enough docs
+				"stopword_min_df":     8,    // token must be frequently observed before suppression
 			}},
 			"cooldown": {
 				Type:    "cooldown",
@@ -183,6 +185,7 @@ func LoadOrInit(path string) (*Epigenome, error) {
 						"intent":   "META_BUNNY",
 						"priority": 100,
 						"contains": []any{"wie geht", "energie", "cooldown", "status", "was denkst"},
+						"regex":    []any{`\bfühl\w*\b.*\bdu\b`, `\bwie\b.*\bgeht\b.*\bdir\b`},
 					},
 					map[string]any{
 						"name":     "explicit_research",
@@ -735,10 +738,10 @@ func (eg *Epigenome) IntentNBParams() (enabled bool, minTokens int, threshold fl
 	return
 }
 
-func (eg *Epigenome) InfoGateParams() (enabled bool, minInfo float64, idfThreshold float64, idf2charThreshold float64, stopwordRatio float64, minTokens int) {
+func (eg *Epigenome) InfoGateParams() (enabled bool, minInfo float64, idfThreshold float64, idf2charThreshold float64, stopwordRatio float64, minTokens int, warmupMinDocs int, stopwordMinDf int) {
 	m := eg.Modules["info_gate"]
 	if m == nil || !m.Enabled {
-		return false, 0.33, 1.0, 3.0, 0.35, 1
+		return false, 0.33, 1.0, 3.0, 0.35, 1, 30, 8
 	}
 	if v, ok := m.Params["enabled"].(bool); ok {
 		enabled = v
@@ -750,6 +753,8 @@ func (eg *Epigenome) InfoGateParams() (enabled bool, minInfo float64, idfThresho
 	idf2charThreshold = asFloat(m.Params["idf_2char_threshold"], 3.0)
 	stopwordRatio = asFloat(m.Params["stopword_ratio"], 0.35)
 	minTokens = int(asFloat(m.Params["min_tokens"], 1))
+	warmupMinDocs = int(asFloat(m.Params["warmup_min_docs"], 30))
+	stopwordMinDf = int(asFloat(m.Params["stopword_min_df"], 8))
 	if minInfo < 0 {
 		minInfo = 0
 	}
@@ -773,6 +778,18 @@ func (eg *Epigenome) InfoGateParams() (enabled bool, minInfo float64, idfThresho
 	}
 	if minTokens > 10 {
 		minTokens = 10
+	}
+	if warmupMinDocs < 0 {
+		warmupMinDocs = 0
+	}
+	if warmupMinDocs > 500 {
+		warmupMinDocs = 500
+	}
+	if stopwordMinDf < 1 {
+		stopwordMinDf = 1
+	}
+	if stopwordMinDf > 1000 {
+		stopwordMinDf = 1000
 	}
 	return
 }

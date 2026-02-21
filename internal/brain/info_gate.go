@@ -109,7 +109,7 @@ func ScoreUtterance(db *sql.DB, eg *epi.Epigenome, text string) InfoResult {
 	if db == nil || eg == nil || text == "" {
 		return res
 	}
-	enabled, _, idfTh, idf2Th, stopRatio, minTok := eg.InfoGateParams()
+	enabled, _, idfTh, idf2Th, stopRatio, minTok, warmupMinDocs, stopMinDf := eg.InfoGateParams()
 	if !enabled {
 		res.Score = 1.0
 		return res
@@ -151,8 +151,8 @@ func ScoreUtterance(db *sql.DB, eg *epi.Epigenome, text string) InfoResult {
 			df = 0
 		}
 		dfRatio := float64(df) / float64(N)
-		// learned stopword suppression
-		if dfRatio >= stopRatio {
+		// learned stopword suppression (after warmup + only truly frequent tokens)
+		if int(N) >= warmupMinDocs && int(df) >= stopMinDf && dfRatio >= stopRatio {
 			continue
 		}
 		idf := math.Log(float64(N+1) / float64(df+1))
@@ -191,7 +191,7 @@ func ScoreUtterance(db *sql.DB, eg *epi.Epigenome, text string) InfoResult {
 }
 
 func IsLowInfo(db *sql.DB, eg *epi.Epigenome, text string) (low bool, info InfoResult) {
-	enabled, minInfo, _, _, _, _ := eg.InfoGateParams()
+	enabled, minInfo, _, _, _, _, _, _ := eg.InfoGateParams()
 	if !enabled {
 		return false, InfoResult{Score: 1.0}
 	}
