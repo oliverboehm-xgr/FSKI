@@ -101,6 +101,14 @@ func migrate(db *sql.DB) error {
 			content TEXT NOT NULL
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_thought_log_topic ON thought_log(topic);`,
+
+		// message metadata for UI (kind: auto|reply|think)
+		`CREATE TABLE IF NOT EXISTS message_meta (
+			message_id INTEGER PRIMARY KEY,
+			kind TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_message_meta_kind ON message_meta(kind);`,
+
 		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"frankenstein-v0/internal/epi"
 	"frankenstein-v0/internal/ollama"
 	"frankenstein-v0/internal/state"
+	"frankenstein-v0/internal/ui"
 	"frankenstein-v0/internal/websense"
 )
 
@@ -47,6 +49,7 @@ func main() {
 	ollamaURL := getenv("OLLAMA_URL", "http://localhost:11434")
 	dbPath := getenv("FRANK_DB", "data/frankenstein.sqlite")
 	epiPath := getenv("FRANK_EPI", "data/epigenome.json")
+	uiAddr := getenv("FRANK_UI_ADDR", "127.0.0.1:8080")
 
 	_ = os.MkdirAll("data", 0o755)
 
@@ -94,6 +97,102 @@ func main() {
 
 	var lastMessageID int64 = 0 // protected by mu
 	var lastAutoSpeak time.Time // protected by mu
+
+	// --- UI server (SSE) ---
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := ui.New(uiAddr)
+
+	// DB-backed list (last N)
+	srv.ListMessages = func(limit int) ([]ui.Message, error) {
+		rows, err := db.DB.Query(
+			`SELECT m.id, m.created_at, COALESCE(mm.kind,'reply') as kind, m.text
+			 FROM messages m
+			 LEFT JOIN message_meta mm ON mm.message_id = m.id
+			 ORDER BY m.id DESC
+			 LIMIT ?`, limit,
+		)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []ui.Message
+		for rows.Next() {
+			var m ui.Message
+			_ = rows.Scan(&m.ID, &m.CreatedAt, &m.Kind, &m.Text)
+			out = append(out, m)
+		}
+		return out, nil
+	}
+	srv.Status = func() (any, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		// publish raw selfmodel (json-ish struct)
+		sm := epi.BuildSelfModel(&body, aff, ws, tr, eg)
+		// also include drives/traits extras without forcing schema changes
+		type status struct {
+			Self   any `json:"self"`
+			Drives any `json:"drives"`
+			Traits any `json:"traits"`
+		}
+		st := status{
+			Self: sm,
+			Drives: map[string]any{
+				"curiosity":     dr.Curiosity,
+				"urge_to_share": dr.UrgeToShare,
+			},
+			Traits: map[string]any{
+				"talk_bias":      tr.TalkBias,
+				"search_k":       tr.SearchK,
+				"fetch_attempts": tr.FetchAttempts,
+			},
+		}
+		return st, nil
+	}
+	srv.SendText = func(text string) (ui.Message, error) {
+		mu.Lock()
+		out, err := say(db.DB, epiPath, oc, model, &body, aff, ws, tr, dr, eg, text)
+		mu.Unlock()
+		if err != nil {
+			return ui.Message{}, err
+		}
+		id := persistMessageWithKind(db.DB, out, nil, 0.2, "reply")
+		mu.Lock()
+		lastMessageID = id
+		mu.Unlock()
+		return ui.Message{
+			ID: id, CreatedAt: time.Now().Format(time.RFC3339), Kind: "reply", Text: out,
+		}, nil
+	}
+	srv.RateMessage = func(messageID int64, value int) error {
+		if err := storeRating(db.DB, messageID, value); err != nil {
+			return err
+		}
+		mu.Lock()
+		_ = brain.ApplyRating(db.DB, tr, aff, eg, value)
+		// also nudge drives
+		if value > 0 {
+			dr.UrgeToShare = clamp01(dr.UrgeToShare + 0.06)
+			dr.Curiosity = clamp01(dr.Curiosity + 0.04)
+		} else if value < 0 {
+			dr.UrgeToShare = clamp01(dr.UrgeToShare - 0.10)
+		}
+		mu.Unlock()
+		return nil
+	}
+	srv.Caught = func(messageID int64) error {
+		mu.Lock()
+		_ = brain.ApplyCaught(db.DB, tr, aff, eg)
+		_ = brain.SaveAffectState(db.DB, aff)
+		dr.UrgeToShare = clamp01(dr.UrgeToShare - 0.15)
+		mu.Unlock()
+		return nil
+	}
+
+	go func() {
+		_ = srv.Run(ctx)
+	}()
+	fmt.Println("UI:", "http://"+uiAddr)
 
 	go func() {
 		reader := bufio.NewReader(os.Stdin)
@@ -211,6 +310,23 @@ Regeln:
 			case speakReqCh <- req:
 			default:
 			}
+		}
+
+		// push status snapshot occasionally (UI)
+		if tickN%10 == 0 { // ~5s with 500ms heartbeat
+			sm := epi.BuildSelfModel(&body, aff, ws, tr, eg)
+			srv.PublishStatus(map[string]any{
+				"self": sm,
+				"drives": map[string]any{
+					"curiosity":     dr.Curiosity,
+					"urge_to_share": dr.UrgeToShare,
+				},
+				"traits": map[string]any{
+					"talk_bias":      tr.TalkBias,
+					"search_k":       tr.SearchK,
+					"fetch_attempts": tr.FetchAttempts,
+				},
+			})
 		}
 	})
 	defer stopHB()
@@ -336,14 +452,19 @@ Regeln:
 		case txt := <-speakOutCh:
 			outCh <- OutMsg{Text: txt, Sources: nil, Kind: "auto"}
 		case om := <-outCh:
-			id := persistMessage(db.DB, om.Text, om.Sources, 0.4)
+			id := persistMessageWithKind(db.DB, om.Text, om.Sources, 0.4, om.Kind)
 			mu.Lock()
 			lastMessageID = id
 			mu.Unlock()
 			fmt.Println()
 			fmt.Println("Bunny:", om.Text)
 			fmt.Println()
-			fmt.Println("Rate it with: /rate up | /rate meh | /rate down")
+			fmt.Println("Train:", "/rate up", "|", "/rate meh", "|", "/rate down", "  (wenn ich gelogen habe oder Quatsch:", "/caught", ")")
+
+			// publish to UI
+			srv.PublishMessage(ui.Message{
+				ID: id, CreatedAt: time.Now().Format(time.RFC3339), Kind: om.Kind, Text: om.Text,
+			})
 		}
 	}
 }
@@ -920,4 +1041,20 @@ func must(err error) {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+func persistMessageWithKind(db *sql.DB, text string, sources []SourceRecord, priority float64, kind string) int64 {
+	id := persistMessage(db, text, sources, priority)
+	if id <= 0 {
+		return id
+	}
+	if kind == "" {
+		kind = "reply"
+	}
+	_, _ = db.Exec(
+		`INSERT INTO message_meta(message_id, kind) VALUES(?,?)
+         ON CONFLICT(message_id) DO UPDATE SET kind=excluded.kind`,
+		id, kind,
+	)
+	return id
 }
