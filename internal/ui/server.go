@@ -295,6 +295,8 @@ const indexHTML = `<!doctype html>
     .chat { padding: 16px; overflow: auto; }
     .side { border-left: 1px solid #222; padding: 16px; overflow: auto; background: #0f0f11; }
     .msg { background: #131316; border: 1px solid #242428; border-radius: 12px; padding: 12px; margin: 10px 0; }
+    .msg.user { background:#0f1a12; border-color:#21402b; margin-left: 64px; }
+    .msg.reply,.msg.auto,.msg.think { margin-right: 64px; }
     .meta { opacity: 0.7; font-size: 12px; display:flex; justify-content: space-between; gap: 12px; }
     .text { white-space: pre-wrap; line-height: 1.35; margin-top: 8px; }
     .btns { margin-top: 10px; display:flex; gap: 8px; }
@@ -337,7 +339,7 @@ const indexHTML = `<!doctype html>
 
   function renderMsg(m){
     const div = document.createElement('div');
-    div.className = 'msg';
+    div.className = 'msg ' + (m.kind||'');
     div.dataset.id = m.id;
     div.innerHTML =
       '<div class="meta">'+
@@ -348,12 +350,13 @@ const indexHTML = `<!doctype html>
         '<div>'+esc(m.created_at||'')+'</div>'+
       '</div>'+
       '<div class="text">'+esc(m.text||'')+'</div>'+
+      ((m.kind==='user') ? '' :
       '<div class="btns">'+
         '<button data-v="1">👍</button>'+
         '<button data-v="0">😐</button>'+
         '<button data-v="-1">👎</button>'+
         '<button data-c="1">❌ caught</button>'+
-      '</div>';
+      '</div>');
 
     div.querySelectorAll('button[data-v]').forEach(b=>{
       b.addEventListener('click', async ()=>{
@@ -361,9 +364,12 @@ const indexHTML = `<!doctype html>
         await fetch('/api/rate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message_id:m.id, value:v})});
       });
     });
-    div.querySelector('button[data-c]').addEventListener('click', async ()=>{
-      await fetch('/api/caught', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message_id:m.id})});
-    });
+    const caughtBtn = div.querySelector('button[data-c]');
+    if(caughtBtn){
+      caughtBtn.addEventListener('click', async ()=>{
+        await fetch('/api/caught', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message_id:m.id})});
+      });
+    }
     return div;
   }
 
