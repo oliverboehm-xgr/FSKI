@@ -155,6 +155,33 @@ func migrate(db *sql.DB) error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_memory_items_topic ON memory_items(topic);`,
 
+		// Values & stances
+		`CREATE TABLE IF NOT EXISTS stances (
+			topic TEXT PRIMARY KEY,
+			position REAL NOT NULL,
+			label TEXT NOT NULL,
+			rationale TEXT NOT NULL,
+			confidence REAL NOT NULL,
+			updated_at TEXT NOT NULL,
+			half_life_days REAL NOT NULL DEFAULT 60.0
+		);`,
+		`CREATE TABLE IF NOT EXISTS stance_sources (
+			topic TEXT NOT NULL,
+			url TEXT NOT NULL,
+			domain TEXT NOT NULL,
+			snippet TEXT NOT NULL,
+			fetched_at TEXT NOT NULL,
+			PRIMARY KEY(topic, url)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_stance_sources_topic ON stance_sources(topic);`,
+
+		// Generic key/value state (throttles, counters)
+		`CREATE TABLE IF NOT EXISTS kv_state (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+
 		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {

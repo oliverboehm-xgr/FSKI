@@ -62,6 +62,23 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"latency_pain_ms":          2500,
 				"auto_tune":                true,
 			}},
+			"values": {Type: "values", Enabled: true, Params: map[string]any{
+				"minimize_suffering": 1.0,
+				"truthfulness":       1.0,
+				"fairness":           0.8,
+				"stability":          0.6,
+				"curiosity":          0.6,
+			}},
+			"stance": {Type: "stance", Enabled: true, Params: map[string]any{
+				"half_life_days": 60.0,
+				"min_confidence": 0.35,
+				"auto_update":    true,
+			}},
+			"scout": {Type: "scout", Enabled: true, Params: map[string]any{
+				"interval_seconds": 45,
+				"min_curiosity":    0.55,
+				"max_per_hour":     24,
+			}},
 			"cooldown": {
 				Type:    "cooldown",
 				Enabled: true,
@@ -245,6 +262,68 @@ func (eg *Epigenome) SayEnergyCost() float64 {
 		return 1.0
 	}
 	return asFloat(m.Params["cost"], 1.0)
+}
+
+func (eg *Epigenome) Values() map[string]float64 {
+	m := eg.Modules["values"]
+	out := map[string]float64{}
+	if m == nil || !m.Enabled {
+		return out
+	}
+	for k, v := range m.Params {
+		out[k] = asFloat(v, 0)
+	}
+	return out
+}
+
+func (eg *Epigenome) StanceParams() (halfLifeDays float64, minConfidence float64, autoUpdate bool) {
+	m := eg.Modules["stance"]
+	if m == nil || !m.Enabled {
+		return 60.0, 0.35, true
+	}
+	halfLifeDays = asFloat(m.Params["half_life_days"], 60.0)
+	minConfidence = asFloat(m.Params["min_confidence"], 0.35)
+	autoUpdate, _ = m.Params["auto_update"].(bool)
+	if halfLifeDays < 7 {
+		halfLifeDays = 7
+	}
+	if minConfidence < 0 {
+		minConfidence = 0
+	}
+	if minConfidence > 1 {
+		minConfidence = 1
+	}
+	return
+}
+
+func (eg *Epigenome) ScoutParams() (intervalSec int, minCuriosity float64, maxPerHour int, enabled bool) {
+	m := eg.Modules["scout"]
+	if m == nil || !m.Enabled {
+		return 45, 0.55, 24, false
+	}
+	enabled = true
+	intervalSec = int(asFloat(m.Params["interval_seconds"], 45))
+	minCuriosity = asFloat(m.Params["min_curiosity"], 0.55)
+	maxPerHour = int(asFloat(m.Params["max_per_hour"], 24))
+	if intervalSec < 10 {
+		intervalSec = 10
+	}
+	if intervalSec > 600 {
+		intervalSec = 600
+	}
+	if minCuriosity < 0 {
+		minCuriosity = 0
+	}
+	if minCuriosity > 1 {
+		minCuriosity = 1
+	}
+	if maxPerHour < 1 {
+		maxPerHour = 1
+	}
+	if maxPerHour > 240 {
+		maxPerHour = 240
+	}
+	return
 }
 
 func (eg *Epigenome) Lang() string {

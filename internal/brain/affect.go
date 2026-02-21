@@ -62,6 +62,8 @@ func TickAffects(body any, a *AffectState, eg *epi.Epigenome, delta time.Duratio
 	}
 }
 
+func Clamp01(x float64) float64 { return clamp01(x) }
+
 func clamp01(x float64) float64 {
 	if x < 0 {
 		return 0
