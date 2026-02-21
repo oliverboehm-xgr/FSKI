@@ -86,7 +86,19 @@ func main() {
 
 	aff := brain.NewAffectState()
 	ws := brain.NewWorkspace()
-	ws.LLMAvailable = oc.Ping() == nil
+
+	// ---- Ollama auto-manage (opt-in) ----
+	enabled, autoStart, autoPull, retries, retryMs, pullSec, maxPull := eg.OllamaManagerParams()
+	if enabled {
+		want := []string{modelSpeaker, modelCritic, modelDaydream, modelScout, modelHippo, modelStance}
+		ctxEnsure, cancelEnsure := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelEnsure()
+		res := ollama.EnsureAvailable(ctxEnsure, oc, want, autoStart, autoPull, retries, time.Duration(retryMs)*time.Millisecond, time.Duration(pullSec)*time.Second, maxPull)
+		ws.LLMAvailable = res.Available && len(res.Missing) == 0
+		fmt.Println(ollama.FormatEnsure(res))
+	} else {
+		ws.LLMAvailable = oc.Ping() == nil
+	}
 
 	// NB intent classifier
 	nb := brain.NewNBIntent(db.DB)
