@@ -241,6 +241,31 @@ func migrate(db *sql.DB) error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_code_proposals_status ON code_proposals(status);`,
 
+		// ---------- Intent classifier (Naive Bayes) ----------
+		`CREATE TABLE IF NOT EXISTS reply_context (
+			message_id INTEGER PRIMARY KEY,
+			user_text TEXT NOT NULL,
+			intent TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_reply_context_intent ON reply_context(intent);`,
+
+		`CREATE TABLE IF NOT EXISTS intent_nb_prior (
+			intent TEXT PRIMARY KEY,
+			count REAL NOT NULL
+		);`,
+
+		`CREATE TABLE IF NOT EXISTS intent_nb_token (
+			token TEXT NOT NULL,
+			intent TEXT NOT NULL,
+			count REAL NOT NULL,
+			PRIMARY KEY(token, intent)
+		);`,
+		`CREATE TABLE IF NOT EXISTS intent_nb_meta (
+			intent TEXT PRIMARY KEY,
+			token_total REAL NOT NULL
+		);`,
+
 		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {

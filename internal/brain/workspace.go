@@ -38,6 +38,9 @@ type Workspace struct {
 
 	// Social ping throttle
 	LastSocialPingAt time.Time
+
+	// Router bookkeeping for learning
+	LastRoutedIntent string
 }
 
 func NewWorkspace() *Workspace {
