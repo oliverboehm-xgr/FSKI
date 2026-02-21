@@ -17,6 +17,9 @@ type Workspace struct {
 	PrevUserText   string
 	ActiveTopic    string
 	_daydreamAccum float64
+	LastLatencyMs  float64
+	LatencyEMA     float64
+	lastTuneAt     time.Time
 }
 
 func NewWorkspace() *Workspace {
