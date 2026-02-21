@@ -86,6 +86,7 @@ func main() {
 
 	aff := brain.NewAffectState()
 	ws := brain.NewWorkspace()
+	ws.LLMAvailable = oc.Ping() == nil
 
 	// NB intent classifier
 	nb := brain.NewNBIntent(db.DB)

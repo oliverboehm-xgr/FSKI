@@ -63,6 +63,7 @@ type Workspace struct {
 	// Generic info-gate traces (debug/telemetry)
 	LastUserInfoScore float64
 	LastUserTopToken  string
+	LLMAvailable      bool
 }
 
 func NewWorkspace() *Workspace {
