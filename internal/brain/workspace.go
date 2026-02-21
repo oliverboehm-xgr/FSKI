@@ -41,6 +41,11 @@ type Workspace struct {
 
 	// Router bookkeeping for learning
 	LastRoutedIntent string
+
+	// Policy selection (bandit)
+	LastPolicyCtx    string
+	LastPolicyAction string
+	LastPolicyStyle  string
 }
 
 func NewWorkspace() *Workspace {

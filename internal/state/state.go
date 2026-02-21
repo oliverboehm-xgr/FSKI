@@ -266,6 +266,36 @@ func migrate(db *sql.DB) error {
 			token_total REAL NOT NULL
 		);`,
 
+		// ---------- Preferences (likes/dislikes) ----------
+		`CREATE TABLE IF NOT EXISTS preferences (
+			key TEXT PRIMARY KEY,
+			value REAL NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_preferences_key ON preferences(key);`,
+
+		// ---------- Policy Bandit (Thompson sampling) ----------
+		`CREATE TABLE IF NOT EXISTS policy_stats (
+			context_key TEXT NOT NULL,
+			action TEXT NOT NULL,
+			alpha REAL NOT NULL,
+			beta REAL NOT NULL,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY(context_key, action)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_policy_stats_ctx ON policy_stats(context_key);`,
+
+		// Extended reply context with policy data.
+		`CREATE TABLE IF NOT EXISTS reply_context_v2 (
+			message_id INTEGER PRIMARY KEY,
+			user_text TEXT NOT NULL,
+			intent TEXT NOT NULL,
+			policy_ctx TEXT NOT NULL,
+			action TEXT NOT NULL,
+			style TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);`,
+
 		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {
