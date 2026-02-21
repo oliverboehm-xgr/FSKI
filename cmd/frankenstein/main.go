@@ -23,10 +23,11 @@ import (
 )
 
 type BodyState struct {
-	Energy        float64 // 0..100
-	MemLoad       float64 // proxy
-	WebCountHour  int
-	CooldownUntil time.Time
+	Energy            float64 // 0..100
+	MemLoad           float64 // proxy
+	WebCountHour      int
+	CooldownUntil     time.Time
+	AutoCooldownUntil time.Time // blocks ONLY autonomous speaking
 }
 
 type SourceRecord struct {
@@ -66,10 +67,11 @@ func main() {
 
 	// v0 BodyState
 	body := BodyState{
-		Energy:        80,
-		MemLoad:       0,
-		WebCountHour:  0,
-		CooldownUntil: time.Time{},
+		Energy:            80,
+		MemLoad:           0,
+		WebCountHour:      0,
+		CooldownUntil:     time.Time{},
+		AutoCooldownUntil: time.Time{},
 	}
 
 	aff := brain.NewAffectState()
@@ -106,7 +108,12 @@ func main() {
 	// DB-backed list (last N)
 	srv.ListMessages = func(limit int) ([]ui.Message, error) {
 		rows, err := db.DB.Query(
-			`SELECT m.id, m.created_at, COALESCE(mm.kind,'reply') as kind, m.text
+			`SELECT
+			   m.id,
+			   m.created_at,
+			   COALESCE(mm.kind,'reply') as kind,
+			   m.text,
+			   (SELECT r.value FROM ratings r WHERE r.message_id=m.id ORDER BY r.created_at DESC LIMIT 1) as rating
 			 FROM messages m
 			 LEFT JOIN message_meta mm ON mm.message_id = m.id
 			 ORDER BY m.id DESC
@@ -119,7 +126,14 @@ func main() {
 		var out []ui.Message
 		for rows.Next() {
 			var m ui.Message
-			_ = rows.Scan(&m.ID, &m.CreatedAt, &m.Kind, &m.Text)
+			var rating sql.NullInt64
+			_ = rows.Scan(&m.ID, &m.CreatedAt, &m.Kind, &m.Text, &rating)
+			if rating.Valid {
+				v := int(rating.Int64)
+				if v == -1 || v == 0 || v == 1 {
+					m.Rating = &v
+				}
+			}
 			out = append(out, m)
 		}
 		return out, nil
@@ -279,7 +293,7 @@ Regeln:
 		}
 
 		now := time.Now()
-		if now.Before(body.CooldownUntil) {
+		if now.Before(body.AutoCooldownUntil) {
 			return
 		}
 		minInterval := 25 * time.Second
@@ -316,7 +330,8 @@ Regeln:
 			if body.Energy < 0 {
 				body.Energy = 0
 			}
-			body.CooldownUntil = now.Add(eg.CooldownDuration())
+			// IMPORTANT: auto-speak has its own cooldown so normal replies don't suppress autonomy
+			body.AutoCooldownUntil = now.Add(eg.AutoSpeakCooldownDuration())
 			dr.UrgeToShare = dr.UrgeToShare * 0.55
 			lastAutoSpeak = now
 

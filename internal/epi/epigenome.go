@@ -52,6 +52,7 @@ func LoadOrInit(path string) (*Epigenome, error) {
 			"energy":           {Type: "energy", Enabled: true, Params: map[string]any{"max": 100}},
 			"utterance_filter": {Type: "utterance_filter", Enabled: true, Params: map[string]any{"banned_phrases": []any{}}},
 			"heartbeat":        {Type: "heartbeat", Enabled: true, Params: map[string]any{"ms": 500}},
+			"auto_speak":       {Type: "auto_speak", Enabled: true, Params: map[string]any{"cooldown_seconds": 18}},
 			"cooldown": {
 				Type:    "cooldown",
 				Enabled: true,
@@ -168,6 +169,18 @@ func (eg *Epigenome) CooldownDuration() time.Duration {
 	sec := asFloat(m.Params["seconds"], 120)
 	if sec < 0 {
 		sec = 0
+	}
+	return time.Duration(sec * float64(time.Second))
+}
+
+func (eg *Epigenome) AutoSpeakCooldownDuration() time.Duration {
+	m := eg.Modules["auto_speak"]
+	if m == nil || !m.Enabled {
+		return 18 * time.Second
+	}
+	sec := asFloat(m.Params["cooldown_seconds"], 18)
+	if sec < 5 {
+		sec = 5
 	}
 	return time.Duration(sec * float64(time.Second))
 }

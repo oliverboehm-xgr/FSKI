@@ -13,8 +13,9 @@ import (
 type Message struct {
 	ID        int64  `json:"id"`
 	CreatedAt string `json:"created_at"`
-	Kind      string `json:"kind"` // auto|reply|think
+	Kind      string `json:"kind"` // auto|reply|think|user
 	Text      string `json:"text"`
+	Rating    *int   `json:"rating,omitempty"` // -1,0,1
 }
 
 type Server struct {
@@ -299,9 +300,11 @@ const indexHTML = `<!doctype html>
     .msg.reply,.msg.auto,.msg.think { margin-right: 64px; }
     .meta { opacity: 0.7; font-size: 12px; display:flex; justify-content: space-between; gap: 12px; }
     .text { white-space: pre-wrap; line-height: 1.35; margin-top: 8px; }
-    .btns { margin-top: 10px; display:flex; gap: 8px; }
+    .btns { margin-top: 10px; display:flex; gap: 8px; align-items:center; }
     button { background:#1b1b20; border:1px solid #2b2b33; color:#eaeaea; border-radius:10px; padding:6px 10px; cursor:pointer; }
     button:hover { background:#24242a; }
+    button:disabled { opacity:0.45; cursor: default; }
+    .ack { font-size: 12px; opacity: 0.75; margin-left: 6px; }
     .row { display:flex; gap: 10px; padding: 12px; border-top: 1px solid #222; }
     input { flex:1; background:#101012; border:1px solid #2b2b33; border-radius:10px; padding:10px; color:#eaeaea; }
     .tag { font-size: 11px; padding:2px 8px; border:1px solid #2b2b33; border-radius:999px; }
@@ -337,10 +340,28 @@ const indexHTML = `<!doctype html>
 
   function esc(s){ return (s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
 
+  function scrollBottom(){
+    requestAnimationFrame(()=>{ chat.scrollTop = chat.scrollHeight; });
+  }
+
+  function addMsg(m){
+    chat.appendChild(renderMsg(m));
+    scrollBottom();
+  }
+
+  async function loadMessages(){
+    const res = await fetch('/api/messages?limit=80');
+    const msgs = await res.json();
+    chat.innerHTML = '';
+    msgs.reverse().forEach(addMsg);
+    scrollBottom();
+  }
+
   function renderMsg(m){
     const div = document.createElement('div');
     div.className = 'msg ' + (m.kind||'');
     div.dataset.id = m.id;
+    const rated = (m.rating === 1 || m.rating === 0 || m.rating === -1);
     div.innerHTML =
       '<div class="meta">'+
         '<div>'+
@@ -352,38 +373,43 @@ const indexHTML = `<!doctype html>
       '<div class="text">'+esc(m.text||'')+'</div>'+
       ((m.kind==='user') ? '' :
       '<div class="btns">'+
-        '<button data-v="1">👍</button>'+
-        '<button data-v="0">😐</button>'+
-        '<button data-v="-1">👎</button>'+
+        '<button data-v="1" '+(rated ? 'disabled' : '')+'>👍</button>'+
+        '<button data-v="0" '+(rated ? 'disabled' : '')+'>😐</button>'+
+        '<button data-v="-1" '+(rated ? 'disabled' : '')+'>👎</button>'+
         '<button data-c="1">❌ caught</button>'+
+        '<span class="ack">'+(rated ? '✓ gespeichert' : '')+'</span>'+
       '</div>');
 
     div.querySelectorAll('button[data-v]').forEach(b=>{
       b.addEventListener('click', async ()=>{
         const v = parseInt(b.dataset.v,10);
-        await fetch('/api/rate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message_id:m.id, value:v})});
+        const ack = div.querySelector('.ack');
+        b.disabled = true;
+        div.querySelectorAll('button[data-v]').forEach(x=>x.disabled=true);
+        const res = await fetch('/api/rate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message_id:m.id, value:v})});
+        if(res.ok){
+          if(ack) ack.textContent = '✓ gespeichert';
+        } else {
+          if(ack) ack.textContent = '✗ Fehler';
+          div.querySelectorAll('button[data-v]').forEach(x=>x.disabled=false);
+        }
       });
     });
     const caughtBtn = div.querySelector('button[data-c]');
     if(caughtBtn){
       caughtBtn.addEventListener('click', async ()=>{
-        await fetch('/api/caught', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message_id:m.id})});
+        const ack = div.querySelector('.ack');
+        caughtBtn.disabled = true;
+        const res = await fetch('/api/caught', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message_id:m.id})});
+        if(res.ok){
+          if(ack) ack.textContent = '✓ caught';
+        } else {
+          if(ack) ack.textContent = '✗ Fehler';
+          caughtBtn.disabled = false;
+        }
       });
     }
     return div;
-  }
-
-  function addMsg(m){
-    chat.appendChild(renderMsg(m));
-    chat.scrollTop = chat.scrollHeight;
-  }
-
-  async function loadMessages(){
-    const res = await fetch('/api/messages?limit=80');
-    const msgs = await res.json();
-    chat.innerHTML = '';
-    msgs.reverse().forEach(addMsg);
-    chat.scrollTop = chat.scrollHeight;
   }
 
   async function loadStatus(){
