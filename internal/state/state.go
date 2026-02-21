@@ -220,6 +220,27 @@ func migrate(db *sql.DB) error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_caught_events_created_at ON caught_events(created_at);`,
 
+		// ---------- Code index (self-awareness) ----------
+		`CREATE TABLE IF NOT EXISTS code_index (
+			path TEXT PRIMARY KEY,
+			package TEXT NOT NULL,
+			summary TEXT NOT NULL,
+			symbols_json TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_code_index_package ON code_index(package);`,
+
+		// ---------- Code proposals (gated self-modifying code) ----------
+		`CREATE TABLE IF NOT EXISTS code_proposals (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			title TEXT NOT NULL,
+			diff TEXT NOT NULL,
+			status TEXT NOT NULL, -- proposed|applied|rejected
+			notes TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_code_proposals_status ON code_proposals(status);`,
+
 		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {
