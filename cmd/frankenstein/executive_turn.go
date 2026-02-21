@@ -12,6 +12,14 @@ import (
 // ExecuteTurn: single place where strategy becomes actual execution.
 // This replaces "policy as prompt hint".
 func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, modelStance string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string) (string, error) {
+	if ws != nil && !ws.LLMAvailable {
+		low := strings.ToLower(userText)
+		if strings.Contains(low, "fühl") || strings.Contains(low, "wie geht") {
+			return "Ich kann dir meinen Zustand nennen (Ressourcen/Drives), aber mein Sprachzentrum (LLM/Ollama) ist auf diesem Gerät gerade nicht verfügbar. Installier/Starte Ollama, dann kann ich normal antworten.", nil
+		}
+		return "LLM backend offline. Ich bin da, aber mein Sprachzentrum (LLM/Ollama) ist gerade offline. Willst du, dass ich dir helfe, Ollama zu installieren/zu starten?", nil
+	}
+
 	// --- Generic info gate (learned IDF) ---
 	// Score first, then observe (avoid self-influencing DF during the same turn).
 	low, info := brain.IsLowInfo(db, eg, userText)

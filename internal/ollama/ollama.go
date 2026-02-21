@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 )
@@ -63,4 +64,19 @@ func (c *Client) Chat(model string, messages []Message) (string, error) {
 		return "", err
 	}
 	return out.Message.Content, nil
+}
+
+func (c *Client) Ping() error {
+	req, _ := http.NewRequest("GET", c.BaseURL+"/api/tags", nil)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("ollama status %d", resp.StatusCode)
+	}
+
+	return nil
 }
