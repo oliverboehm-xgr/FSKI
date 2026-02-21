@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -341,39 +342,74 @@ func answerWithEvidence(db *sql.DB, oc *ollama.Client, model string, body *BodyS
 		body.Energy = 0
 	}
 
-	results, err := websense.Search(query, 6)
+	k := 8
+	if tr != nil && tr.SearchK > 0 {
+		k = tr.SearchK
+	}
+
+	results, err := websense.Search(query, k)
 	if err != nil || len(results) == 0 {
-		return "Ich kann dazu gerade keine verlässlichen Quellen abrufen. Nenne mir bitte Ort/Zeitraum oder formuliere die Frage etwas konkreter.", nil
+		return "Ich kann dazu gerade keine Quellen abrufen (Search fehlgeschlagen). Formuliere die Frage etwas konkreter oder gib ein Stichwort mehr.", nil
+	}
+
+	maxFetch := 4
+	if tr != nil && tr.FetchAttempts > 0 {
+		maxFetch = tr.FetchAttempts
+	}
+	if maxFetch > len(results) {
+		maxFetch = len(results)
 	}
 
 	var sources []SourceRecord
-	for i := 0; i < len(results) && i < 2; i++ {
+
+	// 1) try fetch for first N results
+	for i := 0; i < maxFetch; i++ {
 		fr, err := websense.Fetch(results[i].URL)
 		if err != nil {
 			continue
 		}
 		storeSource(db, fr)
+		snip := fr.Snippet
+		if snip == "" {
+			snip = results[i].Snippet
+		}
 		sources = append(sources, SourceRecord{
 			URL:       fr.URL,
 			Domain:    fr.Domain,
-			Title:     fr.Title,
-			Snippet:   fr.Snippet,
+			Title:     pick(fr.Title, results[i].Title),
+			Snippet:   snip,
 			FetchedAt: fr.FetchedAt.Format(time.RFC3339),
 			Hash:      fr.Hash,
 		})
 	}
+
+	// 2) if fetching produced no sources, fall back to search snippets as evidence
 	if len(sources) == 0 {
-		return "Ich habe Treffer, aber ich kann gerade keine Inhalte sauber laden. Gib mir bitte Ort/Zeitraum oder ein Stichwort mehr.", nil
+		for i := 0; i < len(results) && i < 3; i++ {
+			if results[i].URL == "" {
+				continue
+			}
+			dom := ""
+			if pu, e := url.Parse(results[i].URL); e == nil {
+				dom = pu.Hostname()
+			}
+			sources = append(sources, SourceRecord{
+				URL:       results[i].URL,
+				Domain:    dom,
+				Title:     results[i].Title,
+				Snippet:   results[i].Snippet,
+				FetchedAt: time.Now().Format(time.RFC3339),
+				Hash:      "",
+			})
+		}
 	}
 
-	sys := `Du bist Bunny.
-HARTE REGELN
-1) Deutsch, kurz, sachlich.
-2) Externe Fakten: nur aus SOURCES_JSON antworten. Nichts raten.
-3) Antworte in 2 Teilen:
-   - Antwort: 1–3 Sätze.
-   - Quellen: 1 Zeile mit Domains.
-4) Wenn SOURCES_JSON nicht reicht: stelle GENAU 1 Rückfrage.`
+	if len(sources) == 0 {
+		return "Ich bekomme gerade weder Fetch noch brauchbare Snippets. Das ist ein Sensorik-Problem (Netz/Parser).", nil
+	}
+
+	sys := `Du bist Bunny. Nutze deine Sinnesorgane.
+Regel: Externe Fakten nur aus SOURCES_JSON ableiten. Wenn SOURCES_JSON nicht reicht: eine Rückfrage oder offen sagen, was fehlt.`
 	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, ws, tr, eg), "", "  ")
 	srcJSON, _ := json.MarshalIndent(sources, "", "  ")
 	user := "SelfModel:\n" + string(selfJSON) + "\n\nSOURCES_JSON:\n" + string(srcJSON) + "\n\nFrage:\n" + userText
@@ -389,6 +425,13 @@ HARTE REGELN
 	body.CooldownUntil = time.Now().Add(eg.CooldownDuration())
 	out = brain.ApplyUtteranceFilter(out, eg)
 	return brain.PostprocessUtterance(out), nil
+}
+
+func pick(a, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
+	}
+	return b
 }
 
 func storeSource(db *sql.DB, fr *websense.FetchResult) {
