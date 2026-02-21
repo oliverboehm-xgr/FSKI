@@ -53,6 +53,15 @@ func LoadOrInit(path string) (*Epigenome, error) {
 			"utterance_filter": {Type: "utterance_filter", Enabled: true, Params: map[string]any{"banned_phrases": []any{}}},
 			"heartbeat":        {Type: "heartbeat", Enabled: true, Params: map[string]any{"ms": 500}},
 			"auto_speak":       {Type: "auto_speak", Enabled: true, Params: map[string]any{"cooldown_seconds": 18}},
+			"memory": {Type: "memory", Enabled: true, Params: map[string]any{
+				"consolidate_every_events": 16,
+				"context_turns":            10,
+				"detail_items":             6,
+				"detail_half_life_days":    14.0,
+				"episode_half_life_days":   120.0,
+				"latency_pain_ms":          2500,
+				"auto_tune":                true,
+			}},
 			"cooldown": {
 				Type:    "cooldown",
 				Enabled: true,
@@ -183,6 +192,51 @@ func (eg *Epigenome) AutoSpeakCooldownDuration() time.Duration {
 		sec = 5
 	}
 	return time.Duration(sec * float64(time.Second))
+}
+
+func (eg *Epigenome) MemoryParams() (consolidateEvery int, contextTurns int, detailItems int, detailHalfLifeDays float64, episodeHalfLifeDays float64, latencyPainMs int, autoTune bool) {
+	m := eg.Modules["memory"]
+	if m == nil || !m.Enabled {
+		return 16, 10, 6, 14.0, 120.0, 2500, true
+	}
+	consolidateEvery = int(asFloat(m.Params["consolidate_every_events"], 16))
+	contextTurns = int(asFloat(m.Params["context_turns"], 10))
+	detailItems = int(asFloat(m.Params["detail_items"], 6))
+	detailHalfLifeDays = asFloat(m.Params["detail_half_life_days"], 14.0)
+	episodeHalfLifeDays = asFloat(m.Params["episode_half_life_days"], 120.0)
+	latencyPainMs = int(asFloat(m.Params["latency_pain_ms"], 2500))
+	autoTune, _ = m.Params["auto_tune"].(bool)
+	if consolidateEvery < 6 {
+		consolidateEvery = 6
+	}
+	if consolidateEvery > 60 {
+		consolidateEvery = 60
+	}
+	if contextTurns < 4 {
+		contextTurns = 4
+	}
+	if contextTurns > 30 {
+		contextTurns = 30
+	}
+	if detailItems < 0 {
+		detailItems = 0
+	}
+	if detailItems > 20 {
+		detailItems = 20
+	}
+	if detailHalfLifeDays < 1 {
+		detailHalfLifeDays = 1
+	}
+	if detailHalfLifeDays > 365 {
+		detailHalfLifeDays = 365
+	}
+	if episodeHalfLifeDays < 7 {
+		episodeHalfLifeDays = 7
+	}
+	if latencyPainMs < 300 {
+		latencyPainMs = 300
+	}
+	return
 }
 
 func (eg *Epigenome) SayEnergyCost() float64 {

@@ -97,6 +97,8 @@ func main() {
 	outCh := make(chan OutMsg, 16)
 	speakReqCh := make(chan brain.SpeakRequest, 8)
 	speakOutCh := make(chan string, 8)
+	memReqCh := make(chan brain.ConsolidateRequest, 4)
+	memOutCh := make(chan string, 4)
 
 	var lastMessageID int64 = 0 // protected by mu
 	var lastAutoSpeak time.Time // protected by mu
@@ -177,8 +179,10 @@ func main() {
 		}
 
 		// 2) generate Bunny reply
+		start := time.Now()
 		mu.Lock()
 		out, err := say(db.DB, epiPath, oc, model, &body, aff, ws, tr, dr, eg, text)
+		brain.LatencyAffect(ws, aff, eg, time.Since(start))
 		mu.Unlock()
 		if err != nil {
 			return ui.Message{}, err
@@ -270,6 +274,28 @@ Regeln:
 		}
 	}()
 
+	go func() {
+		for req := range memReqCh {
+			sys := `Du bist Hippocampus (Bunny).
+Fasse die folgenden Ereignisse zu einer GROBEN STORY zusammen (Gist), Details weglassen.
+Ziel: 5-9 kurze Sätze oder Bulletpoints, neutral, deutsch.
+Keine erfundenen Fakten.`
+			user := "TOPIC: " + req.Topic + "\nEVENTS:\n" + req.TextBlock + "\n\nGIST:"
+			sum, err := oc.Chat(model, []ollama.Message{
+				{Role: "system", Content: sys},
+				{Role: "user", Content: user},
+			})
+			if err != nil {
+				continue
+			}
+			sum = strings.TrimSpace(sum)
+			if sum == "" {
+				continue
+			}
+			memOutCh <- fmt.Sprintf("%d|%d|%s\n%s", req.StartEvent, req.EndEvent, req.Topic, sum)
+		}
+	}()
+
 	hb := brain.NewHeartbeat(eg)
 	var tickN int
 	stopHB := hb.Start(func(delta time.Duration) {
@@ -281,6 +307,17 @@ Regeln:
 		brain.TickWorkspace(ws, &body, aff, tr, eg, delta)
 		brain.TickDrives(dr, aff, delta)
 		brain.TickDaydream(db.DB, ws, dr, aff, delta)
+		if brain.AutoTuneMemory(eg, ws, aff) {
+			_ = eg.Save(epiPath)
+		}
+		if ws.ActiveTopic != "" {
+			if ok, req := brain.NeedsConsolidation(db.DB, eg, ws.ActiveTopic); ok {
+				select {
+				case memReqCh <- req:
+				default:
+				}
+			}
+		}
 
 		tickN++
 		if tickN%60 == 0 {
@@ -402,8 +439,10 @@ Regeln:
 					continue
 				}
 				userText := strings.Join(args, " ")
+				start := time.Now()
 				mu.Lock()
 				out, err := say(db.DB, epiPath, oc, model, &body, aff, ws, tr, dr, eg, userText)
+				brain.LatencyAffect(ws, aff, eg, time.Since(start))
 				mu.Unlock()
 				if err != nil {
 					fmt.Println("ERR:", err)
@@ -489,6 +528,17 @@ Regeln:
 			id := persistMessageWithKind(db.DB, om.Text, om.Sources, 0.4, om.Kind)
 			mu.Lock()
 			lastMessageID = id
+			topic := ws.ActiveTopic
+			if topic == "" {
+				topic = ws.LastTopic
+			}
+			ch := om.Kind
+			if ch == "" {
+				ch = "reply"
+			}
+			brain.InsertEvent(db.DB, ch, topic, om.Text, id, 0.35)
+			_, _, _, detHalf, _, _, _ := eg.MemoryParams()
+			brain.InsertMemoryItem(db.DB, ch, topic, "utterance", om.Text, 0.25, detHalf)
 			mu.Unlock()
 			fmt.Println()
 			fmt.Println("Bunny:", om.Text)
@@ -499,6 +549,21 @@ Regeln:
 			srv.PublishMessage(ui.Message{
 				ID: id, CreatedAt: time.Now().Format(time.RFC3339), Kind: om.Kind, Text: om.Text,
 			})
+		case sum := <-memOutCh:
+			parts := strings.SplitN(sum, "\n", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			head := parts[0]
+			bodySum := strings.TrimSpace(parts[1])
+			hp := strings.SplitN(head, "|", 3)
+			if len(hp) != 3 {
+				continue
+			}
+			startID, _ := strconv.ParseInt(hp[0], 10, 64)
+			endID, _ := strconv.ParseInt(hp[1], 10, 64)
+			topic := hp[2]
+			brain.SaveEpisode(db.DB, topic, startID, endID, bodySum)
 		}
 	}
 }

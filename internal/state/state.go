@@ -116,6 +116,45 @@ func migrate(db *sql.DB) error {
 			updated_at TEXT NOT NULL
 		);`,
 
+		// Unified event stream (multi-channel: user/reply/auto/daydream/web/...)
+		`CREATE TABLE IF NOT EXISTS events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			channel TEXT NOT NULL,
+			topic TEXT NOT NULL,
+			text TEXT NOT NULL,
+			message_id INTEGER,
+			salience REAL NOT NULL DEFAULT 0.3
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_events_topic ON events(topic);`,
+
+		// Episodes (gist/story). Details fade, gist remains.
+		`CREATE TABLE IF NOT EXISTS episodes (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			topic TEXT NOT NULL,
+			start_event_id INTEGER NOT NULL,
+			end_event_id INTEGER NOT NULL,
+			summary TEXT NOT NULL,
+			salience REAL NOT NULL DEFAULT 0.6
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_episodes_topic ON episodes(topic);`,
+
+		// Memory items (details with decay)
+		`CREATE TABLE IF NOT EXISTS memory_items (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			channel TEXT NOT NULL,
+			topic TEXT NOT NULL,
+			key TEXT NOT NULL,
+			value TEXT NOT NULL,
+			salience REAL NOT NULL DEFAULT 0.3,
+			half_life_days REAL NOT NULL DEFAULT 14.0,
+			last_accessed_at TEXT
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_memory_items_topic ON memory_items(topic);`,
+
 		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {
