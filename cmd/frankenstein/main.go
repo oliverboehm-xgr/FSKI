@@ -234,6 +234,7 @@ func main() {
 		_ = brain.ApplyCaught(db.DB, tr, aff, eg)
 		_ = brain.SaveAffectState(db.DB, aff)
 		dr.UrgeToShare = clamp01(dr.UrgeToShare - 0.15)
+		_, _ = db.DB.Exec(`INSERT INTO caught_events(created_at,message_id) VALUES(?,?)`, time.Now().Format(time.RFC3339), messageID)
 		mu.Unlock()
 		return nil
 	}
@@ -713,6 +714,9 @@ Antworte NUR als JSON:
 				_ = brain.SaveAffectState(db.DB, aff)
 				if dr != nil {
 					dr.UrgeToShare = clamp01(dr.UrgeToShare - 0.15)
+				}
+				if lastMessageID > 0 {
+					_, _ = db.DB.Exec(`INSERT INTO caught_events(created_at,message_id) VALUES(?,?)`, time.Now().Format(time.RFC3339), lastMessageID)
 				}
 				mu.Unlock()
 				fmt.Println("(caught -> shame spike, bluff reduced)")
