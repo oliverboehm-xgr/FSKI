@@ -17,7 +17,7 @@ func UpdateActiveTopic(ws *Workspace, userText string) string {
 	}
 
 	cand := ExtractTopic(userText)
-	if cand == "" {
+	if cand == "" || isMetaTopic(cand) {
 		return ws.ActiveTopic
 	}
 
@@ -42,4 +42,13 @@ func UpdateActiveTopic(ws *Workspace, userText string) string {
 		ws.ActiveTopic = cand
 	}
 	return ws.ActiveTopic
+}
+
+func isMetaTopic(t string) bool {
+	switch strings.ToLower(t) {
+	case "jetzt", "moment", "gegenwart", "heute", "morgen":
+		return true
+	default:
+		return false
+	}
 }

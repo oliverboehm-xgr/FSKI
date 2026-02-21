@@ -99,6 +99,8 @@ func main() {
 	speakOutCh := make(chan string, 8)
 	memReqCh := make(chan brain.ConsolidateRequest, 4)
 	memOutCh := make(chan string, 4)
+	scoutReqCh := make(chan brain.ScoutRequest, 4)
+	scoutOutCh := make(chan string, 4)
 
 	var lastMessageID int64 = 0 // protected by mu
 	var lastAutoSpeak time.Time // protected by mu
@@ -296,6 +298,44 @@ Keine erfundenen Fakten.`
 		}
 	}()
 
+	go func() {
+		for req := range scoutReqCh {
+			results, err := websense.Search(req.Query, 6)
+			if err != nil || len(results) == 0 {
+				continue
+			}
+			type Ev struct {
+				URL     string `json:"url"`
+				Domain  string `json:"domain"`
+				Title   string `json:"title"`
+				Snippet string `json:"snippet"`
+			}
+			evs := make([]Ev, 0, 3)
+			for i := 0; i < len(results) && i < 3; i++ {
+				dom := ""
+				if pu, e := url.Parse(results[i].URL); e == nil {
+					dom = pu.Hostname()
+				}
+				evs = append(evs, Ev{URL: results[i].URL, Domain: dom, Title: results[i].Title, Snippet: results[i].Snippet})
+			}
+			evJSON, _ := json.MarshalIndent(evs, "", "  ")
+			sys := `Du bist Bunny-Scout.
+Aus EVIDENCE eine knappe Einordnung des Themas erstellen.
+Antwort NUR als JSON:
+{"summary":"1-3 Sätze","confidence":0.0-1.0,"importance":0.0-1.0}`
+			user := "TOPIC: " + req.Topic + "\nEVIDENCE:\n" + string(evJSON)
+			out, err := oc.Chat(model, []ollama.Message{{Role: "system", Content: sys}, {Role: "user", Content: user}})
+			if err != nil {
+				continue
+			}
+			out = strings.TrimSpace(out)
+			if out == "" {
+				continue
+			}
+			scoutOutCh <- req.Topic + "\n" + out
+		}
+	}()
+
 	hb := brain.NewHeartbeat(eg)
 	var tickN int
 	stopHB := hb.Start(func(delta time.Duration) {
@@ -316,6 +356,12 @@ Keine erfundenen Fakten.`
 				case memReqCh <- req:
 				default:
 				}
+			}
+		}
+		if ok, req := brain.MaybeQueueScout(db.DB, eg, ws, dr); ok {
+			select {
+			case scoutReqCh <- req:
+			default:
 			}
 		}
 
@@ -549,6 +595,30 @@ Keine erfundenen Fakten.`
 			srv.PublishMessage(ui.Message{
 				ID: id, CreatedAt: time.Now().Format(time.RFC3339), Kind: om.Kind, Text: om.Text,
 			})
+
+		case scout := <-scoutOutCh:
+			parts := strings.SplitN(scout, "\n", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			topic := strings.TrimSpace(parts[0])
+			js := strings.TrimSpace(parts[1])
+			var parsed struct {
+				Summary    string  `json:"summary"`
+				Confidence float64 `json:"confidence"`
+				Importance float64 `json:"importance"`
+			}
+			if err := json.Unmarshal([]byte(js), &parsed); err != nil || parsed.Summary == "" {
+				continue
+			}
+			brain.UpsertConcept(db.DB, brain.Concept{Term: topic, Kind: "concept", Summary: parsed.Summary, Confidence: clamp01(parsed.Confidence), Importance: clamp01(parsed.Importance)})
+			mu.Lock()
+			brain.InsertEvent(db.DB, "web", topic, parsed.Summary, 0, 0.45)
+			brain.InsertMemoryItem(db.DB, "web", topic, "scout", parsed.Summary, 0.35, 14.0)
+			if dr != nil {
+				dr.UrgeToShare = clamp01(dr.UrgeToShare + 0.10*clamp01(parsed.Importance))
+			}
+			mu.Unlock()
 		case sum := <-memOutCh:
 			parts := strings.SplitN(sum, "\n", 2)
 			if len(parts) != 2 {
@@ -682,6 +752,10 @@ func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *Body
 		return answerWithEvidence(db, oc, model, body, aff, ws, tr, eg, rd.Query)
 	}
 
+	if intent == brain.IntentOpinion {
+		return answerWithStance(db, oc, model, body, aff, ws, tr, eg, userText)
+	}
+
 	// external fact explicit routing remains as a safe default
 	if intent == brain.IntentExternalFact {
 		ans, err := answerWithEvidence(db, oc, model, body, aff, ws, tr, eg, userText)
@@ -705,14 +779,18 @@ HARTE REGELN
 	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, ws, tr, eg), "", "  ")
 	mode := brain.IntentToMode(intent)
 	activeTopic := ""
-	if ws != nil { activeTopic = ws.ActiveTopic }
+	if ws != nil {
+		activeTopic = ws.ActiveTopic
+	}
 	// STM (last turns)
 	_, ctxTurns, detailItems, _, _, _, _ := eg.MemoryParams()
 	turns := brain.RecentTurns(db, ctxTurns)
 	// Gist (episode summary)
 	gist := ""
 	if activeTopic != "" {
-		if s, ok := brain.GetLastEpisode(db, activeTopic); ok { gist = s }
+		if s, ok := brain.GetLastEpisode(db, activeTopic); ok {
+			gist = s
+		}
 	}
 	// Details (decaying items)
 	details := ""
