@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -116,6 +117,19 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"ema_user_reward":           0.12,
 				"ema_caught":                0.20,
 				"help_min_interval_seconds": 180, // don't nag
+			}},
+
+			// Models per brain area (LoRA-ready).
+			// Keys are "speaker", "critic", "daydream", "scout", "hippocampus", "stance".
+			"models": {Type: "models", Enabled: true, Params: map[string]any{
+				"default":     "llama3.1:8b",
+				"speaker":     "llama3.1:8b",
+				"critic":      "llama3.1:8b",
+				"daydream":    "llama3.1:8b",
+				"scout":       "llama3.1:8b",
+				"hippocampus": "llama3.1:8b",
+				"stance":      "llama3.1:8b",
+				// later you can set: "critic": "llama3.1:8b-lora-critic"
 			}},
 			"cooldown": {
 				Type:    "cooldown",
@@ -614,4 +628,25 @@ func asFloat(v any, def float64) float64 {
 	default:
 		return def
 	}
+}
+
+func (eg *Epigenome) ModelFor(area string, fallback string) string {
+	m := eg.Modules["models"]
+	if m == nil || !m.Enabled {
+		if fallback != "" {
+			return fallback
+		}
+		return "llama3.1:8b"
+	}
+	area = strings.ToLower(strings.TrimSpace(area))
+	if v, ok := m.Params[area].(string); ok && v != "" {
+		return v
+	}
+	if v, ok := m.Params["default"].(string); ok && v != "" {
+		return v
+	}
+	if fallback != "" {
+		return fallback
+	}
+	return "llama3.1:8b"
 }
