@@ -9,7 +9,7 @@ const (
 	IntentMetaBunny
 	IntentUserLife
 	IntentTaskTech
-	IntentWeather
+	IntentExternalFact
 )
 
 func DetectIntent(s string) Intent {
@@ -17,8 +17,14 @@ func DetectIntent(s string) Intent {
 	switch {
 	case hasAny(t, "wie geht", "was denkst", "hast du angst", "hast du gefühl", "energie", "cooldown"):
 		return IntentMetaBunny
-	case hasAny(t, "wetter", "vorhersage", "temperatur", "regen", "wind"):
-		return IntentWeather
+	case hasAny(t,
+		"wetter", "vorhersage", "temperatur", "regen", "wind",
+		"news", "nachrichten", "heute", "morgen",
+		"kurs", "preis", "aktie", "bitcoin", "ethereum",
+		"datum", "uhrzeit", "wann", "wie viel",
+		"wer ist", "aktuell", "jetzt",
+	):
+		return IntentExternalFact
 	case hasAny(t, "glücklich", "sinn", "beziehung", "stress", "motivation"):
 		return IntentUserLife
 	case hasAny(t, "code", "patch", "github", "fski", "go ", "ollama", "sqlite", "module"):
@@ -32,8 +38,8 @@ func IntentToMode(i Intent) string {
 	switch i {
 	case IntentMetaBunny:
 		return "META_BUNNY"
-	case IntentWeather:
-		return "WEATHER"
+	case IntentExternalFact:
+		return "EXTERNAL_FACT"
 	case IntentUserLife:
 		return "USER_LIFE"
 	case IntentTaskTech:
