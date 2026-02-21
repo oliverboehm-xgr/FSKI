@@ -22,6 +22,21 @@ func ConceptExists(db *sql.DB, term string) bool {
 	return t != ""
 }
 
+func GetConcept(db *sql.DB, term string) (Concept, bool) {
+	if db == nil {
+		return Concept{}, false
+	}
+	var c Concept
+	err := db.QueryRow(
+		`SELECT term, kind, summary, confidence, importance FROM concepts WHERE term=?`,
+		term,
+	).Scan(&c.Term, &c.Kind, &c.Summary, &c.Confidence, &c.Importance)
+	if err != nil || c.Term == "" {
+		return Concept{}, false
+	}
+	return c, true
+}
+
 func UpsertConcept(db *sql.DB, c Concept) {
 	if db == nil {
 		return
