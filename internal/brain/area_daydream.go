@@ -14,6 +14,10 @@ func (a *DaydreamArea) Tick(ctx *TickContext) []Action {
 	if ctx == nil || ctx.EG == nil || ctx.WS == nil || ctx.Dr == nil {
 		return nil
 	}
+	// survival gate: no daydream under high survival pressure
+	if ctx.WS.DrivesEnergyDeficit >= 0.65 {
+		return nil
+	}
 	intervalSec, minCur, minEnergy, _, enabled := ctx.EG.DaydreamParams()
 	if !enabled {
 		return nil
