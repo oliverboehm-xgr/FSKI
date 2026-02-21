@@ -150,6 +150,18 @@ func main() {
 		return st, nil
 	}
 	srv.SendText = func(text string) (ui.Message, error) {
+		// 1) persist + publish USER message immediately
+		userID := persistMessageWithKind(db.DB, text, nil, 0.1, "user")
+		if userID > 0 {
+			srv.PublishMessage(ui.Message{
+				ID:        userID,
+				CreatedAt: time.Now().Format(time.RFC3339),
+				Kind:      "user",
+				Text:      text,
+			})
+		}
+
+		// 2) generate Bunny reply
 		mu.Lock()
 		out, err := say(db.DB, epiPath, oc, model, &body, aff, ws, tr, dr, eg, text)
 		mu.Unlock()
@@ -161,7 +173,10 @@ func main() {
 		lastMessageID = id
 		mu.Unlock()
 		return ui.Message{
-			ID: id, CreatedAt: time.Now().Format(time.RFC3339), Kind: "reply", Text: out,
+			ID:        id,
+			CreatedAt: time.Now().Format(time.RFC3339),
+			Kind:      "reply",
+			Text:      out,
 		}, nil
 	}
 	srv.RateMessage = func(messageID int64, value int) error {
