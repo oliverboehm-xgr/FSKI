@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"frankenstein-v0/internal/brain"
+	"frankenstein-v0/internal/codeindex"
 	"frankenstein-v0/internal/epi"
 	"frankenstein-v0/internal/ollama"
 	"frankenstein-v0/internal/sensors"
@@ -102,7 +103,7 @@ func main() {
 	var mu sync.Mutex
 
 	fmt.Println("Bunny v0 online.")
-	fmt.Println("Commands: /think | /say <text...> | /rate <up|meh|down> | /caught | /status | /mutate ... | /quit")
+	fmt.Println("Commands: /think | /say <text...> | /rate <up|meh|down> | /caught | /status | /mutate ... | /selfcode index | /quit")
 	fmt.Println()
 
 	// async input + async output
@@ -763,8 +764,20 @@ Antworte NUR als JSON:
 					continue
 				}
 				fmt.Println("(epigenome updated)")
+			case "/selfcode":
+				if len(args) >= 1 && args[0] == "index" {
+					cwd, _ := os.Getwd()
+					if err := codeindex.IndexRepo(db.DB, cwd); err != nil {
+						fmt.Println("ERR index:", err)
+					} else {
+						fmt.Println("OK: code indexed.")
+					}
+					continue
+				}
+				fmt.Println("Use: /selfcode index")
+				continue
 			default:
-				fmt.Println("Unknown. Try /think, /say, /status or /quit.")
+				fmt.Println("Unknown. Try /think, /say, /status, /selfcode index or /quit.")
 			}
 		case txt := <-speakOutCh:
 			outCh <- OutMsg{Text: txt, Sources: nil, Kind: "auto"}
