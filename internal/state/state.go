@@ -212,6 +212,14 @@ func migrate(db *sql.DB) error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_candidate_history_candidate ON candidate_history(candidate_id);`,
 
+		// ---------- Caught events (for user satisfaction / shame learning) ----------
+		`CREATE TABLE IF NOT EXISTS caught_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			message_id INTEGER NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_caught_events_created_at ON caught_events(created_at);`,
+
 		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {

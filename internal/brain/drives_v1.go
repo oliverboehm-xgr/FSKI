@@ -127,7 +127,19 @@ func computeUserRewardEMA(db *sql.DB, alpha float64) (reward float64, caught flo
 		}
 		reward = ema
 	}
-	return reward, 0
+	var n int
+	_ = db.QueryRow(
+		`SELECT COUNT(*) FROM caught_events WHERE created_at >= ?`,
+		time.Now().Add(-60*time.Minute).Format(time.RFC3339),
+	).Scan(&n)
+	caught = 1.0 - math.Exp(-0.5*float64(n))
+	if caught < 0 {
+		caught = 0
+	}
+	if caught > 1 {
+		caught = 1
+	}
+	return reward, caught
 }
 
 func TickDrivesV1(db *sql.DB, eg *epi.Epigenome, d *DrivesV1, ws *Workspace, aff *AffectState, snap sensors.Snapshot, latencyEMAms float64, activeTopic string, conceptConf float64, stanceConf float64) {
