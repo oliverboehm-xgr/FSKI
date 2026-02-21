@@ -742,6 +742,10 @@ func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *Body
 	}
 
 	intent := brain.DetectIntent(userText)
+	// Hard rule: Opinion -> stance engine (stance persists, becomes personality)
+	if intent == brain.IntentOpinion {
+		return answerWithStance(db, oc, model, body, aff, ws, tr, eg, userText)
+	}
 
 	// GENERIC RESEARCH GATE:
 	// decides when senses are needed to make progress (not only "opinion").
@@ -750,10 +754,6 @@ func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *Body
 		// If the gate says "research", route into evidence answering.
 		// answerWithEvidence already does Search+Fetch+Snippet fallback.
 		return answerWithEvidence(db, oc, model, body, aff, ws, tr, eg, rd.Query)
-	}
-
-	if intent == brain.IntentOpinion {
-		return answerWithStance(db, oc, model, body, aff, ws, tr, eg, userText)
 	}
 
 	// external fact explicit routing remains as a safe default
@@ -776,7 +776,8 @@ HARTE REGELN
 5) Bei Themen wie "glücklich/Sinn/Stress/Beziehung": keine Annahmen. Stelle zuerst 1–2 präzise Rückfragen.
 6) Externe Fakten nie raten. Wenn keine Quellen: offen sagen. (External-Facts werden automatisch via Evidence-Resolver gelöst.)
 7) Maximal 5 Sätze.`
-	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, ws, tr, eg), "", "  ")
+	sm := epi.BuildSelfModel(body, aff, ws, tr, eg)
+	selfLines := buildSelfLines(sm, aff)
 	mode := brain.IntentToMode(intent)
 	activeTopic := ""
 	if ws != nil {
@@ -809,7 +810,7 @@ HARTE REGELN
 		"\n\nDETAILS (decay):\n" + details +
 		"\n\nCONCEPTS:\n" + concepts +
 		"\n\nRECENT_TURNS:\n" + turns +
-		"\n\nSelfModel:\n" + string(selfJSON) +
+		"\n\nSELFMODEL_LINES:\n" + selfLines +
 		"\n\nUSER:\n" + userText
 	out, err := oc.Chat(model, []ollama.Message{
 		{Role: "system", Content: sys},
