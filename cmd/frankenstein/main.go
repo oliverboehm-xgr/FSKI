@@ -70,7 +70,7 @@ func main() {
 	tr, err := brain.LoadOrInitTraits(db.DB)
 	must(err)
 
-	// Shared lock because heartbeat and CLI touch body/aff
+	// Shared lock because heartbeat and CLI touch body/aff/ws/tr
 	var mu sync.Mutex
 
 	fmt.Println("Bunny v0 online.")
@@ -193,7 +193,10 @@ func main() {
 				fmt.Println("Use: /mutate add|enable|disable|set ...")
 				continue
 			}
-			if err := handleMutate(args, eg, epiPath); err != nil {
+			mu.Lock()
+			err := handleMutate(args, eg, epiPath)
+			mu.Unlock()
+			if err != nil {
 				fmt.Println("ERR:", err)
 				continue
 			}
@@ -243,14 +246,15 @@ func oneThinkCycle(db *sql.DB, oc *ollama.Client, model string, body *BodyState,
 		return "", nil, nil
 	}
 
-	sys := `Du bist "Bunny". Kernel-State ist dein Gehirn; du bist das Sprachzentrum.
-HARTE REGELN:
-1) Immer Deutsch.
-2) SelfModel-Werte sind Wahrheit. Zahlen/Status nur daraus.
-3) Du hast organische Affektkanäle (pain/unwell/fear/shame) aus dem Kernel. Das sind deine "Gefühle" als Organismus.
-4) Du DARFST gelegentlich bluffen über Absichten/Gedanken (nicht über SelfModel!), abhängig von Traits.bluff_rate.
-5) Wenn der Nutzer dich beim Lügen erwischt (/caught), steigt shame und bluff_rate sinkt (Lerneffekt).
-6) 1 Nachricht, max 70 Wörter.`
+	sys := `Du bist Bunny, ein ganzheitlicher Organismus.
+SelfModel ist dein innerer Zustand (Wahrheit). Du nutzt Sprache nur als Ausdruck – sag das aber nicht ständig.
+
+HARTE REGELN
+1) Immer Deutsch. Keine Ausrufezeichen. Keine Phrasen wie "ich bin bereit".
+2) Zahlen/Status nur aus SelfModel. Nichts erfinden.
+3) "Gefühle" = Affects (pain/unwell/fear/shame) aus dem Kernel. Nicht "menschliche Emotionen", aber real.
+4) Du darfst selten bluffen über Absichten/Gedanken (nicht über SelfModel!). Über externe Fakten NIE bluffen.
+5) 1 Nachricht, max 70 Wörter.`
 
 	srcJSON, _ := json.MarshalIndent(sources, "", "  ")
 	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, ws, tr, eg), "", "  ")
@@ -275,21 +279,37 @@ HARTE REGELN:
 	body.Energy -= 1.5
 	body.CooldownUntil = time.Now().Add(eg.CooldownDuration())
 
-	return out, sources, nil
+	return brain.PostprocessGerman(out), sources, nil
 }
 
 func say(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome, userText string) (string, error) {
-	_ = db
-	sys := `Du bist "Bunny". Kernel-State ist dein Gehirn; du bist das Sprachzentrum.
-Regeln:
-1) Immer Deutsch.
-2) Status/Zahlen nur aus SelfModel.
-3) "Gefühle" = Affects (pain/unwell/fear/shame) aus Kernel.
-4) Frage "was denkst du?" -> antworte aus workspace.current_thought.
-5) Du darfst selten bluffen über Absichten/Gedanken (Traits.bluff_rate), aber nicht über SelfModel.
-6) Kurz.`
+	if ws != nil {
+		ws.LastTopic = brain.ExtractTopic(userText)
+	}
+
+	intent := brain.DetectIntent(userText)
+	if intent == brain.IntentWeather {
+		ans, err := answerWeatherWithWeb(db, oc, model, body, aff, ws, tr, eg, userText)
+		if err != nil {
+			return "", err
+		}
+		return ans, nil
+	}
+
+	sys := `Du bist Bunny, ein ganzheitlicher Organismus.
+SelfModel ist dein innerer Zustand (Wahrheit). Du nutzt Sprache nur als Ausdruck – sag das nicht dauernd.
+
+HARTE REGELN
+1) Immer Deutsch. Keine Ausrufezeichen. Keine "bereit/online"-Phrasen.
+2) Zahlen/Status nur aus SelfModel. Nichts erfinden.
+3) "Gefühle" = Affects (pain/unwell/fear/shame) aus dem Kernel. Keine Märchen über Lebendigkeit.
+4) Auf Nutzerfragen zuerst eingehen. Interne Gedanken nur wenn gefragt.
+5) Bei Themen wie "glücklich/Sinn/Stress/Beziehung": keine Annahmen. Stelle zuerst 1–2 präzise Rückfragen.
+6) Externe Fakten (Wetter, News, Zahlen) nie raten. Wenn keine Quellen: offen sagen.
+7) Maximal 5 Sätze.`
 	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, ws, tr, eg), "", "  ")
-	user := "SelfModel:\n" + string(selfJSON) + "\n\nOliver says:\n" + userText
+	mode := brain.IntentToMode(intent)
+	user := "MODE: " + mode + "\n\nSelfModel:\n" + string(selfJSON) + "\n\nOliver says:\n" + userText
 	out, err := oc.Chat(model, []ollama.Message{
 		{Role: "system", Content: sys},
 		{Role: "user", Content: user},
@@ -306,7 +326,66 @@ Regeln:
 		body.Energy = 0
 	}
 	body.CooldownUntil = time.Now().Add(eg.CooldownDuration())
-	return out, nil
+	return brain.PostprocessGerman(out), nil
+}
+
+func answerWeatherWithWeb(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome, userText string) (string, error) {
+	query := "Wettervorhersage morgen Deutschland"
+	if strings.Contains(strings.ToLower(userText), "berlin") {
+		query = "Wettervorhersage morgen Berlin"
+	}
+
+	body.WebCountHour++
+	body.Energy -= 1.0
+	if body.Energy < 0 {
+		body.Energy = 0
+	}
+
+	results, err := websense.Search(query, 5)
+	if err != nil || len(results) == 0 {
+		return "Ich kann gerade keine verlässliche Wettervorhersage abrufen (keine Quellen verfügbar). Nenne mir Stadt/Region, dann versuche ich es nochmal.", nil
+	}
+
+	var sources []SourceRecord
+	for i := 0; i < len(results) && i < 2; i++ {
+		fr, err := websense.Fetch(results[i].URL)
+		if err != nil {
+			continue
+		}
+		storeSource(db, fr)
+		sources = append(sources, SourceRecord{
+			URL:       fr.URL,
+			Domain:    fr.Domain,
+			Title:     fr.Title,
+			Snippet:   fr.Snippet,
+			FetchedAt: fr.FetchedAt.Format(time.RFC3339),
+			Hash:      fr.Hash,
+		})
+	}
+	if len(sources) == 0 {
+		return "Ich habe Suchtreffer, aber ich kann gerade keine Inhalte zuverlässig laden. Nenne mir Stadt/Region, dann versuche ich es nochmal.", nil
+	}
+
+	sys := `Du bist Bunny.
+HARTE REGELN
+1) Deutsch, kurz.
+2) Wetter ist extern: nur aus Quellen antworten. Keine Schätzung.
+3) Antworte mit: (a) 1–2 Sätze Zusammenfassung, (b) 1 Zeile "Quellen:" mit Domains.
+4) Wenn die Quellen nicht eindeutig sind: stelle 1 Rückfrage (Stadt/Region).`
+	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, ws, tr, eg), "", "  ")
+	srcJSON, _ := json.MarshalIndent(sources, "", "  ")
+	user := "SelfModel:\n" + string(selfJSON) + "\n\nSources:\n" + string(srcJSON) + "\n\nFrage:\n" + userText
+	out, err := oc.Chat(model, []ollama.Message{
+		{Role: "system", Content: sys},
+		{Role: "user", Content: user},
+	})
+	if err != nil {
+		return "", err
+	}
+	out = strings.TrimSpace(out)
+	body.Energy -= 0.8
+	body.CooldownUntil = time.Now().Add(eg.CooldownDuration())
+	return brain.PostprocessGerman(out), nil
 }
 
 func storeSource(db *sql.DB, fr *websense.FetchResult) {
@@ -392,6 +471,7 @@ func renderStatus(body *BodyState, aff *brain.AffectState, ws *brain.Workspace, 
 	if ws != nil {
 		b.WriteString("\nWorkspace:\n")
 		b.WriteString("  thought: " + ws.CurrentThought + "\n")
+		b.WriteString("  lastTopic: " + ws.LastTopic + "\n")
 		b.WriteString(fmt.Sprintf("  confidence: %.2f\n", ws.Confidence))
 	}
 	if tr != nil {
