@@ -2,12 +2,11 @@ package state
 
 import (
 	"database/sql"
+
 	_ "github.com/mattn/go-sqlite3"
 )
 
-type DB struct {
-	*sql.DB
-}
+type DB struct{ *sql.DB }
 
 func Open(path string) (*DB, error) {
 	db, err := sql.Open("sqlite3", path)
@@ -46,6 +45,13 @@ func migrate(db *sql.DB) error {
 			text TEXT NOT NULL,
 			sources_json TEXT NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS ratings (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			message_id INTEGER NOT NULL,
+			value INTEGER NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
