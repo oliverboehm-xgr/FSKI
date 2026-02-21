@@ -66,6 +66,14 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Model routing per area (LoRA-ready)
+	modelSpeaker := eg.ModelFor("speaker", model)
+	modelCritic := eg.ModelFor("critic", model)
+	modelDaydream := eg.ModelFor("daydream", model)
+	modelScout := eg.ModelFor("scout", model)
+	modelHippo := eg.ModelFor("hippocampus", model)
+	modelStance := eg.ModelFor("stance", model)
+
 	// v0 BodyState
 	body := BodyState{
 		Energy:            80,
@@ -196,7 +204,7 @@ func main() {
 		// 2) generate Bunny reply
 		start := time.Now()
 		mu.Lock()
-		out, err := say(db.DB, epiPath, oc, model, &body, aff, ws, tr, dr, eg, text)
+		out, err := say(db.DB, epiPath, oc, model, modelStance, &body, aff, ws, tr, dr, eg, text)
 		brain.LatencyAffect(ws, aff, eg, time.Since(start))
 		mu.Unlock()
 		if err != nil {
@@ -278,7 +286,7 @@ Regeln:
 				"CurrentThought:\n" + req.CurrentThought + "\n\n" +
 				"Compose ONE proactive message now."
 
-			txt, err := oc.Chat(model, []ollama.Message{{Role: "system", Content: sys}, {Role: "user", Content: user}})
+			txt, err := oc.Chat(modelSpeaker, []ollama.Message{{Role: "system", Content: sys}, {Role: "user", Content: user}})
 			if err != nil {
 				continue
 			}
@@ -297,7 +305,7 @@ Fasse die folgenden Ereignisse zu einer GROBEN STORY zusammen (Gist), Details we
 Ziel: 5-9 kurze Sätze oder Bulletpoints, neutral, deutsch.
 Keine erfundenen Fakten.`
 			user := "TOPIC: " + req.Topic + "\nEVENTS:\n" + req.TextBlock + "\n\nGIST:"
-			sum, err := oc.Chat(model, []ollama.Message{
+			sum, err := oc.Chat(modelHippo, []ollama.Message{
 				{Role: "system", Content: sys},
 				{Role: "user", Content: user},
 			})
@@ -338,7 +346,7 @@ Aus EVIDENCE eine knappe Einordnung des Themas erstellen.
 Antwort NUR als JSON:
 {"summary":"1-3 Sätze","confidence":0.0-1.0,"importance":0.0-1.0}`
 			user := "TOPIC: " + req.Topic + "\nEVIDENCE:\n" + string(evJSON)
-			out, err := oc.Chat(model, []ollama.Message{{Role: "system", Content: sys}, {Role: "user", Content: user}})
+			out, err := oc.Chat(modelScout, []ollama.Message{{Role: "system", Content: sys}, {Role: "user", Content: user}})
 			if err != nil {
 				continue
 			}
@@ -363,7 +371,7 @@ Antwortformat: NUR JSON:
 				"CurrentThought: " + req.CurrentThought + "\n" +
 				"ConceptSummary: " + req.ConceptSummary + "\n" +
 				"SelfModel:\n" + req.SelfModelJSON + "\n\nJSON:"
-			out, err := oc.Chat(model, []ollama.Message{
+			out, err := oc.Chat(modelDaydream, []ollama.Message{
 				{Role: "system", Content: sys},
 				{Role: "user", Content: user},
 			})
@@ -404,7 +412,7 @@ Antworte NUR als JSON:
 				"\nAFFECT_KEYS: " + keys +
 				"\nSELFMODEL_MINI:\n" + req.SelfModelMini +
 				"\n\nDRAFT:\n" + pre.Text + "\n\nJSON:"
-			out, err := oc.Chat(model, []ollama.Message{
+			out, err := oc.Chat(modelCritic, []ollama.Message{
 				{Role: "system", Content: sys},
 				{Role: "user", Content: user},
 			})
@@ -674,7 +682,7 @@ Antworte NUR als JSON:
 				userText := strings.Join(args, " ")
 				start := time.Now()
 				mu.Lock()
-				out, err := say(db.DB, epiPath, oc, model, &body, aff, ws, tr, dr, eg, userText)
+				out, err := say(db.DB, epiPath, oc, model, modelStance, &body, aff, ws, tr, dr, eg, userText)
 				brain.LatencyAffect(ws, aff, eg, time.Since(start))
 				mu.Unlock()
 				if err != nil {
@@ -975,7 +983,7 @@ HARTE REGELN
 	return brain.PostprocessUtterance(out), sources, nil
 }
 
-func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string) (string, error) {
+func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, stanceModel string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string) (string, error) {
 	// Track topic + remember previous user turn
 	if ws != nil {
 		ws.PrevUserText = ws.LastUserText
@@ -1004,7 +1012,7 @@ func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *Body
 	intent := brain.DetectIntentWithEpigenome(userText, eg)
 	// Hard rule: Opinion -> stance engine (stance persists, becomes personality)
 	if intent == brain.IntentOpinion {
-		return answerWithStance(db, oc, model, body, aff, ws, tr, eg, userText)
+		return answerWithStance(db, oc, stanceModel, body, aff, ws, tr, eg, userText)
 	}
 
 	// GENERIC RESEARCH GATE:
