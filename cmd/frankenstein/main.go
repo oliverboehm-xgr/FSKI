@@ -84,6 +84,7 @@ func main() {
 	must(err)
 
 	_ = brain.LoadAffectState(db.DB, aff)
+	ws.ActiveTopic = brain.LoadActiveTopic(db.DB)
 
 	var mu sync.Mutex
 
@@ -290,6 +291,9 @@ Regeln:
 		}
 		if tickN%40 == 0 {
 			brain.SaveDrives(db.DB, dr)
+		}
+		if tickN%40 == 0 && ws.ActiveTopic != "" {
+			brain.SaveActiveTopic(db.DB, ws.ActiveTopic)
 		}
 
 		now := time.Now()
@@ -582,6 +586,7 @@ func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, body *Body
 		ws.PrevUserText = ws.LastUserText
 		ws.LastUserText = userText
 		ws.LastTopic = brain.ExtractTopic(userText)
+		_ = brain.UpdateActiveTopic(ws, userText)
 		if ws.LastTopic != "" {
 			brain.BumpInterest(db, ws.LastTopic, 0.03)
 		}
@@ -634,7 +639,21 @@ HARTE REGELN
 7) Maximal 5 Sätze.`
 	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, ws, tr, eg), "", "  ")
 	mode := brain.IntentToMode(intent)
-	user := "MODE: " + mode + "\n\nSelfModel:\n" + string(selfJSON) + "\n\nOliver says:\n" + userText
+	activeTopic := ""
+	if ws != nil {
+		activeTopic = ws.ActiveTopic
+	}
+	dialogCtx := brain.BuildDialogContext(db, 14)
+	recall := ""
+	if activeTopic != "" {
+		recall = brain.RecallConcepts(db, activeTopic, 4)
+	}
+	user := "MODE: " + mode +
+		"\nACTIVE_TOPIC: " + activeTopic +
+		"\n\nDIALOG_CONTEXT:\n" + dialogCtx +
+		"\n\nRELEVANT_MEMORY:\n" + recall +
+		"\n\nSelfModel:\n" + string(selfJSON) +
+		"\n\nUSER:\n" + userText
 	out, err := oc.Chat(model, []ollama.Message{
 		{Role: "system", Content: sys},
 		{Role: "user", Content: user},
