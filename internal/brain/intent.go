@@ -37,6 +37,29 @@ func DetectIntentWithEpigenome(s string, eg *epi.Epigenome) Intent {
 	return IntentUnknown
 }
 
+// DetectIntentHybrid: first epigenetic rules (high precision),
+// then NB classifier if confidence passes threshold.
+func DetectIntentHybrid(s string, eg *epi.Epigenome, nb *NBIntent) Intent {
+	// 1) epigenetic rules
+	i := DetectIntentWithEpigenome(s, eg)
+	if i != IntentUnknown {
+		return i
+	}
+	// 2) NB fallback
+	if nb == nil || eg == nil {
+		return IntentUnknown
+	}
+	_, _, thr, _ := eg.IntentNBParams()
+	p := nb.Predict(s, eg)
+	if strings.TrimSpace(p.Intent) == "" {
+		return IntentUnknown
+	}
+	if p.Prob < thr {
+		return IntentUnknown
+	}
+	return mapIntentString(p.Intent)
+}
+
 func matchRule(t string, r epi.IntentRule) bool {
 	for _, c := range r.Contains {
 		if c == "" {

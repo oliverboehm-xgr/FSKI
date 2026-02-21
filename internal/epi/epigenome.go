@@ -135,6 +135,14 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"hippocampus": "llama3.2:3b",
 				// later you can set: "critic": "llama3.1:8b-lora-critic"
 			}},
+
+			// Online intent classifier (Naive Bayes) parameters
+			"intent_nb": {Type: "intent_nb", Enabled: true, Params: map[string]any{
+				"enabled":    true,
+				"min_tokens": 2,
+				"threshold":  0.72, // only trust if P(best) >= threshold
+				"alpha":      1.0,  // Laplace smoothing
+			}},
 			"cooldown": {
 				Type:    "cooldown",
 				Enabled: true,
@@ -632,6 +640,37 @@ func asFloat(v any, def float64) float64 {
 	default:
 		return def
 	}
+}
+
+func (eg *Epigenome) IntentNBParams() (enabled bool, minTokens int, threshold float64, alpha float64) {
+	m := eg.Modules["intent_nb"]
+	if m == nil || !m.Enabled {
+		return false, 2, 0.72, 1.0
+	}
+	if v, ok := m.Params["enabled"].(bool); ok {
+		enabled = v
+	} else {
+		enabled = true
+	}
+	minTokens = int(asFloat(m.Params["min_tokens"], 2))
+	threshold = asFloat(m.Params["threshold"], 0.72)
+	alpha = asFloat(m.Params["alpha"], 1.0)
+	if minTokens < 1 {
+		minTokens = 1
+	}
+	if minTokens > 10 {
+		minTokens = 10
+	}
+	if threshold < 0 {
+		threshold = 0
+	}
+	if threshold > 0.99 {
+		threshold = 0.99
+	}
+	if alpha <= 0 {
+		alpha = 1.0
+	}
+	return
 }
 
 func (eg *Epigenome) ModelFor(area string, fallback string) string {

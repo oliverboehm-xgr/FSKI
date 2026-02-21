@@ -87,6 +87,9 @@ func main() {
 	aff := brain.NewAffectState()
 	ws := brain.NewWorkspace()
 
+	// NB intent classifier
+	nb := brain.NewNBIntent(db.DB)
+
 	tr, err := brain.LoadOrInitTraits(db.DB)
 	must(err)
 
@@ -205,6 +208,12 @@ func main() {
 		// 2) generate Bunny reply
 		start := time.Now()
 		mu.Lock()
+		// determine intent (rules + NB)
+		intent := brain.DetectIntentHybrid(text, eg, nb)
+		// store last routed intent for context (used below)
+		ws.LastRoutedIntent = brain.IntentToMode(intent)
+		ws.LastUserText = text
+
 		out, err := say(db.DB, epiPath, oc, model, modelStance, &body, aff, ws, tr, dr, eg, text)
 		brain.LatencyAffect(ws, aff, eg, time.Since(start))
 		mu.Unlock()
@@ -212,9 +221,13 @@ func main() {
 			return ui.Message{}, err
 		}
 		id := persistMessageWithKind(db.DB, out, nil, 0.2, "reply")
+		// link reply -> user_text + intent for learning
 		mu.Lock()
+		ut := ws.LastUserText
+		in := ws.LastRoutedIntent
 		lastMessageID = id
 		mu.Unlock()
+		brain.SaveReplyContext(db.DB, id, ut, in)
 		return ui.Message{
 			ID:        id,
 			CreatedAt: time.Now().Format(time.RFC3339),
@@ -225,6 +238,23 @@ func main() {
 	srv.RateMessage = func(messageID int64, value int) error {
 		if err := storeRating(db.DB, messageID, value); err != nil {
 			return err
+		}
+		// NB learning: apply feedback based on reply_context
+		ut, in, ok := brain.LoadReplyContext(db.DB, messageID)
+		if ok {
+			// weights: up reinforces, meh slight reinforce, down/caught unlearn
+			w := 0.0
+			switch value {
+			case 1:
+				w = 1.0
+			case 0:
+				w = 0.30
+			case -1:
+				w = -0.70
+			}
+			if w != 0 {
+				nb.ApplyFeedback(in, ut, w)
+			}
 		}
 		mu.Lock()
 		_ = brain.ApplyRating(db.DB, tr, aff, eg, value)
@@ -239,6 +269,11 @@ func main() {
 		return nil
 	}
 	srv.Caught = func(messageID int64) error {
+		// NB learning: caught is strong negative feedback for the routed intent.
+		ut, in, ok := brain.LoadReplyContext(db.DB, messageID)
+		if ok {
+			nb.ApplyFeedback(in, ut, -1.0)
+		}
 		mu.Lock()
 		_ = brain.ApplyCaught(db.DB, tr, aff, eg)
 		_ = brain.SaveAffectState(db.DB, aff)
