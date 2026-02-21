@@ -288,8 +288,8 @@ func say(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brai
 	}
 
 	intent := brain.DetectIntent(userText)
-	if intent == brain.IntentWeather {
-		ans, err := answerWeatherWithWeb(db, oc, model, body, aff, ws, tr, eg, userText)
+	if intent == brain.IntentExternalFact {
+		ans, err := answerWithEvidence(db, oc, model, body, aff, ws, tr, eg, userText)
 		if err != nil {
 			return "", err
 		}
@@ -305,7 +305,7 @@ HARTE REGELN
 3) "Gefühle" = Affects (pain/unwell/fear/shame) aus dem Kernel. Keine Märchen über Lebendigkeit.
 4) Auf Nutzerfragen zuerst eingehen. Interne Gedanken nur wenn gefragt.
 5) Bei Themen wie "glücklich/Sinn/Stress/Beziehung": keine Annahmen. Stelle zuerst 1–2 präzise Rückfragen.
-6) Externe Fakten (Wetter, News, Zahlen) nie raten. Wenn keine Quellen: offen sagen.
+6) Externe Fakten nie raten. Wenn keine Quellen: offen sagen.
 7) Maximal 5 Sätze.`
 	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, ws, tr, eg), "", "  ")
 	mode := brain.IntentToMode(intent)
@@ -329,11 +329,8 @@ HARTE REGELN
 	return brain.PostprocessGerman(out), nil
 }
 
-func answerWeatherWithWeb(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome, userText string) (string, error) {
-	query := "Wettervorhersage morgen Deutschland"
-	if strings.Contains(strings.ToLower(userText), "berlin") {
-		query = "Wettervorhersage morgen Berlin"
-	}
+func answerWithEvidence(db *sql.DB, oc *ollama.Client, model string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, eg *epi.Epigenome, userText string) (string, error) {
+	query := brain.NormalizeSearchQuery(userText)
 
 	body.WebCountHour++
 	body.Energy -= 1.0
@@ -341,9 +338,9 @@ func answerWeatherWithWeb(db *sql.DB, oc *ollama.Client, model string, body *Bod
 		body.Energy = 0
 	}
 
-	results, err := websense.Search(query, 5)
+	results, err := websense.Search(query, 6)
 	if err != nil || len(results) == 0 {
-		return "Ich kann gerade keine verlässliche Wettervorhersage abrufen (keine Quellen verfügbar). Nenne mir Stadt/Region, dann versuche ich es nochmal.", nil
+		return "Ich kann dazu gerade keine verlässlichen Quellen abrufen. Nenne mir bitte Ort/Zeitraum oder formuliere die Frage etwas konkreter.", nil
 	}
 
 	var sources []SourceRecord
@@ -363,18 +360,20 @@ func answerWeatherWithWeb(db *sql.DB, oc *ollama.Client, model string, body *Bod
 		})
 	}
 	if len(sources) == 0 {
-		return "Ich habe Suchtreffer, aber ich kann gerade keine Inhalte zuverlässig laden. Nenne mir Stadt/Region, dann versuche ich es nochmal.", nil
+		return "Ich habe Treffer, aber ich kann gerade keine Inhalte sauber laden. Gib mir bitte Ort/Zeitraum oder ein Stichwort mehr.", nil
 	}
 
 	sys := `Du bist Bunny.
 HARTE REGELN
-1) Deutsch, kurz.
-2) Wetter ist extern: nur aus Quellen antworten. Keine Schätzung.
-3) Antworte mit: (a) 1–2 Sätze Zusammenfassung, (b) 1 Zeile "Quellen:" mit Domains.
-4) Wenn die Quellen nicht eindeutig sind: stelle 1 Rückfrage (Stadt/Region).`
+1) Deutsch, kurz, sachlich.
+2) Externe Fakten: nur aus SOURCES_JSON antworten. Nichts raten.
+3) Antworte in 2 Teilen:
+   - Antwort: 1–3 Sätze.
+   - Quellen: 1 Zeile mit Domains.
+4) Wenn SOURCES_JSON nicht reicht: stelle GENAU 1 Rückfrage.`
 	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, ws, tr, eg), "", "  ")
 	srcJSON, _ := json.MarshalIndent(sources, "", "  ")
-	user := "SelfModel:\n" + string(selfJSON) + "\n\nSources:\n" + string(srcJSON) + "\n\nFrage:\n" + userText
+	user := "SelfModel:\n" + string(selfJSON) + "\n\nSOURCES_JSON:\n" + string(srcJSON) + "\n\nFrage:\n" + userText
 	out, err := oc.Chat(model, []ollama.Message{
 		{Role: "system", Content: sys},
 		{Role: "user", Content: user},
