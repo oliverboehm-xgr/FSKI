@@ -119,7 +119,12 @@ func isResearchLike(t string) bool {
 		strings.Contains(t, "nachsehen") ||
 		strings.Contains(t, "schau nach") ||
 		strings.Contains(t, "quelle") ||
-		strings.Contains(t, "quellen")
+		strings.Contains(t, "quellen") ||
+		strings.Contains(t, "link") ||
+		strings.Contains(t, "url") ||
+		strings.Contains(t, "nachricht") ||
+		strings.Contains(t, "news") ||
+		looksLikeURLOrDomain(t)
 }
 
 func isBareResearchCommand(t string) bool {
@@ -132,6 +137,19 @@ func isBareResearchCommand(t string) bool {
 	}
 	if short == "im internet" || short == "im internet nachsehen" || short == "schau nach" {
 		return true
+	}
+	return false
+}
+
+func looksLikeURLOrDomain(t string) bool {
+	if strings.Contains(t, "http://") || strings.Contains(t, "https://") || strings.Contains(t, "www.") {
+		return true
+	}
+	// crude TLD hint (good enough for gating)
+	for _, tld := range []string{".de", ".com", ".org", ".net", ".io", ".eu"} {
+		if strings.Contains(t, tld) {
+			return true
+		}
 	}
 	return false
 }
