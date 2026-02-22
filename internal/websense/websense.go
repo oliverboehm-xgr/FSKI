@@ -24,6 +24,7 @@ type FetchResult struct {
 	URL       string
 	Text      string
 	Snippet   string
+	Body      string // first 3000 chars for LLM context
 	Hash      string
 	FetchedAt time.Time
 	Domain    string
@@ -132,9 +133,16 @@ func Fetch(rawURL string) (*FetchResult, error) {
 	h := sha256.Sum256([]byte(text))
 	hash := hex.EncodeToString(h[:])
 
+	// Short snippet for display/storage (420 chars)
 	snippet := text
 	if len(snippet) > 420 {
 		snippet = snippet[:420]
+	}
+
+	// Longer body for LLM context (first 3000 chars of clean text)
+	body := text
+	if len(body) > 3000 {
+		body = body[:3000]
 	}
 
 	return &FetchResult{
@@ -142,6 +150,7 @@ func Fetch(rawURL string) (*FetchResult, error) {
 		URL:       normalized,
 		Text:      text,
 		Snippet:   snippet,
+		Body:      body,
 		Hash:      hash,
 		FetchedAt: time.Now(),
 		Domain:    pu.Hostname(),
