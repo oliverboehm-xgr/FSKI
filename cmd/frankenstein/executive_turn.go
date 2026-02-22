@@ -265,6 +265,7 @@ func handleCodeCommands(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, userTe
 		}
 
 		// 2) basic validation
+		out = normalizeUnifiedDiffHunks(out)
 		if !strings.Contains(out, "diff --git") {
 			return true, "LLM hat keinen unified diff geliefert. (Erwartet: diff --git ...)"
 		}
@@ -431,6 +432,7 @@ func selectCoderModel(oc *ollama.Client, eg *epi.Epigenome) string {
 }
 
 func validateUnifiedDiffSyntax(diff string) error {
+	diff = normalizeUnifiedDiffHunks(diff)
 	lines := strings.Split(diff, "\n")
 	inHunk := false
 	for i, ln := range lines {
@@ -456,6 +458,28 @@ func validateUnifiedDiffSyntax(diff string) error {
 		}
 	}
 	return nil
+}
+
+func normalizeUnifiedDiffHunks(diff string) string {
+	lines := strings.Split(diff, "\n")
+	inHunk := false
+	for i, ln := range lines {
+		if strings.HasPrefix(ln, "diff --git ") || strings.HasPrefix(ln, "--- ") || strings.HasPrefix(ln, "+++ ") || strings.HasPrefix(ln, "index ") {
+			inHunk = false
+			continue
+		}
+		if strings.HasPrefix(ln, "@@") {
+			inHunk = true
+			continue
+		}
+		if !inHunk {
+			continue
+		}
+		if ln == "" {
+			lines[i] = " "
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 type touchedFile struct {
@@ -678,7 +702,7 @@ func firstInvalidHunkLine(diff string) (lineNo int, line string) {
 }
 
 func validateDraftUnifiedDiff(diff string) (string, error) {
-	diff = strings.TrimSpace(diff)
+	diff = normalizeUnifiedDiffHunks(strings.TrimSpace(diff))
 	if diff == "" {
 		return "empty diff", fmt.Errorf("empty diff")
 	}
@@ -704,7 +728,7 @@ func validateDraftUnifiedDiff(diff string) (string, error) {
 }
 
 func applyPatchInRepo(id int64, title string, diff string) (string, error) {
-	diff = strings.TrimSpace(diff)
+	diff = normalizeUnifiedDiffHunks(strings.TrimSpace(diff))
 	if diff == "" {
 		return "", fmt.Errorf("empty diff")
 	}
