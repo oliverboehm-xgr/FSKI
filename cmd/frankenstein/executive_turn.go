@@ -241,7 +241,7 @@ func handleCodeCommands(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, userTe
 			return true, "Use: /code apply <id>"
 		}
 		id := parseID(parts[2])
-		_, diffText, _, _, ok := brain.GetCodeProposalFull(db, id)
+		title, diffText, _, _, ok := brain.GetCodeProposalFull(db, id)
 		if !ok {
 			return true, "Nicht gefunden."
 		}
@@ -252,7 +252,7 @@ func handleCodeCommands(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, userTe
 		if bad := firstDisallowedPath(diffText); bad != "" {
 			return true, "Diff enthält disallowed path: " + bad
 		}
-		msg, err := applyPatchInRepo(diffText)
+		msg, err := applyPatchInRepo(id, title, diffText)
 		if err != nil {
 			return true, "Apply fehlgeschlagen: " + err.Error() + "\n" + msg
 		}
@@ -339,7 +339,7 @@ func firstDisallowedPath(diff string) string {
 	return ""
 }
 
-func applyPatchInRepo(diff string) (string, error) {
+func applyPatchInRepo(id int64, title string, diff string) (string, error) {
 	diff = strings.TrimSpace(diff)
 	if diff == "" {
 		return "", fmt.Errorf("empty diff")
@@ -360,10 +360,22 @@ func applyPatchInRepo(diff string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	baseBranch, _ := runCmdDir(repo, "git", "rev-parse", "--abbrev-ref", "HEAD")
+	baseBranch = strings.TrimSpace(baseBranch)
+	if baseBranch == "" {
+		baseBranch = "<unknown>"
+	}
+	branch := fmt.Sprintf("bunny/proposal-%d-%s", id, time.Now().Format("20060102-150405"))
+	branch = strings.ReplaceAll(branch, " ", "-")
+	if len(branch) > 80 {
+		branch = branch[:80]
+	}
 
 	var log strings.Builder
 	log.WriteString("[code apply]\n")
 	log.WriteString("repo: " + repo + "\n")
+	log.WriteString("base_branch: " + baseBranch + "\n")
+	log.WriteString("new_branch: " + branch + "\n")
 
 	// require clean working tree
 	status, err := runCmdDir(repo, "git", "status", "--porcelain")
@@ -376,8 +388,15 @@ func applyPatchInRepo(diff string) (string, error) {
 		return strings.TrimSpace(log.String()), fmt.Errorf("working tree not clean (commit/stash first)")
 	}
 
+	log.WriteString("0) git checkout -b\n")
+	out, err := runCmdDir(repo, "git", "checkout", "-b", branch)
+	if err != nil {
+		log.WriteString(out + "\n")
+		return strings.TrimSpace(log.String()), err
+	}
+
 	log.WriteString("1) git apply --check\n")
-	out, err := runCmdDir(repo, "git", "apply", "--check", tmp)
+	out, err = runCmdDir(repo, "git", "apply", "--check", tmp)
 	if err != nil {
 		log.WriteString(out + "\n")
 		return strings.TrimSpace(log.String()), err
@@ -387,6 +406,7 @@ func applyPatchInRepo(diff string) (string, error) {
 	out, err = runCmdDir(repo, "git", "apply", tmp)
 	if err != nil {
 		log.WriteString(out + "\n")
+		_, _ = runCmdDir(repo, "git", "checkout", baseBranch)
 		return strings.TrimSpace(log.String()), err
 	}
 
@@ -396,13 +416,37 @@ func applyPatchInRepo(diff string) (string, error) {
 		log.WriteString("go test FAILED:\n" + testOut + "\n")
 		rb, _ := runCmdDir(repo, "git", "apply", "-R", tmp)
 		log.WriteString("rollback:\n" + rb + "\n")
+		_, _ = runCmdDir(repo, "git", "checkout", baseBranch)
 		return strings.TrimSpace(log.String()), fmt.Errorf("go test failed; patch rolled back")
+	}
+
+	log.WriteString("4) git add -A\n")
+	_, _ = runCmdDir(repo, "git", "add", "-A")
+	msg := fmt.Sprintf("Apply code_proposal #%d", id)
+	if strings.TrimSpace(title) != "" {
+		t := strings.TrimSpace(title)
+		if len(t) > 64 {
+			t = t[:64]
+		}
+		msg += ": " + t
+	}
+	log.WriteString("5) git commit\n")
+	cout, cerr := runCmdDir(repo, "git", "commit", "-m", msg)
+	if cerr != nil {
+		if !strings.Contains(strings.ToLower(cout), "nothing to commit") {
+			log.WriteString(cout + "\n")
+			return strings.TrimSpace(log.String()), cerr
+		}
+	}
+	if strings.TrimSpace(cout) != "" {
+		log.WriteString(cout + "\n")
 	}
 
 	if strings.TrimSpace(testOut) != "" {
 		log.WriteString(testOut + "\n")
 	}
 	log.WriteString("OK\n")
+	log.WriteString("Next: review diff on branch, then merge manually.\n")
 	return strings.TrimSpace(log.String()), nil
 }
 

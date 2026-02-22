@@ -1343,6 +1343,11 @@ HARTE REGELN
 }
 
 func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, stanceModel string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string) (string, error) {
+	// Online phenotype overrides (persisted in kv_state): model + speech overlay.
+	if v := strings.TrimSpace(kvGet(db, "speaker_model_override")); v != "" {
+		model = v
+	}
+
 	// Track topic + remember previous user turn
 	if ws != nil {
 		ws.PrevUserText = ws.LastUserText
@@ -1356,44 +1361,49 @@ func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, stanceMode
 
 	// Concept Acquisition: if user mentions an unknown term (affect or general concept),
 	// Bunny will try to acquire meaning via sensorik and store it.
-	term, hint := brain.ExtractCandidate(userText)
-	if term != "" {
-		if !brain.ConceptExists(db, term) {
-			// generic acquire + integrate
-			imp := acquireAndIntegrateConcept(db, epiPath, oc, model, body, aff, ws, tr, eg, term, hint, userText)
-			// increase urge to share if the concept turned out important (drives)
-			if dr != nil && tr != nil && imp > 0 {
-				dr.UrgeToShare = clamp01(dr.UrgeToShare + 0.12*imp*clamp01(tr.TalkBias))
+	// In training dry-run we avoid DB side-effects.
+	if ws == nil || !ws.TrainingDryRun {
+		term, hint := brain.ExtractCandidate(userText)
+		if term != "" {
+			if !brain.ConceptExists(db, term) {
+				// generic acquire + integrate
+				imp := acquireAndIntegrateConcept(db, epiPath, oc, model, body, aff, ws, tr, eg, term, hint, userText)
+				// increase urge to share if the concept turned out important (drives)
+				if dr != nil && tr != nil && imp > 0 {
+					dr.UrgeToShare = clamp01(dr.UrgeToShare + 0.12*imp*clamp01(tr.TalkBias))
+				}
 			}
 		}
 	}
 
 	intent := brain.DetectIntentWithEpigenome(userText, eg)
-	// Hard rule: Opinion -> stance engine (stance persists, becomes personality)
-	if intent == brain.IntentOpinion {
-		return answerWithStance(db, oc, stanceModel, body, aff, ws, tr, eg, userText)
-	}
-
-	// GENERIC RESEARCH GATE:
-	// decides when senses are needed to make progress (not only "opinion").
-	if ws != nil && !ws.WebAllowed {
-		// Survival gate disabled web; continue without research.
-	} else {
-		rd := brain.DecideResearch(db, userText, intent, ws, tr, dr, aff)
-		if rd.Do {
-			// If the gate says "research", route into evidence answering.
-			// answerWithEvidence already does Search+Fetch+Snippet fallback.
-			return answerWithEvidence(db, oc, model, body, aff, ws, tr, eg, rd.Query)
+	// In training dry-run we keep everything "online" but avoid web/stance side-effects.
+	if ws == nil || !ws.TrainingDryRun {
+		// Hard rule: Opinion -> stance engine (stance persists, becomes personality)
+		if intent == brain.IntentOpinion {
+			return answerWithStance(db, oc, stanceModel, body, aff, ws, tr, eg, userText)
 		}
-	}
 
-	// external fact explicit routing remains as a safe default
-	if intent == brain.IntentExternalFact {
-		ans, err := answerWithEvidence(db, oc, model, body, aff, ws, tr, eg, userText)
-		if err != nil {
-			return "", err
+		// GENERIC RESEARCH GATE:
+		// decides when senses are needed to make progress (not only "opinion").
+		if ws != nil && !ws.WebAllowed {
+			// Survival gate disabled web; continue without research.
+		} else {
+			rd := brain.DecideResearch(db, userText, intent, ws, tr, dr, aff)
+			if rd.Do {
+				// answerWithEvidence already does Search+Fetch+Snippet fallback.
+				return answerWithEvidence(db, oc, model, body, aff, ws, tr, eg, rd.Query)
+			}
 		}
-		return ans, nil
+
+		// external fact explicit routing remains as a safe default
+		if intent == brain.IntentExternalFact {
+			ans, err := answerWithEvidence(db, oc, model, body, aff, ws, tr, eg, userText)
+			if err != nil {
+				return "", err
+			}
+			return ans, nil
+		}
 	}
 
 	sys := `Du bist Bunny, ein ganzheitlicher Organismus.
@@ -1421,6 +1431,9 @@ HARTE REGELN
 	if ws != nil {
 		mentalImage = ws.VisualScene
 		innerSpeech = ws.InnerSpeech
+		if ov := strings.TrimSpace(kvGet(db, "speech_overlay")); ov != "" {
+			innerSpeech = strings.TrimSpace(ov) + "\n" + innerSpeech
+		}
 		policy = "POLICY_CONTEXT: " + ws.LastPolicyCtx + "\n" +
 			"POLICY_ACTION: " + ws.LastPolicyAction + "\n" +
 			"STYLE_HINT: " + ws.LastPolicyStyle + "\n"
