@@ -120,7 +120,7 @@ func main() {
 	var mu sync.Mutex
 
 	fmt.Println("Bunny v0 online.")
-	fmt.Println("Commands: /think | /say <text...> | /rate <up|meh|down> | /caught | /status | /mutate ... | /selfcode index | /quit")
+	fmt.Println("Commands: /think | /say <text...> | /train on|off | /pick A|B | /rate <up|meh|down> | /caught | /status | /mutate ... | /selfcode index | /quit")
 	fmt.Println()
 
 	// async input + async output
@@ -142,6 +142,7 @@ func main() {
 	criticOutCh := make(chan brain.CriticResult, 12)
 
 	var lastMessageID int64 = 0 // protected by mu
+	var lastTrainTrialID int64 = 0
 	var lastAutoSpeak time.Time // protected by mu
 
 	// --- UI server (SSE) ---
@@ -652,6 +653,12 @@ Antworte NUR als JSON:
 			default:
 			}
 		}
+		if created, msg := brain.TickProposalEngine(db.DB, eg, ws, aff); created > 0 && strings.TrimSpace(msg) != "" {
+			select {
+			case outCh <- OutMsg{Text: msg, Kind: "auto"}:
+			default:
+			}
+		}
 
 		tickN++
 		if tickN%60 == 0 {
@@ -906,6 +913,28 @@ Antworte NUR als JSON:
 					continue
 				}
 				userText := strings.Join(args, " ")
+				userMsgID := persistMessageWithKind(db.DB, userText, nil, 0.1, "user")
+				if userMsgID > 0 {
+					srv.PublishMessage(ui.Message{ID: userMsgID, CreatedAt: time.Now().Format(time.RFC3339), Kind: "user", Text: userText})
+				}
+				trainOn, mutantModel, mutantStrength, mutantPrompt := eg.TrainModeParams()
+				if trainOn {
+					start := time.Now()
+					mu.Lock()
+					aTxt, aAct, aSty, ctxKey, topic, intentMode := ExecuteTurnWithMeta(db.DB, epiPath, oc, modelSpeaker, modelStance, &body, aff, ws, tr, dr, eg, userText, nil)
+					mut := &MutantOverlay{Strength: mutantStrength, Prompt: mutantPrompt, Model: mutantModel}
+					bTxt, bAct, bSty, _, _, _ := ExecuteTurnWithMeta(db.DB, epiPath, oc, modelSpeaker, modelStance, &body, aff, ws, tr, dr, eg, userText, mut)
+					brain.LatencyAffect(ws, aff, eg, time.Since(start))
+					tid, _ := brain.InsertTrainTrial(db.DB, userMsgID, topic, intentMode, ctxKey, aAct, aSty, aTxt, bAct, bSty, bTxt)
+					lastTrainTrialID = tid
+					mu.Unlock()
+					out := "🧪 TRAINING MODE (Trial #" + fmt.Sprint(tid) + ")\n" +
+						"A) " + aTxt + "\n\n" +
+						"B) " + bTxt + "\n\n" +
+						"Wähle: /pick A oder /pick B"
+					outCh <- OutMsg{Text: out, Sources: nil, Kind: "reply"}
+					continue
+				}
 				start := time.Now()
 				mu.Lock()
 				out, err := say(db.DB, epiPath, oc, model, modelStance, &body, aff, ws, tr, dr, eg, userText)
@@ -920,6 +949,35 @@ Antworte NUR als JSON:
 					continue
 				}
 				outCh <- OutMsg{Text: out, Sources: nil, Kind: "reply"}
+			case "/train":
+				if len(args) >= 1 && (args[0] == "on" || args[0] == "off") {
+					on := args[0] == "on"
+					eg.Modules["train_mode"].Enabled = true
+					eg.Modules["train_mode"].Params["enabled"] = on
+					_ = eg.Save(epiPath)
+					fmt.Println("train_mode =", on)
+				} else {
+					fmt.Println("Use: /train on | /train off")
+				}
+				continue
+			case "/pick":
+				if len(args) < 1 {
+					fmt.Println("Use: /pick A|B")
+					continue
+				}
+				c := strings.ToUpper(strings.TrimSpace(args[0]))
+				if c != "A" && c != "B" {
+					fmt.Println("Use: /pick A|B")
+					continue
+				}
+				if lastTrainTrialID <= 0 {
+					fmt.Println("no active trial")
+					continue
+				}
+				_ = brain.ChooseTrainTrial(db.DB, lastTrainTrialID, c)
+				brain.ApplyTrainChoice(db.DB, lastTrainTrialID, c)
+				fmt.Println("saved choice", c, "for trial", lastTrainTrialID)
+				continue
 			case "/rate":
 				if len(args) != 1 {
 					fmt.Println("Use: /rate up|meh|down")
