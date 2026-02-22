@@ -234,6 +234,19 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"max_boost":           0.35,
 				"notify_interval_sec": 300,
 			}},
+			"train_mode": {Type: "train_mode", Enabled: true, Params: map[string]any{
+				"enabled":              false,
+				"mutant_model_speaker": "",
+				"mutant_strength":      0.20,
+				"mutant_prompt":        "MUTATION: mehr direkt, weniger Rückfragen, mehr Initiative, Fakten sauber, keine Ausreden.",
+			}},
+			"proposal_engine": {Type: "proposal_engine", Enabled: true, Params: map[string]any{
+				"enabled":               true,
+				"min_interval_sec":      90,
+				"max_per_hour":          6,
+				"friction_threshold":    0.55,
+				"prefer_code_vs_schema": 0.6,
+			}},
 			"cooldown": {
 				Type:    "cooldown",
 				Enabled: true,
@@ -344,6 +357,19 @@ func (eg *Epigenome) ensureDefaults() (changed bool) {
 		"boost_per_pending":   0.08,
 		"max_boost":           0.35,
 		"notify_interval_sec": 300,
+	}})
+	add("train_mode", &ModuleSpec{Type: "train_mode", Enabled: true, Params: map[string]any{
+		"enabled":              false,
+		"mutant_model_speaker": "",
+		"mutant_strength":      0.20,
+		"mutant_prompt":        "MUTATION: mehr direkt, weniger Rückfragen, mehr Initiative, Fakten sauber, keine Ausreden.",
+	}})
+	add("proposal_engine", &ModuleSpec{Type: "proposal_engine", Enabled: true, Params: map[string]any{
+		"enabled":               true,
+		"min_interval_sec":      90,
+		"max_per_hour":          6,
+		"friction_threshold":    0.55,
+		"prefer_code_vs_schema": 0.6,
 	}})
 
 	def := func(k string, base, decay, coupling float64) {
@@ -602,6 +628,64 @@ func (eg *Epigenome) ProposalDriveParams() (enabled bool, boostPer float64, maxB
 	}
 	if notifyIntervalSec > 3600 {
 		notifyIntervalSec = 3600
+	}
+	return
+}
+
+func (eg *Epigenome) TrainModeParams() (enabled bool, mutantModel string, strength float64, mutantPrompt string) {
+	m := eg.Modules["train_mode"]
+	if m == nil || !m.Enabled {
+		return false, "", 0.2, ""
+	}
+	if v, ok := m.Params["enabled"].(bool); ok {
+		enabled = v
+	}
+	mutantModel, _ = m.Params["mutant_model_speaker"].(string)
+	strength = asFloat(m.Params["mutant_strength"], 0.2)
+	mutantPrompt, _ = m.Params["mutant_prompt"].(string)
+	if strength < 0 {
+		strength = 0
+	}
+	if strength > 1 {
+		strength = 1
+	}
+	return
+}
+
+func (eg *Epigenome) ProposalEngineParams() (enabled bool, minIntervalSec float64, maxPerHour int, frictionTh float64, preferCode float64) {
+	m := eg.Modules["proposal_engine"]
+	if m == nil || !m.Enabled {
+		return false, 120, 4, 0.55, 0.6
+	}
+	if v, ok := m.Params["enabled"].(bool); ok {
+		enabled = v
+	} else {
+		enabled = true
+	}
+	minIntervalSec = asFloat(m.Params["min_interval_sec"], 90)
+	maxPerHour = int(asFloat(m.Params["max_per_hour"], 6))
+	frictionTh = asFloat(m.Params["friction_threshold"], 0.55)
+	preferCode = asFloat(m.Params["prefer_code_vs_schema"], 0.6)
+	if minIntervalSec < 10 {
+		minIntervalSec = 10
+	}
+	if maxPerHour < 0 {
+		maxPerHour = 0
+	}
+	if maxPerHour > 60 {
+		maxPerHour = 60
+	}
+	if frictionTh < 0 {
+		frictionTh = 0
+	}
+	if frictionTh > 1 {
+		frictionTh = 1
+	}
+	if preferCode < 0 {
+		preferCode = 0
+	}
+	if preferCode > 1 {
+		preferCode = 1
 	}
 	return
 }

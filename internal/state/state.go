@@ -332,6 +332,37 @@ func migrate(db *sql.DB) error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_token_df_df ON token_df(df);`,
 
+		// A/B training trials (split chat, choose A or B)
+		`CREATE TABLE IF NOT EXISTS train_trials (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			user_msg_id INTEGER NOT NULL,
+			topic TEXT NOT NULL,
+			intent TEXT NOT NULL,
+			ctx_key TEXT NOT NULL,
+			a_action TEXT NOT NULL,
+			a_style TEXT NOT NULL,
+			a_text TEXT NOT NULL,
+			b_action TEXT NOT NULL,
+			b_style TEXT NOT NULL,
+			b_text TEXT NOT NULL,
+			chosen TEXT NOT NULL,
+			note TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_train_trials_created ON train_trials(created_at);`,
+
+		// Pending thought proposals queue (optional; lets Bunny propose asynchronously)
+		`CREATE TABLE IF NOT EXISTS thought_proposals (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			title TEXT NOT NULL,
+			payload TEXT NOT NULL,
+			status TEXT NOT NULL,
+			note TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_thought_proposals_status ON thought_proposals(status);`,
+
 		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {

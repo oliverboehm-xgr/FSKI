@@ -115,6 +115,21 @@ func TickAutonomy(db *sql.DB, now time.Time, lastUserAt time.Time, lastAutoAt ti
 		}
 	}
 
+	if db != nil {
+		var tp int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM thought_proposals WHERE status='proposed'`).Scan(&tp)
+		if tp > 0 {
+			boost := 0.06 * float64(tp)
+			if boost > 0.25 {
+				boost = 0.25
+			}
+			talkDrive = clamp01(talkDrive + boost)
+			if talkDrive >= p.MinTalkDrive {
+				return "Ich habe " + itoa(tp) + " offene Selbstverbesserungs-Ideen aus meiner Gedankenwelt. Soll ich sie als Schema/Code-Proposal ausformulieren?", talkDrive
+			}
+		}
+	}
+
 	if !lastAutoAt.IsZero() && now.Sub(lastAutoAt).Seconds() < p.CooldownSeconds {
 		return "", talkDrive
 	}
