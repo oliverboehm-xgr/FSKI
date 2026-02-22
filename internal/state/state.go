@@ -389,6 +389,35 @@ func migrate(db *sql.DB) error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_thought_proposals_status ON thought_proposals(status);`,
 
+		// ---------- Evolution tournament (daily epigenome forks) ----------
+		`CREATE TABLE IF NOT EXISTS evolution_runs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			window_start TEXT NOT NULL,
+			window_end TEXT NOT NULL,
+			fork_count INTEGER NOT NULL,
+			budget_seconds INTEGER NOT NULL,
+			weights_json TEXT NOT NULL,
+			winner_index INTEGER NOT NULL,
+			winner_score REAL NOT NULL,
+			notes TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS evolution_candidates (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id INTEGER NOT NULL,
+			candidate_index INTEGER NOT NULL,
+			title TEXT NOT NULL,
+			patch_json TEXT NOT NULL,
+			user_reward REAL NOT NULL,
+			evidence REAL NOT NULL,
+			cost REAL NOT NULL,
+			spam REAL NOT NULL,
+			coherence REAL NOT NULL,
+			fitness REAL NOT NULL,
+			created_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_evolution_candidates_run ON evolution_candidates(run_id);`,
+
 		`CREATE INDEX IF NOT EXISTS idx_ratings_message_id ON ratings(message_id);`,
 	}
 	for _, s := range stmts {

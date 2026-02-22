@@ -247,6 +247,19 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"friction_threshold":    0.55,
 				"prefer_code_vs_schema": 0.6,
 			}},
+			"evolution_tournament": {Type: "evolution_tournament", Enabled: true, Params: map[string]any{
+				"enabled":         true,
+				"interval_hours":  24,
+				"window_hours":    24,
+				"fork_count":      6,
+				"budget_seconds":  90,
+				"alpha":           0.45,
+				"beta":            0.20,
+				"gamma":           0.15,
+				"delta":           0.10,
+				"epsilon":         0.10,
+				"proposal_prefix": "evolution_tournament",
+			}},
 			"cooldown": {
 				Type:    "cooldown",
 				Enabled: true,
@@ -383,6 +396,19 @@ func (eg *Epigenome) ensureDefaults() (changed bool) {
 		"max_per_hour":          6,
 		"friction_threshold":    0.55,
 		"prefer_code_vs_schema": 0.6,
+	}})
+	add("evolution_tournament", &ModuleSpec{Type: "evolution_tournament", Enabled: true, Params: map[string]any{
+		"enabled":         true,
+		"interval_hours":  24,
+		"window_hours":    24,
+		"fork_count":      6,
+		"budget_seconds":  90,
+		"alpha":           0.45,
+		"beta":            0.20,
+		"gamma":           0.15,
+		"delta":           0.10,
+		"epsilon":         0.10,
+		"proposal_prefix": "evolution_tournament",
 	}})
 	add("offline_reflex", &ModuleSpec{Type: "offline_reflex", Enabled: true, Params: map[string]any{
 		"default": "LLM backend offline. Ich bin da, aber mein Sprachzentrum (LLM/Ollama) ist gerade offline. Soll ich dir helfen, Ollama zu starten?",
@@ -772,6 +798,58 @@ func (eg *Epigenome) ProposalEngineParams() (enabled bool, minIntervalSec float6
 	}
 	if preferCode > 1 {
 		preferCode = 1
+	}
+	return
+}
+
+func (eg *Epigenome) EvolutionTournamentParams() (enabled bool, intervalHours int, windowHours int, forkCount int, budgetSeconds int, alpha float64, beta float64, gamma float64, delta float64, epsilon float64, proposalPrefix string) {
+	m := eg.Modules["evolution_tournament"]
+	if m == nil || !m.Enabled {
+		return false, 24, 24, 6, 90, 0.45, 0.20, 0.15, 0.10, 0.10, "evolution_tournament"
+	}
+	if v, ok := m.Params["enabled"].(bool); ok {
+		enabled = v
+	} else {
+		enabled = true
+	}
+	intervalHours = int(asFloat(m.Params["interval_hours"], 24))
+	windowHours = int(asFloat(m.Params["window_hours"], 24))
+	forkCount = int(asFloat(m.Params["fork_count"], 6))
+	budgetSeconds = int(asFloat(m.Params["budget_seconds"], 90))
+	alpha = asFloat(m.Params["alpha"], 0.45)
+	beta = asFloat(m.Params["beta"], 0.20)
+	gamma = asFloat(m.Params["gamma"], 0.15)
+	delta = asFloat(m.Params["delta"], 0.10)
+	epsilon = asFloat(m.Params["epsilon"], 0.10)
+	if v, ok := m.Params["proposal_prefix"].(string); ok {
+		proposalPrefix = strings.TrimSpace(v)
+	}
+	if intervalHours < 1 {
+		intervalHours = 1
+	}
+	if intervalHours > 24*14 {
+		intervalHours = 24 * 14
+	}
+	if windowHours < 1 {
+		windowHours = 1
+	}
+	if windowHours > 24*30 {
+		windowHours = 24 * 30
+	}
+	if forkCount < 2 {
+		forkCount = 2
+	}
+	if forkCount > 32 {
+		forkCount = 32
+	}
+	if budgetSeconds < 10 {
+		budgetSeconds = 10
+	}
+	if budgetSeconds > 1800 {
+		budgetSeconds = 1800
+	}
+	if proposalPrefix == "" {
+		proposalPrefix = "evolution_tournament"
 	}
 	return
 }
