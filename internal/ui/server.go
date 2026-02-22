@@ -317,6 +317,8 @@ const indexHTML = `<!doctype html>
     .cmd:hover { background:#18181c; }
     .cmd code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; opacity: 0.95; }
     .cmd span { font-size: 12px; opacity: 0.7; }
+    .ab { margin-top: 10px; display:flex; gap: 8px; align-items:center; }
+    .ab .lab { font-size: 12px; opacity: 0.8; }
   </style>
 </head>
 <body>
@@ -393,6 +395,18 @@ const indexHTML = `<!doctype html>
     div.className = 'msg ' + (m.kind||'');
     div.dataset.id = m.id;
     const rated = (m.rating === 1 || m.rating === 0 || m.rating === -1);
+
+    // Detect A/B trial prompts (TRAIN#<id> ... or "Wähle: /pick <id>")
+    const txt = (m.text||'');
+    let pickID = null;
+    let mm = txt.match(/\bTRAIN#(\d+)\b/);
+    if(mm && mm[1]) pickID = parseInt(mm[1], 10);
+    if(!pickID){
+      mm = txt.match(/Wähle:\s*\/pick\s+(\d+)\s+(A\|B\|none)/i);
+      if(mm && mm[1]) pickID = parseInt(mm[1], 10);
+    }
+    const hasPick = (pickID && pickID > 0);
+
     div.innerHTML =
       '<div class="meta">'+
         '<div>'+
@@ -402,6 +416,14 @@ const indexHTML = `<!doctype html>
         '<div>'+esc(m.created_at||'')+'</div>'+
       '</div>'+
       '<div class="text">'+esc(m.text||'')+'</div>'+
+      (hasPick ?
+      '<div class="ab">'+
+        '<span class="lab">A/B:</span>'+
+        '<button class="abpick" data-pick="A">A</button>'+
+        '<button class="abpick" data-pick="B">B</button>'+
+        '<button class="abpick" data-pick="none">none</button>'+
+        '<span class="ack aback"></span>'+
+      '</div>' : '')+
       ((m.kind==='user') ? '' :
       '<div class="btns">'+
         '<button data-v="1" '+(rated ? 'disabled' : '')+'>👍</button>'+
@@ -410,6 +432,26 @@ const indexHTML = `<!doctype html>
         '<button data-c="1">❌ caught</button>'+
         '<span class="ack">'+(rated ? '✓ gespeichert' : '')+'</span>'+
       '</div>');
+
+    // Wire A/B pick buttons
+    if(hasPick){
+      div.querySelectorAll('button.abpick').forEach(b=>{
+        b.addEventListener('click', async ()=>{
+          const choice = (b.dataset.pick||'').trim();
+          if(!choice) return;
+          const ack = div.querySelector('.aback');
+          div.querySelectorAll('button.abpick').forEach(x=>x.disabled=true);
+          const cmd = '/pick ' + pickID + ' ' + choice;
+          const res = await fetch('/api/send', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text: cmd})});
+          if(res.ok){
+            if(ack) ack.textContent = 'ok';
+          } else {
+            if(ack) ack.textContent = 'err';
+            div.querySelectorAll('button.abpick').forEach(x=>x.disabled=false);
+          }
+        });
+      });
+    }
 
     div.querySelectorAll('button[data-v]').forEach(b=>{
       b.addEventListener('click', async ()=>{
