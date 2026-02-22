@@ -340,21 +340,24 @@ const indexHTML = `<!doctype html>
 
   function esc(s){ return (s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
 
-  function scrollBottom(){
-    requestAnimationFrame(()=>{ chat.scrollTop = chat.scrollHeight; });
+  function scrollTopNow(){
+    requestAnimationFrame(()=>{ chat.scrollTop = 0; });
   }
 
-  function addMsg(m){
-    chat.appendChild(renderMsg(m));
-    scrollBottom();
+  function addMsgTop(m){
+    const el = renderMsg(m);
+    if (chat.firstChild) chat.insertBefore(el, chat.firstChild);
+    else chat.appendChild(el);
+    scrollTopNow();
   }
 
   async function loadMessages(){
     const res = await fetch('/api/messages?limit=80');
     const msgs = await res.json();
     chat.innerHTML = '';
-    msgs.reverse().forEach(addMsg);
-    scrollBottom();
+    // API returns newest first (ORDER BY id DESC) -> render newest at the top.
+    msgs.forEach(m => chat.appendChild(renderMsg(m)));
+    scrollTopNow();
   }
 
   function renderMsg(m){
@@ -436,7 +439,7 @@ const indexHTML = `<!doctype html>
     const es = new EventSource('/api/stream');
     es.addEventListener('message', (ev)=>{
       const m = JSON.parse(ev.data);
-      addMsg(m);
+      addMsgTop(m);
     });
     es.addEventListener('status', (ev)=>{
       const st = JSON.parse(ev.data);

@@ -2,6 +2,10 @@ package main
 
 import (
 	"database/sql"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +24,15 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		return out, nil
 	}
 	if ok, out := handleThoughtCommands(db, userText); ok {
+		return out, nil
+	}
+	if ok, out := handleCodeCommands(db, oc, eg, userText); ok {
+		return out, nil
+	}
+	if ok, out := handleABCommands(db, eg, userText); ok {
+		return out, nil
+	}
+	if ok, out := handlePickCommand(db, userText); ok {
 		return out, nil
 	}
 	// Natural confirmation: if last auto asked about materializing thought_proposals and user says "ja", show them.
@@ -68,7 +81,26 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		return "Hi 🙂 Willst du einfach reden oder soll ich ein Thema vorschlagen?", nil
 	}
 
+	// --- A/B training mode (preference data for LoRA / behavior) ---
+// Notes:
+// - We intentionally avoid running A/B for EXTERNAL_FACT (would trigger web sense twice).
+// - We also avoid OPINION, because the stance engine uses stanceModel (so A/B wouldn't vary).
+// - If A/B is enabled but cannot be produced (missing model, Ollama down, etc.), we return a clear diagnostic
+//   instead of silently falling back to a normal reply.
+if abEnabled(db) {
 	intent := brain.DetectIntentWithEpigenome(userText, eg)
+	if intent != brain.IntentExternalFact && intent != brain.IntentOpinion {
+		msg, ok := runABTrial(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, userText)
+		if ok {
+			return msg, nil
+		}
+		return "A/B Training ist AN, aber der Trial konnte nicht erzeugt werden.\n" +
+			"Prüfe:\n" +
+			"1) Existiert das B-Model wirklich? (Terminal: `ollama list`)\n" +
+			"2) Läuft Ollama? (Terminal: `ollama ps` oder `curl http://localhost:11434/api/tags`)\n" +
+			"3) Teste ohne LoRA: `/ab set b_model llama3.1:8b`", nil
+	}
+}	intent := brain.DetectIntentWithEpigenome(userText, eg)
 	intentMode := brain.IntentToMode(intent)
 
 	survival := 0.0
@@ -139,6 +171,431 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		}
 		return out, err
 	}
+}
+
+func handleCodeCommands(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, userText string) (bool, string) {
+	line := strings.TrimSpace(userText)
+	if !strings.HasPrefix(line, "/code") {
+		return false, ""
+	}
+	parts := strings.Fields(line)
+	if len(parts) == 1 {
+		return true, brain.RenderCodeProposalList(db, 20)
+	}
+	sub := strings.ToLower(strings.TrimSpace(parts[1]))
+	switch sub {
+	case "list":
+		return true, brain.RenderCodeProposalList(db, 20)
+	case "show":
+		if len(parts) < 3 {
+			return true, "Use: /code show <id>"
+		}
+		id, _ := strconv.ParseInt(parts[2], 10, 64)
+		return true, brain.RenderCodeProposal(db, id)
+	case "draft":
+		if len(parts) < 3 {
+			return true, "Use: /code draft <id>"
+		}
+		id, _ := strconv.ParseInt(parts[2], 10, 64)
+		title, diffText, status, notes, ok := brain.GetCodeProposalFull(db, id)
+		_ = status
+		if !ok {
+			return true, "Nicht gefunden."
+		}
+		spec := strings.TrimSpace(notes)
+		if spec == "" {
+			spec = strings.TrimSpace(diffText)
+		}
+		if spec == "" {
+			return true, "Kein Inhalt vorhanden (notes+diff leer)."
+		}
+		coder := eg.ModelFor("coder", eg.ModelFor("speaker", "llama3.1:8b"))
+		ctx := codeIndexContext(db, title, spec)
+		sys := "Du bist ein Go-Engineer. Gib NUR einen unified diff aus (git apply kompatibel). " +
+			"Keine Erklärungen. Minimaler Patch. Pfade relativ zum Repo-Root. " +
+			"Nur in cmd/ oder internal/ ändern. Kein go.mod/go.sum. " +
+			"Wenn möglich: Tests hinzufügen."
+		user := "GOAL/TITLE:\n" + title + "\n\nSPEC/NOTES:\n" + spec + "\n\nCODE_INDEX_CONTEXT:\n" + ctx
+		out, err := oc.Chat(coder, []ollama.Message{{Role: "system", Content: sys}, {Role: "user", Content: user}})
+		if err != nil {
+			return true, "LLM draft failed: " + err.Error()
+		}
+		out = strings.TrimSpace(out)
+		if !strings.Contains(out, "diff --git") {
+			return true, "LLM hat keinen unified diff geliefert. (Erwartet: diff --git ...)"
+		}
+		if bad := firstDisallowedPath(out); bad != "" {
+			return true, "Diff enthält disallowed path: " + bad
+		}
+		brain.UpdateCodeProposal(db, id, out, "proposed")
+		return true, "OK. Diff erzeugt und in code_proposal #" + strconv.FormatInt(id, 10) + " gespeichert.\nWeiter: /code apply " + strconv.FormatInt(id, 10)
+	case "apply":
+		if len(parts) < 3 {
+			return true, "Use: /code apply <id>"
+		}
+		id, _ := strconv.ParseInt(parts[2], 10, 64)
+		_, diffText, _, _, ok := brain.GetCodeProposalFull(db, id)
+		if !ok {
+			return true, "Nicht gefunden."
+		}
+		diffText = strings.TrimSpace(diffText)
+		if !strings.Contains(diffText, "diff --git") {
+			return true, "In code_proposal #" + strconv.FormatInt(id, 10) + " ist noch kein unified diff. Erst: /code draft " + strconv.FormatInt(id, 10)
+		}
+		if bad := firstDisallowedPath(diffText); bad != "" {
+			return true, "Diff enthält disallowed path: " + bad
+		}
+		msg, err := applyPatchInRepo(diffText)
+		if err != nil {
+			return true, "Apply fehlgeschlagen: " + err.Error() + "\n" + msg
+		}
+		brain.MarkCodeProposal(db, id, "applied")
+		return true, "OK. Patch angewendet + go test ./... OK. (code_proposal #" + strconv.FormatInt(id, 10) + " → applied)"
+	case "reject":
+		if len(parts) < 3 {
+			return true, "Use: /code reject <id>"
+		}
+		id, _ := strconv.ParseInt(parts[2], 10, 64)
+		brain.MarkCodeProposal(db, id, "rejected")
+		return true, "OK. code_proposal #" + strconv.FormatInt(id, 10) + " → rejected"
+	default:
+		return true, "Use: /code list | /code show <id> | /code draft <id> | /code apply <id> | /code reject <id>"
+	}
+}
+
+func codeIndexContext(db *sql.DB, title, spec string) string {
+	if db == nil {
+		return ""
+	}
+	q := strings.ToLower(title + " " + spec)
+	keys := []string{}
+	for _, t := range brain.TokenizeAlphaNumLower(q) {
+		if len(t) < 4 {
+			continue
+		}
+		if _, bad := map[string]struct{}{"topic": {}, "drift": {}, "fix": {}, "prevent": {}}[t]; bad {
+			continue
+		}
+		keys = append(keys, t)
+		if len(keys) >= 3 {
+			break
+		}
+	}
+	if len(keys) == 0 {
+		keys = []string{"topic", "gate", "workspace"}
+	}
+	like := "%" + keys[0] + "%"
+	rows, err := db.Query(`SELECT path, summary FROM code_index WHERE lower(path) LIKE ? OR lower(summary) LIKE ? LIMIT 14`, like, like)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	var b strings.Builder
+	for rows.Next() {
+		var p, s string
+		_ = rows.Scan(&p, &s)
+		b.WriteString("- " + strings.TrimSpace(p) + ": " + strings.TrimSpace(s) + "\n")
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func firstDisallowedPath(diff string) string {
+	lines := strings.Split(diff, "\n")
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		if !strings.HasPrefix(ln, "diff --git ") {
+			continue
+		}
+		// diff --git a/<p> b/<p>
+		parts := strings.Fields(ln)
+		if len(parts) < 4 {
+			continue
+		}
+		a := strings.TrimPrefix(parts[2], "a/")
+		b := strings.TrimPrefix(parts[3], "b/")
+		for _, p := range []string{a, b} {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if strings.HasPrefix(p, "cmd/") || strings.HasPrefix(p, "internal/") {
+				// ok
+				continue
+			}
+			return p
+		}
+	}
+	// forbid go.mod/go.sum anywhere
+	if strings.Contains(diff, "go.mod") || strings.Contains(diff, "go.sum") {
+		return "go.mod/go.sum"
+	}
+	return ""
+}
+
+func applyPatchInRepo(diff string) (string, error) {
+	cwd, _ := os.Getwd()
+	tmp := filepath.Join(os.TempDir(), fmt.Sprintf("bunny_patch_%d.diff", time.Now().UnixNano()))
+	_ = os.WriteFile(tmp, []byte(diff), 0644)
+	defer os.Remove(tmp)
+
+	// ensure git exists
+	if _, err := exec.LookPath("git"); err != nil {
+		return "", fmt.Errorf("git not found in PATH")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		return "", fmt.Errorf("go not found in PATH")
+	}
+
+	// optional: ensure clean tree
+	_ = cwd
+	if out, err := runCmd("git", "diff", "--quiet"); err != nil {
+		// non-zero means dirty
+		return out, fmt.Errorf("working tree not clean (commit/stash first)")
+	}
+
+	if out, err := runCmd("git", "apply", "--check", tmp); err != nil {
+		return out, err
+	}
+	if out, err := runCmd("git", "apply", tmp); err != nil {
+		return out, err
+	}
+	// run tests
+	out, err := runCmd("go", "test", "./...")
+	if err != nil {
+		// rollback
+		_, _ = runCmd("git", "apply", "-R", tmp)
+		return out, fmt.Errorf("go test failed; patch rolled back")
+	}
+	return out, nil
+}
+
+func runCmd(bin string, args ...string) (string, error) {
+	cmd := exec.Command(bin, args...)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+func handleABCommands(db *sql.DB, eg *epi.Epigenome, userText string) (bool, string) {
+	line := strings.TrimSpace(userText)
+	if !strings.HasPrefix(line, "/ab") {
+		return false, ""
+	}
+	parts := strings.Fields(line)
+	if len(parts) == 1 {
+		return true, renderABStatus(db, eg)
+	}
+	sub := strings.ToLower(parts[1])
+	switch sub {
+	case "on":
+		kvSet(db, "ab_enabled", "1")
+		return true, "OK. A/B Training ist AN.\n" + renderABStatus(db, eg)
+	case "off":
+		kvSet(db, "ab_enabled", "0")
+		return true, "OK. A/B Training ist AUS."
+	case "status":
+		return true, renderABStatus(db, eg)
+	case "set":
+		if len(parts) < 4 {
+			return true, "Use: /ab set a_model|b_model|a_style|b_style <value>"
+		}
+		k := strings.ToLower(strings.TrimSpace(parts[2]))
+		v := strings.TrimSpace(strings.TrimPrefix(line, parts[0]+" "+parts[1]+" "+parts[2]))
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return true, "Value leer."
+		}
+		allowed := map[string]string{"a_model": "ab_model_a", "b_model": "ab_model_b", "a_style": "ab_style_a", "b_style": "ab_style_b"}
+		key, ok := allowed[k]
+		if !ok {
+			return true, "Use: /ab set a_model|b_model|a_style|b_style <value>"
+		}
+		kvSet(db, key, v)
+		return true, "OK. " + k + " gesetzt.\n" + renderABStatus(db, eg)
+	default:
+		return true, "Use: /ab on|off|status|set ..."
+	}
+}
+
+func handlePickCommand(db *sql.DB, userText string) (bool, string) {
+	line := strings.TrimSpace(userText)
+	if !strings.HasPrefix(line, "/pick") {
+		return false, ""
+	}
+	parts := strings.Fields(line)
+	if len(parts) < 3 {
+		return true, "Use: /pick <ab_id> a|b|none"
+	}
+	id, _ := strconv.ParseInt(parts[1], 10, 64)
+	choice := strings.ToLower(strings.TrimSpace(parts[2]))
+	t, ok := brain.GetABTrial(db, id)
+	if !ok {
+		return true, "AB# nicht gefunden."
+	}
+	if t.Status == "chosen" {
+		// already chosen → return the chosen answer
+		switch t.Choice {
+		case "a":
+			return true, t.AText
+		case "b":
+			return true, t.BText
+		default:
+			return true, "OK. (none)"
+		}
+	}
+	if err := brain.ChooseABTrial(db, id, choice); err != nil {
+		return true, "ERR: " + err.Error()
+	}
+	switch choice {
+	case "a":
+		return true, t.AText
+	case "b":
+		return true, t.BText
+	default:
+		return true, "OK. (none)"
+	}
+}
+
+func abEnabled(db *sql.DB) bool {
+	return strings.TrimSpace(kvGet(db, "ab_enabled")) == "1"
+}
+
+func renderABStatus(db *sql.DB, eg *epi.Epigenome) string {
+	aModel := strings.TrimSpace(kvGet(db, "ab_model_a"))
+	bModel := strings.TrimSpace(kvGet(db, "ab_model_b"))
+	aStyle := strings.TrimSpace(kvGet(db, "ab_style_a"))
+	bStyle := strings.TrimSpace(kvGet(db, "ab_style_b"))
+	if aModel == "" {
+		aModel = eg.ModelFor("speaker", "llama3.1:8b")
+	}
+	if bStyle == "" {
+		bStyle = "empathisch-direkt"
+	}
+	en := "OFF"
+	if abEnabled(db) {
+		en = "ON"
+	}
+	return "A/B Training: " + en + "\n" +
+		"A model: " + aModel + "\n" +
+		"B model: " + pickNonEmpty(bModel, "<unset>") + "\n" +
+		"A style: " + pickNonEmpty(aStyle, "default") + "\n" +
+		"B style: " + bStyle + "\n\n" +
+		"Setze B-Model z.B.: /ab set b_model bunny-speaker-lora-v1"
+}
+
+func pickNonEmpty(v, fb string) string {
+	if strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	return fb
+}
+
+func kvGet(db *sql.DB, key string) string {
+	if db == nil {
+		return ""
+	}
+	var v string
+	_ = db.QueryRow(`SELECT value FROM kv_state WHERE key=?`, key).Scan(&v)
+	return strings.TrimSpace(v)
+}
+
+func kvSet(db *sql.DB, key, val string) {
+	if db == nil {
+		return
+	}
+	_, _ = db.Exec(`INSERT INTO kv_state(key,value,updated_at) VALUES(?,?,?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+		strings.TrimSpace(key), strings.TrimSpace(val), time.Now().Format(time.RFC3339))
+}
+
+func runABTrial(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, modelStance string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string) (string, bool) {
+	bModel := strings.TrimSpace(kvGet(db, "ab_model_b"))
+	if bModel == "" {
+		return "A/B Training ist AN, aber B-Model ist nicht gesetzt.\nNutze: /ab set b_model <modelName>", true
+	}
+	aModel := strings.TrimSpace(kvGet(db, "ab_model_a"))
+	if aModel == "" {
+		aModel = eg.ModelFor("speaker", modelSpeaker)
+	}
+	aStyle := strings.TrimSpace(kvGet(db, "ab_style_a"))
+	bStyle := strings.TrimSpace(kvGet(db, "ab_style_b"))
+	if bStyle == "" {
+		bStyle = "STYLE: empathisch-direkt. Kurz, warm, direkt. Keine unnötigen Rückfragen. 2–5 Sätze."
+	}
+
+	// Clone state to avoid double side-effects.
+	bodyA := *body
+	bodyB := *body
+	wsA := cloneWorkspace(ws)
+	wsB := cloneWorkspace(ws)
+	affA := cloneAffect(aff)
+	affB := cloneAffect(aff)
+	drA := *dr
+	drB := *dr
+
+	aOut, errA := sayWithMutation(db, epiPath, oc, aModel, modelStance, &bodyA, affA, wsA, tr, &drA, eg, userText, aStyle)
+	bOut, errB := sayWithMutation(db, epiPath, oc, bModel, modelStance, &bodyB, affB, wsB, tr, &drB, eg, userText, bStyle)
+	aOut = strings.TrimSpace(aOut)
+	bOut = strings.TrimSpace(bOut)
+
+	// IMPORTANT: Do not silently fall back.
+	if errA != nil || errB != nil {
+		return "A/B Trial konnte nicht erzeugt werden (LLM Fehler).\n" +
+			"A (" + aModel + "): " + errString(errA) + "\n" +
+			"B (" + bModel + "): " + errString(errB) + "\n\n" +
+			"Tipp: Prüfe Modelnamen mit `ollama list`. Falls dein LoRA-Model fehlt, baue es per `ollama create <name> -f Modelfile`.",
+			true
+	}
+	if aOut == "" || bOut == "" {
+		return "A/B Trial konnte nicht erzeugt werden (leere Kandidaten).\n" +
+			"A (" + aModel + ") len=" + strconv.Itoa(len(aOut)) + "\n" +
+			"B (" + bModel + ") len=" + strconv.Itoa(len(bOut)) + "\n\n" +
+			"Tipp: Teste B-Model erst als normales Model: `/ab set b_model llama3.1:8b`.",
+			true
+	}
+
+	id, err := brain.InsertABTrial(db, userText, aModel, aOut, bModel, bOut)
+	if err != nil {
+		return "ERR: " + err.Error(), true
+	}
+	t, _ := brain.GetABTrial(db, id)
+	return brain.RenderABTrial(t), true
+}
+
+
+
+func errString(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+	s := strings.TrimSpace(err.Error())
+	if s == "" {
+		return "<error>"
+	}
+	return s
+}
+
+func cloneWorkspace(ws *brain.Workspace) *brain.Workspace {
+	if ws == nil {
+		return nil
+	}
+	c := *ws
+	if ws.PlanSteps != nil {
+		c.PlanSteps = append([]string{}, ws.PlanSteps...)
+	}
+	return &c
+}
+
+func cloneAffect(a *brain.AffectState) *brain.AffectState {
+	if a == nil {
+		return nil
+	}
+	c := brain.NewAffectState()
+	for _, k := range a.Keys() {
+		c.Set(k, a.Get(k))
+	}
+	return c
 }
 
 func isAffirmative(s string) bool {
