@@ -81,28 +81,26 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		return "Hi 🙂 Willst du einfach reden oder soll ich ein Thema vorschlagen?", nil
 	}
 
+	// --- Intent detection ---
+	intent := brain.DetectIntentWithEpigenome(userText, eg)
+
 	// --- A/B training mode (preference data for LoRA / behavior) ---
 	// Notes:
-	// - We intentionally avoid running A/B for EXTERNAL_FACT (would trigger web sense twice).
-	// - We also avoid OPINION, because the stance engine uses stanceModel (so A/B wouldn't vary).
-	// - If A/B is enabled but cannot be produced (missing model, Ollama down, etc.), we return a clear diagnostic
-	//   instead of silently falling back to a normal reply.
-	if abEnabled(db) {
-		intent := brain.DetectIntentWithEpigenome(userText, eg)
-		if intent != brain.IntentExternalFact && intent != brain.IntentOpinion {
-			msg, ok := runABTrial(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, userText)
-			if ok {
-				return msg, nil
-			}
-			return "A/B Training ist AN, aber der Trial konnte nicht erzeugt werden.\n" +
-				"Prüfe:\n" +
-				"1) Existiert das B-Model wirklich? (Terminal: `ollama list`)\n" +
-				"2) Läuft Ollama? (Terminal: `ollama ps` oder `curl http://localhost:11434/api/tags`)\n" +
-				"3) Teste ohne LoRA: `/ab set b_model llama3.1:8b`", nil
+	// - We skip EXTERNAL_FACT to avoid double websense runs.
+	// - If A/B is enabled but cannot be produced (missing model, Ollama down, etc.),
+	//   we return a clear diagnostic instead of silently falling back.
+	if abEnabled(db) && intent != brain.IntentExternalFact {
+		msg, ok := runABTrial(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, userText)
+		if ok {
+			return msg, nil
 		}
+		return "A/B Training ist AN, aber der Trial konnte nicht erzeugt werden.\n" +
+			"Prüfe:\n" +
+			"1) Existiert das B-Model wirklich? (Terminal: `ollama list`)\n" +
+			"2) Läuft Ollama? (Terminal: `ollama ps` oder `curl http://localhost:11434/api/tags`)\n" +
+			"3) Teste ohne LoRA: `/ab set b_model llama3.1:8b`", nil
 	}
 
-	intent := brain.DetectIntentWithEpigenome(userText, eg)
 	intentMode := brain.IntentToMode(intent)
 
 	survival := 0.0
@@ -192,13 +190,13 @@ func handleCodeCommands(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, userTe
 		if len(parts) < 3 {
 			return true, "Use: /code show <id>"
 		}
-		id, _ := strconv.ParseInt(parts[2], 10, 64)
+		id := parseID(parts[2])
 		return true, brain.RenderCodeProposal(db, id)
 	case "draft":
 		if len(parts) < 3 {
 			return true, "Use: /code draft <id>"
 		}
-		id, _ := strconv.ParseInt(parts[2], 10, 64)
+		id := parseID(parts[2])
 		title, diffText, status, notes, ok := brain.GetCodeProposalFull(db, id)
 		_ = status
 		if !ok {
@@ -235,7 +233,7 @@ func handleCodeCommands(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, userTe
 		if len(parts) < 3 {
 			return true, "Use: /code apply <id>"
 		}
-		id, _ := strconv.ParseInt(parts[2], 10, 64)
+		id := parseID(parts[2])
 		_, diffText, _, _, ok := brain.GetCodeProposalFull(db, id)
 		if !ok {
 			return true, "Nicht gefunden."
@@ -257,7 +255,7 @@ func handleCodeCommands(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, userTe
 		if len(parts) < 3 {
 			return true, "Use: /code reject <id>"
 		}
-		id, _ := strconv.ParseInt(parts[2], 10, 64)
+		id := parseID(parts[2])
 		brain.MarkCodeProposal(db, id, "rejected")
 		return true, "OK. code_proposal #" + strconv.FormatInt(id, 10) + " → rejected"
 	default:
@@ -335,12 +333,15 @@ func firstDisallowedPath(diff string) string {
 }
 
 func applyPatchInRepo(diff string) (string, error) {
-	cwd, _ := os.Getwd()
+	diff = strings.TrimSpace(diff)
+	if diff == "" {
+		return "", fmt.Errorf("empty diff")
+	}
 	tmp := filepath.Join(os.TempDir(), fmt.Sprintf("bunny_patch_%d.diff", time.Now().UnixNano()))
 	_ = os.WriteFile(tmp, []byte(diff), 0644)
 	defer os.Remove(tmp)
 
-	// ensure git exists
+	// ensure tools exist
 	if _, err := exec.LookPath("git"); err != nil {
 		return "", fmt.Errorf("git not found in PATH")
 	}
@@ -348,33 +349,81 @@ func applyPatchInRepo(diff string) (string, error) {
 		return "", fmt.Errorf("go not found in PATH")
 	}
 
-	// optional: ensure clean tree
-	_ = cwd
-	if out, err := runCmd("git", "diff", "--quiet"); err != nil {
-		// non-zero means dirty
-		return out, fmt.Errorf("working tree not clean (commit/stash first)")
+	repo, err := gitRepoRoot()
+	if err != nil {
+		return "", err
 	}
 
-	if out, err := runCmd("git", "apply", "--check", tmp); err != nil {
-		return out, err
-	}
-	if out, err := runCmd("git", "apply", tmp); err != nil {
-		return out, err
-	}
-	// run tests
-	out, err := runCmd("go", "test", "./...")
+	var log strings.Builder
+	log.WriteString("[code apply]\n")
+	log.WriteString("repo: " + repo + "\n")
+
+	// require clean working tree
+	status, err := runCmdDir(repo, "git", "status", "--porcelain")
 	if err != nil {
-		// rollback
-		_, _ = runCmd("git", "apply", "-R", tmp)
-		return out, fmt.Errorf("go test failed; patch rolled back")
+		log.WriteString("git status failed:\n" + status + "\n")
+		return strings.TrimSpace(log.String()), err
+	}
+	if strings.TrimSpace(status) != "" {
+		log.WriteString("working tree NOT clean:\n" + status + "\n")
+		return strings.TrimSpace(log.String()), fmt.Errorf("working tree not clean (commit/stash first)")
+	}
+
+	log.WriteString("1) git apply --check\n")
+	out, err := runCmdDir(repo, "git", "apply", "--check", tmp)
+	if err != nil {
+		log.WriteString(out + "\n")
+		return strings.TrimSpace(log.String()), err
+	}
+
+	log.WriteString("2) git apply\n")
+	out, err = runCmdDir(repo, "git", "apply", tmp)
+	if err != nil {
+		log.WriteString(out + "\n")
+		return strings.TrimSpace(log.String()), err
+	}
+
+	log.WriteString("3) go test ./...\n")
+	testOut, testErr := runCmdDir(repo, "go", "test", "./...")
+	if testErr != nil {
+		log.WriteString("go test FAILED:\n" + testOut + "\n")
+		rb, _ := runCmdDir(repo, "git", "apply", "-R", tmp)
+		log.WriteString("rollback:\n" + rb + "\n")
+		return strings.TrimSpace(log.String()), fmt.Errorf("go test failed; patch rolled back")
+	}
+
+	if strings.TrimSpace(testOut) != "" {
+		log.WriteString(testOut + "\n")
+	}
+	log.WriteString("OK\n")
+	return strings.TrimSpace(log.String()), nil
+}
+
+func gitRepoRoot() (string, error) {
+	// Optional override (useful if bunny is started outside the repo).
+	if v := strings.TrimSpace(os.Getenv("BUNNY_REPO_ROOT")); v != "" {
+		return v, nil
+	}
+	// Use current working dir, but ask git for actual root.
+	out, err := runCmdDir("", "git", "rev-parse", "--show-toplevel")
+	if err != nil {
+		if strings.TrimSpace(out) == "" {
+			out = err.Error()
+		}
+		return "", fmt.Errorf("cannot determine git repo root (are you running bunny inside the repo?): %s", strings.TrimSpace(out))
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return "", fmt.Errorf("cannot determine git repo root (empty)")
 	}
 	return out, nil
 }
 
-func runCmd(bin string, args ...string) (string, error) {
+func runCmdDir(dir string, bin string, args ...string) (string, error) {
 	cmd := exec.Command(bin, args...)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+	if strings.TrimSpace(dir) != "" {
+		cmd.Dir = dir
+	}
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
@@ -429,7 +478,7 @@ func handlePickCommand(db *sql.DB, userText string) (bool, string) {
 	if len(parts) < 3 {
 		return true, "Use: /pick <ab_id> a|b|none"
 	}
-	id, _ := strconv.ParseInt(parts[1], 10, 64)
+	id := parseID(parts[1])
 	choice := strings.ToLower(strings.TrimSpace(parts[2]))
 	t, ok := brain.GetABTrial(db, id)
 	if !ok {
@@ -564,6 +613,12 @@ func runABTrial(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mod
 	t, _ := brain.GetABTrial(db, id)
 	return brain.RenderABTrial(t), true
 }
+func parseID(raw string) int64 {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "#")
+	id, _ := strconv.ParseInt(raw, 10, 64)
+	return id
+}
 
 func errString(err error) string {
 	if err == nil {
@@ -685,7 +740,7 @@ func handleThoughtCommands(db *sql.DB, userText string) (bool, string) {
 		if len(parts) < 3 {
 			return true, "Use: /thought show <id>"
 		}
-		id, _ := strconv.ParseInt(parts[2], 10, 64)
+		id := parseID(parts[2])
 		return true, brain.RenderThoughtProposal(db, id)
 	case "materialize":
 		if len(parts) < 3 {
@@ -695,7 +750,7 @@ func handleThoughtCommands(db *sql.DB, userText string) (bool, string) {
 		if arg == "all" {
 			return true, brain.MaterializeAllThoughtProposals(db, 25)
 		}
-		id, _ := strconv.ParseInt(arg, 10, 64)
+		id := parseID(arg)
 		msg, _ := brain.MaterializeThoughtProposal(db, id)
 		return true, msg
 	default:
