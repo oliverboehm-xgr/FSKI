@@ -2,6 +2,7 @@ package brain
 
 import (
 	"database/sql"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -83,7 +84,9 @@ func ApplyTrainChoice(db *sql.DB, trialID int64, choice string) {
 		return
 	}
 	choice = strings.ToUpper(strings.TrimSpace(choice))
+	chosenAction := ""
 	if choice == "A" {
+		chosenAction = aAct
 		// If A/B are identical on an axis, do not update that axis (prevents double-counting noise).
 		if aAct != "" && bAct != "" && aAct != bAct {
 			UpdatePolicy(db, ctxKey, aAct, 1.0)
@@ -96,6 +99,7 @@ func ApplyTrainChoice(db *sql.DB, trialID int64, choice string) {
 			UpdatePreferenceEMA(db, "style:"+bSty, -0.7, 0.12)
 		}
 	} else if choice == "B" {
+		chosenAction = bAct
 		if aAct != "" && bAct != "" && aAct != bAct {
 			UpdatePolicy(db, ctxKey, bAct, 1.0)
 			UpdatePolicy(db, ctxKey, aAct, 0.0)
@@ -107,4 +111,55 @@ func ApplyTrainChoice(db *sql.DB, trialID int64, choice string) {
 			UpdatePreferenceEMA(db, "style:"+aSty, -0.7, 0.12)
 		}
 	}
+	applySoftWeightMutation(db, ctxKey, chosenAction)
+}
+
+func applySoftWeightMutation(db *sql.DB, ctxKey, chosenAction string) {
+	if db == nil || strings.TrimSpace(ctxKey) == "" || strings.TrimSpace(chosenAction) == "" {
+		return
+	}
+	rate := kvFloat(db, "train:soft_weight_mutation", 0.03)
+	if rate < 0.0 {
+		rate = 0.0
+	}
+	if rate > 0.15 {
+		rate = 0.15
+	}
+	if rate == 0 {
+		return
+	}
+	for _, act := range DefaultPolicyActions {
+		if strings.TrimSpace(act) == "" {
+			continue
+		}
+		reward := 0.5
+		if act == chosenAction {
+			reward = 0.5 + rate
+		} else {
+			reward = 0.5 - (rate / float64(maxInt(1, len(DefaultPolicyActions)-1)))
+		}
+		UpdatePolicy(db, ctxKey, act, reward)
+	}
+}
+
+func kvFloat(db *sql.DB, key string, fallback float64) float64 {
+	if db == nil {
+		return fallback
+	}
+	var raw string
+	if err := db.QueryRow(`SELECT value FROM kv_state WHERE key=?`, strings.TrimSpace(key)).Scan(&raw); err != nil {
+		return fallback
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
