@@ -68,6 +68,13 @@ type Workspace struct {
 	LastUserInfoScore float64
 	LastUserTopToken  string
 	LLMAvailable      bool
+
+	// Cortex sensor-gate traces (per turn)
+	LastSenseNeedWeb bool
+	LastSenseScore   float64
+	LastSenseQuery   string
+	LastSenseReason  string
+	LastSenseText    string
 }
 
 func NewWorkspace() *Workspace {

@@ -18,9 +18,16 @@ type MutantOverlay struct {
 func ExecuteTurnWithMeta(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, modelStance string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string, mut *MutantOverlay) (out string, action string, style string, ctxKey string, topic string, intentMode string) {
 	nb := brain.NewNBIntent(db)
 	intent := brain.DetectIntentHybrid(userText, eg, nb)
-	// Research gate (truth kernel)
-	rd := brain.DecideResearch(db, userText, intent, ws, tr, dr, aff)
 	intentMode = brain.IntentToMode(intent)
+	gateModel := eg.ModelFor("gate", modelSpeaker)
+	rd := brain.DecideResearchCortex(db, oc, gateModel, userText, intent, ws, tr, dr, aff)
+	if ws != nil {
+		ws.LastSenseNeedWeb = rd.Do
+		ws.LastSenseScore = rd.Score
+		ws.LastSenseQuery = rd.Query
+		ws.LastSenseReason = rd.Reason
+		ws.LastSenseText = userText
+	}
 	topic = ws.ActiveTopic
 	if topic == "" {
 		topic = ws.LastTopic
@@ -51,7 +58,7 @@ func ExecuteTurnWithMeta(db *sql.DB, epiPath string, oc *ollama.Client, modelSpe
 		}
 	}
 
-	// Truth-gate: if research is indicated, avoid direct_answer bluffing.
+	// Truth-gate: if cortex decided web is needed, avoid direct_answer bluffing.
 	if rd.Do && ws != nil && ws.WebAllowed && action == "direct_answer" {
 		action = "research_then_answer"
 		ws.LastPolicyAction = action

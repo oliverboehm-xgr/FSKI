@@ -1376,7 +1376,8 @@ func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, stanceMode
 		}
 	}
 
-	intent := brain.DetectIntentWithEpigenome(userText, eg)
+	nb := brain.NewNBIntent(db)
+	intent := brain.DetectIntentHybrid(userText, eg, nb)
 	// In training dry-run we keep everything "online" but avoid web/stance side-effects.
 	if ws == nil || !ws.TrainingDryRun {
 		// Hard rule: Opinion -> stance engine (stance persists, becomes personality)
@@ -1389,8 +1390,22 @@ func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, stanceMode
 		if ws != nil && !ws.WebAllowed {
 			// Survival gate disabled web; continue without research.
 		} else {
-			rd := brain.DecideResearch(db, userText, intent, ws, tr, dr, aff)
+			rd := brain.ResearchDecision{}
+			if ws != nil && ws.LastSenseText == userText {
+				rd = brain.ResearchDecision{Do: ws.LastSenseNeedWeb, Score: ws.LastSenseScore, Query: ws.LastSenseQuery, Reason: ws.LastSenseReason}
+			} else {
+				gateModel := eg.ModelFor("gate", model)
+				rd = brain.DecideResearchCortex(db, oc, gateModel, userText, intent, ws, tr, dr, aff)
+				if ws != nil {
+					ws.LastSenseNeedWeb = rd.Do
+					ws.LastSenseScore = rd.Score
+					ws.LastSenseQuery = rd.Query
+					ws.LastSenseReason = rd.Reason
+					ws.LastSenseText = userText
+				}
+			}
 			if rd.Do {
+				// If the gate says "research", route into evidence answering.
 				// answerWithEvidence already does Search+Fetch+Snippet fallback.
 				return answerWithEvidence(db, oc, model, body, aff, ws, tr, eg, rd.Query)
 			}
@@ -1469,6 +1484,7 @@ HARTE REGELN
 	}
 	body.CooldownUntil = time.Now().Add(eg.CooldownDuration())
 	out = brain.ApplyUtteranceFilter(out, eg)
+	out, _ = brain.StripGeneratedURLs(out, userText)
 	return brain.PostprocessUtterance(out), nil
 }
 
