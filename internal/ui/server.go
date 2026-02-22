@@ -292,10 +292,10 @@ const indexHTML = `<!doctype html>
   <title>Bunny UI</title>
   <style>
     body { font-family: system-ui, sans-serif; margin: 0; background: #0b0b0c; color: #eaeaea; }
-    .wrap { display: grid; grid-template-columns: 1fr 360px; height: 100vh; }
-    .main { display:flex; flex-direction:column; height:100vh; min-height: 100vh; }
-    .chat { flex:1; padding: 16px; overflow: auto; }
-    .side { border-left: 1px solid #222; padding: 16px; overflow: auto; background: #0f0f11; }
+    .wrap { display: grid; grid-template-columns: minmax(0,1fr) clamp(260px, 30vw, 380px); width: min(100vw, 100%); height: 100dvh; overflow: hidden; }
+    .main { display:flex; flex-direction:column; min-width:0; height:100dvh; min-height: 100dvh; }
+    .chat { flex:1; padding: 16px; overflow: auto; min-width:0; }
+    .side { border-left: 1px solid #222; padding: 16px; overflow: auto; background: #0f0f11; min-width:0; }
     .msg { background: #131316; border: 1px solid #242428; border-radius: 12px; padding: 12px; margin: 10px 0; }
     .msg.user { background:#0f1a12; border-color:#21402b; margin-left: 64px; }
     .msg.reply,.msg.auto,.msg.think { margin-right: 64px; }
@@ -306,7 +306,7 @@ const indexHTML = `<!doctype html>
     button:hover { background:#24242a; }
     button:disabled { opacity:0.45; cursor: default; }
     .ack { font-size: 12px; opacity: 0.75; margin-left: 6px; }
-    .row { display:flex; gap: 10px; padding: 12px; border-top: 1px solid #222; background:#0b0b0c; position: sticky; bottom: 0; z-index: 5; }
+    .row { display:flex; gap: 10px; padding: 12px; border-top: 1px solid #222; background:#0b0b0c; position: sticky; bottom: 0; z-index: 5; min-width:0; }
     input { flex:1; background:#101012; border:1px solid #2b2b33; border-radius:10px; padding:10px; color:#eaeaea; }
     .tag { font-size: 11px; padding:2px 8px; border:1px solid #2b2b33; border-radius:999px; }
     pre { white-space: pre-wrap; font-size: 12px; opacity: 0.9; }
@@ -319,6 +319,17 @@ const indexHTML = `<!doctype html>
     .cmd span { font-size: 12px; opacity: 0.7; }
     .ab { margin-top: 10px; display:flex; gap: 8px; align-items:center; }
     .ab .lab { font-size: 12px; opacity: 0.8; }
+
+    @media (max-width: 1080px) {
+      .wrap { grid-template-columns: minmax(0, 1fr) 320px; }
+      .msg.user { margin-left: 24px; }
+      .msg.reply,.msg.auto,.msg.think { margin-right: 24px; }
+    }
+    @media (max-width: 860px) {
+      .wrap { grid-template-columns: 1fr; }
+      .side { border-left: 0; border-top: 1px solid #222; max-height: 36vh; }
+      .main { height: 64vh; min-height: 64vh; }
+    }
   </style>
 </head>
 <body>
@@ -350,6 +361,10 @@ const indexHTML = `<!doctype html>
           <button class="cmd" data-insert="/code apply 1"><code>/code apply &lt;id&gt;</code><span>Gated apply</span></button>
           <button class="cmd" data-insert="/ab on"><code>/ab on</code><span>A/B an</span></button>
           <button class="cmd" data-insert="/ab status"><code>/ab status</code><span>Status</span></button>
+          <button class="cmd" data-insert="/epi list"><code>/epi list</code><span>Epi-Vorschläge</span></button>
+          <button class="cmd" data-insert="/epi show 1"><code>/epi show &lt;id&gt;</code><span>Details</span></button>
+          <button class="cmd" data-insert="/epi apply 1"><code>/epi apply &lt;id&gt;</code><span>Anwenden</span></button>
+          <button class="cmd" data-insert="/selfcode index"><code>/selfcode index</code><span>Code-Index</span></button>
           <button class="cmd" data-insert="/web test ibft consensus"><code>/web test &lt;query&gt;</code><span>Websense</span></button>
         </div>
       </div>
