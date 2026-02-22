@@ -24,6 +24,9 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 	if ok, out := handleWebCommands(userText); ok {
 		return out, nil
 	}
+	if ok, out := handleEpiCommands(db, epiPath, eg, userText); ok {
+		return out, nil
+	}
 	if ok, out := handleThoughtCommands(db, userText); ok {
 		return out, nil
 	}
@@ -64,11 +67,8 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 	}
 
 	if ws != nil && !ws.LLMAvailable {
-		low := strings.ToLower(userText)
-		if strings.Contains(low, "fühl") || strings.Contains(low, "wie geht") {
-			return "Ich kann dir meinen Zustand nennen (Ressourcen/Drives), aber mein Sprachzentrum (LLM/Ollama) ist auf diesem Gerät gerade nicht verfügbar. Installier/Starte Ollama, dann kann ich normal antworten.", nil
-		}
-		return "LLM backend offline. Ich bin da, aber mein Sprachzentrum (LLM/Ollama) ist gerade offline. Willst du, dass ich dir helfe, Ollama zu installieren/zu starten?", nil
+		// LLM offline: respond via epigenetic reflex templates (no keyword hacks in code).
+		return brain.OfflineReflexReply(eg, ws, userText), nil
 	}
 
 	// --- Generic info gate (learned IDF) ---
@@ -1272,7 +1272,22 @@ func autoPickMutantModel(oc *ollama.Client, poolCSV string, fallback string) str
 		}
 		return cands[idx]
 	}
-	return ""
+	// If no LoRA/adapter models exist, still vary by picking ANY other installed model.
+	for m := range models {
+		lm := strings.ToLower(strings.TrimSpace(m))
+		if lm == "" || lm == strings.ToLower(fallback) {
+			continue
+		}
+		cands = append(cands, m)
+	}
+	if len(cands) == 0 {
+		return ""
+	}
+	idx := int(time.Now().UnixNano() % int64(len(cands)))
+	if idx < 0 {
+		idx = -idx
+	}
+	return cands[idx]
 }
 func parseID(raw string) int64 {
 	raw = strings.TrimSpace(raw)
@@ -1395,6 +1410,80 @@ func handleWebCommands(userText string) (bool, string) {
 		b.WriteString("- " + title + "\n  " + u + "\n  " + sn + "\n")
 	}
 	return true, strings.TrimSpace(b.String())
+}
+
+func handleEpiCommands(db *sql.DB, epiPath string, eg *epi.Epigenome, userText string) (bool, string) {
+	line := strings.TrimSpace(userText)
+	if !strings.HasPrefix(line, "/epi") {
+		return false, ""
+	}
+	parts := strings.Fields(line)
+	if len(parts) < 2 {
+		return true, "Use: /epi list | /epi show <id> | /epi apply <id> | /epi reject <id> | /epi dump"
+	}
+	sub := strings.ToLower(strings.TrimSpace(parts[1]))
+	switch sub {
+	case "list":
+		return true, brain.RenderEpigenomeProposalList(db, 20)
+	case "show":
+		if len(parts) < 3 {
+			return true, "Use: /epi show <id>"
+		}
+		id := parseID(parts[2])
+		if id <= 0 {
+			return true, "Bad id."
+		}
+		return true, brain.RenderEpigenomeProposal(db, id)
+	case "reject":
+		if len(parts) < 3 {
+			return true, "Use: /epi reject <id>"
+		}
+		id := parseID(parts[2])
+		if id <= 0 {
+			return true, "Bad id."
+		}
+		brain.MarkEpigenomeProposal(db, id, "rejected")
+		return true, "OK. (rejected)"
+	case "dump":
+		b, err := os.ReadFile(epiPath)
+		if err != nil {
+			return true, "ERR: " + err.Error()
+		}
+		return true, string(b)
+	case "apply":
+		if len(parts) < 3 {
+			return true, "Use: /epi apply <id>"
+		}
+		id := parseID(parts[2])
+		if id <= 0 {
+			return true, "Bad id."
+		}
+		row, ok := brain.GetEpigenomeProposal(db, id)
+		if !ok {
+			return true, "Nicht gefunden."
+		}
+		if strings.TrimSpace(row.Status) != "proposed" {
+			return true, "Nicht offen (status=" + row.Status + ")"
+		}
+		cur, err := epi.LoadOrInit(epiPath)
+		if err != nil {
+			return true, "ERR load epigenome: " + err.Error()
+		}
+		next, err := cur.ApplyMergePatch([]byte(row.PatchJSON))
+		if err != nil {
+			return true, "ERR patch: " + err.Error()
+		}
+		if err := next.Save(epiPath); err != nil {
+			return true, "ERR save: " + err.Error()
+		}
+		if eg != nil {
+			*eg = *next
+		}
+		brain.MarkEpigenomeProposal(db, id, "applied")
+		return true, "OK. Epigenome patch applied: #" + strconv.FormatInt(id, 10)
+	default:
+		return true, "Use: /epi list | /epi show <id> | /epi apply <id> | /epi reject <id> | /epi dump"
+	}
 }
 func handleThoughtCommands(db *sql.DB, userText string) (bool, string) {
 	line := strings.TrimSpace(userText)

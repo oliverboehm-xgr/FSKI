@@ -254,6 +254,19 @@ func LoadOrInit(path string) (*Epigenome, error) {
 					"seconds": 120,
 				},
 			},
+			// LLM-offline reflex templates (data-driven fallback replies)
+			"offline_reflex": {Type: "offline_reflex", Enabled: true, Params: map[string]any{
+				"default": "LLM backend offline. Ich bin da, aber mein Sprachzentrum (LLM/Ollama) ist gerade offline. Soll ich dir helfen, Ollama zu starten?",
+				"rules": []any{
+					map[string]any{
+						"name":     "meta_status",
+						"priority": 100,
+						"contains": []any{"wie geht", "fühl", "status", "energie", "zustand"},
+						"regex":    []any{`\bfühl\w*\b.*\bdu\b`, `\bwie\b.*\bgeht\b.*\bdir\b`},
+						"reply":    "Ich kann dir meinen Zustand nennen (Energie={{energy}}, survival={{survival}}), aber mein Sprachzentrum ist gerade offline. Wenn du willst: ich helfe dir, Ollama zu starten.",
+					},
+				},
+			}},
 			"say_energy_cost": {
 				Type:    "say_energy_cost",
 				Enabled: true,
@@ -371,6 +384,18 @@ func (eg *Epigenome) ensureDefaults() (changed bool) {
 		"friction_threshold":    0.55,
 		"prefer_code_vs_schema": 0.6,
 	}})
+	add("offline_reflex", &ModuleSpec{Type: "offline_reflex", Enabled: true, Params: map[string]any{
+		"default": "LLM backend offline. Ich bin da, aber mein Sprachzentrum (LLM/Ollama) ist gerade offline. Soll ich dir helfen, Ollama zu starten?",
+		"rules": []any{
+			map[string]any{
+				"name":     "meta_status",
+				"priority": 100,
+				"contains": []any{"wie geht", "fühl", "status", "energie", "zustand"},
+				"regex":    []any{`\bfühl\w*\b.*\bdu\b`, `\bwie\b.*\bgeht\b.*\bdir\b`},
+				"reply":    "Ich kann dir meinen Zustand nennen (Energie={{energy}}, survival={{survival}}), aber mein Sprachzentrum ist gerade offline. Wenn du willst: ich helfe dir, Ollama zu starten.",
+			},
+		},
+	}})
 
 	def := func(k string, base, decay, coupling float64) {
 		if _, ok := eg.AffectDefsMap[k]; !ok {
@@ -384,6 +409,67 @@ func (eg *Epigenome) ensureDefaults() (changed bool) {
 	def("shame", 0.00, 0.03, 0.0)
 	def("fear", 0.00, 0.03, 0.0)
 	return changed
+}
+
+type OfflineReflexRule struct {
+	Name     string
+	Priority int
+	Contains []string
+	Regex    []string
+	Reply    string
+}
+
+func (eg *Epigenome) OfflineReflexRules() (rules []OfflineReflexRule, defaultReply string) {
+	m := eg.Modules["offline_reflex"]
+	if m == nil || !m.Enabled {
+		return nil, ""
+	}
+	if v, ok := m.Params["default"].(string); ok {
+		defaultReply = strings.TrimSpace(v)
+	}
+	arr, ok := m.Params["rules"].([]any)
+	if !ok {
+		return nil, defaultReply
+	}
+	for _, it := range arr {
+		mm, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		r := OfflineReflexRule{}
+		if v, ok := mm["name"].(string); ok {
+			r.Name = v
+		}
+		r.Priority = int(asFloat(mm["priority"], 0))
+		if c, ok := mm["contains"].([]any); ok {
+			for _, x := range c {
+				if s, ok := x.(string); ok && s != "" {
+					r.Contains = append(r.Contains, s)
+				}
+			}
+		}
+		if c, ok := mm["regex"].([]any); ok {
+			for _, x := range c {
+				if s, ok := x.(string); ok && s != "" {
+					r.Regex = append(r.Regex, s)
+				}
+			}
+		}
+		if v, ok := mm["reply"].(string); ok {
+			r.Reply = strings.TrimSpace(v)
+		}
+		if r.Reply != "" {
+			rules = append(rules, r)
+		}
+	}
+	for i := 0; i < len(rules); i++ {
+		for j := i + 1; j < len(rules); j++ {
+			if rules[j].Priority > rules[i].Priority {
+				rules[i], rules[j] = rules[j], rules[i]
+			}
+		}
+	}
+	return rules, defaultReply
 }
 
 func (eg *Epigenome) ModuleEnabled(name string) bool {

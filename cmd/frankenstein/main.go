@@ -95,11 +95,16 @@ func main() {
 		ctxEnsure, cancelEnsure := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancelEnsure()
 		res := ollama.EnsureAvailable(ctxEnsure, oc, want, autoStart, autoPull, retries, time.Duration(retryMs)*time.Millisecond, time.Duration(pullSec)*time.Second, maxPull)
-		ws.LLMAvailable = res.Available && len(res.Missing) == 0
+		// Bunny should still function if ONLY the speaker model is available.
+		ws.LLMAvailable = res.Available
+		ws.OLLAMAMissing = append([]string{}, res.Missing...)
 		fmt.Println(ollama.FormatEnsure(res))
 	} else {
 		ws.LLMAvailable = oc.Ping() == nil
 	}
+
+	// Evolution bootstrap: create epigenome_proposals for common self-heal tweaks (manual apply via /epi).
+	brain.BootstrapEpigenomeEvolution(db.DB, oc, eg)
 
 	// NB intent classifier
 	nb := brain.NewNBIntent(db.DB)
