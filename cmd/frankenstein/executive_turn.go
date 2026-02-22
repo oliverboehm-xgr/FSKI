@@ -92,8 +92,16 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 	nb := brain.NewNBIntent(db)
 	intent := brain.DetectIntentHybrid(userText, eg, nb)
 
-	// --- Research gate (truth kernel) ---
-	rd := brain.DecideResearch(db, userText, intent, ws, tr, dr, aff)
+	// --- Cortex sensor-gate (web sense) ---
+	gateModel := eg.ModelFor("gate", modelSpeaker)
+	rd := brain.DecideResearchCortex(db, oc, gateModel, userText, intent, ws, tr, dr, aff)
+	if ws != nil {
+		ws.LastSenseNeedWeb = rd.Do
+		ws.LastSenseScore = rd.Score
+		ws.LastSenseQuery = rd.Query
+		ws.LastSenseReason = rd.Reason
+		ws.LastSenseText = userText
+	}
 
 	// --- A/B training mode (preference data for LoRA / behavior) ---
 	// Notes:
@@ -139,7 +147,7 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		ws.LastPolicyStyle = choice.Style
 		ws.LastRoutedIntent = intentMode
 	}
-	// Truth-gate: if research is indicated, avoid direct_answer bluffing.
+	// Truth-gate: if cortex decided web is needed, avoid direct_answer bluffing.
 	if rd.Do && ws != nil && ws.WebAllowed && choice.Action == "direct_answer" {
 		choice.Action = "research_then_answer"
 		ws.LastPolicyAction = choice.Action
