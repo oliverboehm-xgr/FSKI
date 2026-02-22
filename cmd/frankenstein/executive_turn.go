@@ -247,31 +247,42 @@ func handleCodeCommands(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, userTe
 		if err != nil {
 			return true, "LLM draft failed: " + err.Error()
 		}
-		out = sanitizeUnifiedDiff(strings.TrimSpace(out))
+
+		// 1) sanitize / strip fences
+		out = stripCodeFences(strings.TrimSpace(out))
+
+		// 2) basic validation
 		if !strings.Contains(out, "diff --git") {
 			return true, "LLM hat keinen unified diff geliefert. (Erwartet: diff --git ...)"
 		}
-		if msg, err := validateDraftUnifiedDiff(out); err != nil {
-			// One retry with error feedback
-			retrySys := "Du korrigierst einen fehlerhaften unified diff. Gib NUR einen korrigierten unified diff aus (git apply kompatibel). Keine Erklärungen."
-			retryUser := "GIT_APPLY_OR_PARSE_ERROR:\n" + msg + "\n\nBAD_DIFF:\n" + out + "\n\nREQUIREMENTS:\n- unified diff mit 'diff --git a/... b/... '\n- Jede Zeile in einem Hunk muss mit ' ', '+', '-' beginnen\n- Nur cmd/ oder internal/ ändern, keine go.mod/go.sum"
-			out2, err2 := oc.Chat(coder, []ollama.Message{{Role: "system", Content: retrySys}, {Role: "user", Content: retryUser}})
-			if err2 == nil {
-				out2 = sanitizeUnifiedDiff(strings.TrimSpace(out2))
-				if bad := firstDisallowedPath(out2); bad != "" {
-					return true, "Diff enthält disallowed path: " + bad
-				}
-				if msg2, err3 := validateDraftUnifiedDiff(out2); err3 == nil {
-					out = out2
-				} else {
-					return true, "LLM diff ungültig (git apply --check):\n" + msg2 + "\n\nTipp: In Hunks müssen alle Zeilen mit ' ', '+', '-' beginnen. Außerdem nur echte Dateien unter cmd/ oder internal/ ändern."
-				}
-			} else {
-				return true, "LLM diff ungültig (git apply --check):\n" + msg + "\n(LLM retry failed: " + err2.Error() + ")"
-			}
+		if bad := firstDisallowedPath(out); bad != "" {
+			return true, "Diff enthält disallowed path: " + bad
+		}
+		if err := validateUnifiedDiffSyntax(out); err != nil {
+			return true, "Diff syntaktisch ungültig: " + err.Error()
+		}
+
+		// 3) path guard: only existing files (or explicit new files) in repo / code_index
+		repo, err := gitRepoRoot()
+		if err != nil {
+			return true, "Kann Repo-Root nicht bestimmen: " + err.Error() + "\nTipp: setze BUNNY_REPO_ROOT."
+		}
+		warn, err := validateDiffTouchedPaths(db, repo, out)
+		if err != nil {
+			return true, "Diff-Pfad-Check fehlgeschlagen: " + err.Error() + "\nTipp: /selfcode index ausführen."
+		}
+
+		// 4) preflight: git apply --check + go test in temporary worktree (compile gate before apply)
+		log, err := preflightApplyAndTest(repo, out)
+		if err != nil {
+			return true, "Preflight fehlgeschlagen (Patch wird NICHT gespeichert):\n" + log
 		}
 		brain.UpdateCodeProposal(db, id, out, "proposed")
-		return true, "OK. Diff erzeugt und in code_proposal #" + strconv.FormatInt(id, 10) + " gespeichert.\nWeiter: /code apply " + strconv.FormatInt(id, 10)
+		msg := "OK. Diff validiert und compilierbar (go test OK) — in code_proposal #" + strconv.FormatInt(id, 10) + " gespeichert.\nWeiter: /code apply " + strconv.FormatInt(id, 10)
+		if strings.TrimSpace(warn) != "" {
+			msg += "\n" + warn
+		}
+		return true, msg
 	case "apply":
 		if len(parts) < 3 {
 			return true, "Use: /code apply <id>"
@@ -340,6 +351,197 @@ func codeIndexContext(db *sql.DB, title, spec string) string {
 		b.WriteString("- " + strings.TrimSpace(p) + ": " + strings.TrimSpace(s) + "\n")
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func stripCodeFences(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.Contains(s, "```") {
+		return s
+	}
+	// Take the first fenced block if present.
+	i := strings.Index(s, "```")
+	if i < 0 {
+		return s
+	}
+	rest := s[i+3:]
+	// skip optional language id line
+	if j := strings.Index(rest, "\n"); j >= 0 {
+		rest = rest[j+1:]
+	}
+	k := strings.Index(rest, "```")
+	if k < 0 {
+		return strings.TrimSpace(rest)
+	}
+	return strings.TrimSpace(rest[:k])
+}
+
+func validateUnifiedDiffSyntax(diff string) error {
+	lines := strings.Split(diff, "\n")
+	inHunk := false
+	for i, ln := range lines {
+		if strings.HasPrefix(ln, "diff --git ") {
+			inHunk = false
+			continue
+		}
+		if strings.HasPrefix(ln, "@@") {
+			inHunk = true
+			continue
+		}
+		if !inHunk {
+			continue
+		}
+		if ln == "" {
+			return fmt.Errorf("hunk line %d has empty prefix (expected ' ', '+', '-' or '\\\\')", i+1)
+		}
+		switch ln[0] {
+		case ' ', '+', '-', '\\':
+			// ok
+		default:
+			return fmt.Errorf("hunk line %d has invalid prefix %q", i+1, string(ln[0]))
+		}
+	}
+	return nil
+}
+
+type touchedFile struct {
+	Path  string
+	IsNew bool
+}
+
+func parseTouchedFiles(diff string) []touchedFile {
+	lines := strings.Split(diff, "\n")
+	var out []touchedFile
+	for _, ln := range lines {
+		if strings.HasPrefix(ln, "diff --git ") {
+			parts := strings.Fields(ln)
+			if len(parts) >= 4 {
+				p := strings.TrimSpace(strings.TrimPrefix(parts[3], "b/"))
+				out = append(out, touchedFile{Path: p})
+			}
+			continue
+		}
+		if strings.HasPrefix(ln, "new file mode") || strings.HasPrefix(ln, "--- /dev/null") {
+			if len(out) > 0 {
+				out[len(out)-1].IsNew = true
+			}
+		}
+	}
+	// dedupe by path while preserving order
+	seen := map[string]bool{}
+	result := make([]touchedFile, 0, len(out))
+	for _, f := range out {
+		if f.Path == "" || seen[f.Path] {
+			continue
+		}
+		seen[f.Path] = true
+		result = append(result, f)
+	}
+	return result
+}
+
+func codeIndexRowCount(db *sql.DB) int {
+	if db == nil {
+		return 0
+	}
+	var n int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM code_index`).Scan(&n)
+	return n
+}
+
+func codeIndexHasPath(db *sql.DB, path string) bool {
+	if db == nil {
+		return false
+	}
+	var one int
+	err := db.QueryRow(`SELECT 1 FROM code_index WHERE path=? LIMIT 1`, path).Scan(&one)
+	return err == nil && one == 1
+}
+
+func validateDiffTouchedPaths(db *sql.DB, repoRoot string, diff string) (string, error) {
+	files := parseTouchedFiles(diff)
+	if len(files) == 0 {
+		return "", fmt.Errorf("diff enthält keine erkennbaren File-Changes (diff --git ...)")
+	}
+	idxN := codeIndexRowCount(db)
+	for _, f := range files {
+		p := strings.TrimSpace(f.Path)
+		if p == "" {
+			continue
+		}
+		if strings.Contains(p, "..") {
+			return "", fmt.Errorf("path traversal nicht erlaubt: %s", p)
+		}
+		if !(strings.HasPrefix(p, "cmd/") || strings.HasPrefix(p, "internal/")) {
+			return "", fmt.Errorf("disallowed path root: %s", p)
+		}
+		abs := filepath.Join(repoRoot, filepath.FromSlash(p))
+		_, err := os.Stat(abs)
+		if err != nil && !f.IsNew {
+			return "", fmt.Errorf("file nicht gefunden im Repo: %s", p)
+		}
+		if idxN > 0 && !f.IsNew && !codeIndexHasPath(db, p) {
+			return "", fmt.Errorf("file nicht im code_index (run /selfcode index): %s", p)
+		}
+	}
+	if idxN == 0 {
+		return "WARN: code_index ist leer. Für strengere Guards: /selfcode index ausführen.", nil
+	}
+	return "", nil
+}
+
+func preflightApplyAndTest(repoRoot string, diffText string) (string, error) {
+	diffText = strings.TrimSpace(diffText)
+	if diffText == "" {
+		return "", fmt.Errorf("empty diff")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		return "", fmt.Errorf("git not found in PATH")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		return "", fmt.Errorf("go not found in PATH")
+	}
+
+	tmpPatch := filepath.Join(os.TempDir(), fmt.Sprintf("bunny_draft_%d.diff", time.Now().UnixNano()))
+	_ = os.WriteFile(tmpPatch, []byte(diffText), 0644)
+	defer os.Remove(tmpPatch)
+
+	worktree := filepath.Join(os.TempDir(), fmt.Sprintf("bunny_worktree_%d", time.Now().UnixNano()))
+	var log strings.Builder
+	log.WriteString("[preflight]\n")
+	log.WriteString("repo: " + repoRoot + "\n")
+	log.WriteString("worktree: " + worktree + "\n")
+
+	log.WriteString("0) git worktree add --detach\n")
+	if out, err := runCmdDir(repoRoot, "git", "worktree", "add", "--detach", worktree, "HEAD"); err != nil {
+		log.WriteString(out + "\n")
+		return strings.TrimSpace(log.String()), fmt.Errorf("worktree add failed")
+	}
+	defer func() {
+		_, _ = runCmdDir(repoRoot, "git", "worktree", "remove", "--force", worktree)
+		_, _ = runCmdDir(repoRoot, "git", "worktree", "prune")
+	}()
+
+	log.WriteString("1) git apply --check\n")
+	if out, err := runCmdDir(worktree, "git", "apply", "--check", tmpPatch); err != nil {
+		log.WriteString(out + "\n")
+		return strings.TrimSpace(log.String()), fmt.Errorf("git apply --check failed")
+	}
+	log.WriteString("2) git apply\n")
+	if out, err := runCmdDir(worktree, "git", "apply", tmpPatch); err != nil {
+		log.WriteString(out + "\n")
+		return strings.TrimSpace(log.String()), fmt.Errorf("git apply failed")
+	}
+	log.WriteString("3) go test ./...\n")
+	testOut, testErr := runCmdDir(worktree, "go", "test", "./...")
+	if testErr != nil {
+		log.WriteString(testOut + "\n")
+		return strings.TrimSpace(log.String()), fmt.Errorf("go test failed")
+	}
+	if strings.TrimSpace(testOut) != "" {
+		log.WriteString(testOut + "\n")
+	}
+	log.WriteString("OK\n")
+	return strings.TrimSpace(log.String()), nil
 }
 
 func firstDisallowedPath(diff string) string {
