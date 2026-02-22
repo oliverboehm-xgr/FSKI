@@ -39,21 +39,32 @@ func extractJSONObject(s string) (string, bool) {
 }
 
 // CortexWebGate asks a small LLM to decide whether WebSense is needed.
-// IMPORTANT: If uncertain, it must prefer need_web=true (to avoid hallucinations).
-func CortexWebGate(oc *ollama.Client, model string, userText string, intent Intent, survivalMode bool) (need bool, conf float64, query string, reason string, err error) {
+// IMPORTANT: If uncertain, it must prefer need_web=true (avoid hallucinations).
+func CortexWebGate(oc *ollama.Client, model string, userText string, intent Intent, ws *Workspace) (need bool, conf float64, query string, reason string, err error) {
 	if oc == nil || strings.TrimSpace(model) == "" {
 		return false, 0, "", "", errors.New("ollama_missing")
 	}
-	// keep it short and deterministic
+	if ws != nil && ws.TrainingDryRun {
+		return false, 0, "", "", errors.New("dry_run")
+	}
+
 	sys := "Du bist ein Sensor-Gate. Du beantwortest NICHT die Nutzerfrage. " +
 		"Du entscheidest nur, ob ein WebSense-Aufruf nötig ist, um Halluzinationen zu vermeiden. " +
 		"Wenn du unsicher bist: need_web=true. " +
 		"Output ONLY JSON: {\"need_web\":bool,\"confidence\":0..1,\"query\":string,\"reason\":string}."
 
-	// Provide minimal context.
-	im := IntentToMode(intent)
-	user := "USER_TEXT:\n" + userText + "\n\nINTENT_MODE:" + im + "\nSURVIVAL_MODE:" + boolTo01(survivalMode) + "\n" +
-		"\nEntscheide need_web. Wenn need_web=true, gib eine kurze Suchquery (Deutsch) die für WebSearch taugt."
+	webAllowed := true
+	survivalMode := false
+	if ws != nil {
+		webAllowed = ws.WebAllowed
+		survivalMode = ws.SurvivalMode
+	}
+
+	user := "USER_TEXT:\n" + userText +
+		"\n\nINTENT_MODE:" + IntentToMode(intent) +
+		"\nWEB_ALLOWED:" + boolTo01(webAllowed) +
+		"\nSURVIVAL_MODE:" + boolTo01(survivalMode) +
+		"\n\nEntscheide need_web. Wenn need_web=true, gib eine kurze Suchquery (Deutsch)."
 
 	out, e := oc.Chat(model, []ollama.Message{{Role: "system", Content: sys}, {Role: "user", Content: user}})
 	if e != nil {

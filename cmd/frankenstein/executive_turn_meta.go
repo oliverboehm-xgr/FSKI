@@ -16,10 +16,21 @@ type MutantOverlay struct {
 }
 
 func ExecuteTurnWithMeta(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, modelStance string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string, mut *MutantOverlay) (out string, action string, style string, ctxKey string, topic string, intentMode string) {
+	// NOTE: used for training trials too; must match real routing (hybrid intent + cortex gate).
 	nb := brain.NewNBIntent(db)
 	intent := brain.DetectIntentHybrid(userText, eg, nb)
 	intentMode = brain.IntentToMode(intent)
-	gateModel := eg.ModelFor("gate", modelSpeaker)
+	if ws != nil {
+		brain.ApplySurvivalGate(ws, ws.DrivesEnergyDeficit)
+		topic = ws.ActiveTopic
+		if topic == "" {
+			topic = ws.LastTopic
+		}
+		ctxKey = brain.MakePolicyContext(intentMode, ws.DrivesEnergyDeficit, ws.SocialCraving)
+	} else {
+		ctxKey = brain.MakePolicyContext(intentMode, 0, 0)
+	}
+	gateModel := eg.ModelFor("scout", eg.ModelFor("speaker", modelSpeaker))
 	rd := brain.DecideResearchCortex(db, oc, gateModel, userText, intent, ws, tr, dr, aff)
 	if ws != nil {
 		ws.LastSenseNeedWeb = rd.Do
@@ -28,11 +39,6 @@ func ExecuteTurnWithMeta(db *sql.DB, epiPath string, oc *ollama.Client, modelSpe
 		ws.LastSenseReason = rd.Reason
 		ws.LastSenseText = userText
 	}
-	topic = ws.ActiveTopic
-	if topic == "" {
-		topic = ws.LastTopic
-	}
-	ctxKey = brain.MakePolicyContext(intentMode, ws.DrivesEnergyDeficit, ws.SocialCraving)
 	choice := brain.ChoosePolicy(db, ctxKey)
 	action = choice.Action
 	style = choice.Style
@@ -69,8 +75,8 @@ func ExecuteTurnWithMeta(db *sql.DB, epiPath string, oc *ollama.Client, modelSpe
 		return "Kurze Rückfrage: Willst du Fakten/Status, eine Bewertung/Haltung, oder Optionen mit Trade-offs?", action, style, ctxKey, topic, intentMode
 	case "research_then_answer":
 		q := brain.NormalizeSearchQuery(userText)
-		if rd.Do && strings.TrimSpace(rd.Query) != "" {
-			q = rd.Query
+		if strings.TrimSpace(rd.Query) != "" {
+			q = strings.TrimSpace(rd.Query)
 		}
 		out2, err := answerWithEvidence(db, oc, speakerModel, body, aff, ws, tr, eg, q)
 		if err != nil {

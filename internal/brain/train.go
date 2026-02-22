@@ -84,18 +84,27 @@ func ApplyTrainChoice(db *sql.DB, trialID int64, choice string) {
 	}
 	choice = strings.ToUpper(strings.TrimSpace(choice))
 	if choice == "A" {
-		UpdatePolicy(db, ctxKey, aAct, 1.0)
-		UpdatePolicy(db, ctxKey, bAct, 0.0)
-		UpdatePreferenceEMA(db, "style:"+aSty, 1.0, 0.12)
-		UpdatePreferenceEMA(db, "style:"+bSty, -0.7, 0.12)
-		UpdatePreferenceEMA(db, "strat:"+aAct, 1.0, 0.12)
-		UpdatePreferenceEMA(db, "strat:"+bAct, -0.7, 0.12)
+		// If A/B are identical on an axis, do not update that axis (prevents double-counting noise).
+		if aAct != "" && bAct != "" && aAct != bAct {
+			UpdatePolicy(db, ctxKey, aAct, 1.0)
+			UpdatePolicy(db, ctxKey, bAct, 0.0)
+			UpdatePreferenceEMA(db, "strat:"+aAct, 1.0, 0.12)
+			UpdatePreferenceEMA(db, "strat:"+bAct, -0.7, 0.12)
+		}
+		if aSty != "" && bSty != "" && aSty != bSty {
+			UpdatePreferenceEMA(db, "style:"+aSty, 1.0, 0.12)
+			UpdatePreferenceEMA(db, "style:"+bSty, -0.7, 0.12)
+		}
 	} else if choice == "B" {
-		UpdatePolicy(db, ctxKey, bAct, 1.0)
-		UpdatePolicy(db, ctxKey, aAct, 0.0)
-		UpdatePreferenceEMA(db, "style:"+bSty, 1.0, 0.12)
-		UpdatePreferenceEMA(db, "style:"+aSty, -0.7, 0.12)
-		UpdatePreferenceEMA(db, "strat:"+bAct, 1.0, 0.12)
-		UpdatePreferenceEMA(db, "strat:"+aAct, -0.7, 0.12)
+		if aAct != "" && bAct != "" && aAct != bAct {
+			UpdatePolicy(db, ctxKey, bAct, 1.0)
+			UpdatePolicy(db, ctxKey, aAct, 0.0)
+			UpdatePreferenceEMA(db, "strat:"+bAct, 1.0, 0.12)
+			UpdatePreferenceEMA(db, "strat:"+aAct, -0.7, 0.12)
+		}
+		if aSty != "" && bSty != "" && aSty != bSty {
+			UpdatePreferenceEMA(db, "style:"+bSty, 1.0, 0.12)
+			UpdatePreferenceEMA(db, "style:"+aSty, -0.7, 0.12)
+		}
 	}
 }
