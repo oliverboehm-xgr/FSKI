@@ -88,12 +88,22 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		return "Hi 🙂 Willst du einfach reden oder soll ich ein Thema vorschlagen?", nil
 	}
 
+	// --- Survival gate (kernel truth) should be applied BEFORE routing/training ---
+	survival := 0.0
+	social := 0.0
+	if ws != nil {
+		survival = ws.DrivesEnergyDeficit
+		social = ws.SocialCraving
+		brain.ApplySurvivalGate(ws, survival)
+	}
+
 	// --- Intent detection (hybrid: epigenome rules + NB fallback) ---
 	nb := brain.NewNBIntent(db)
 	intent := brain.DetectIntentHybrid(userText, eg, nb)
+	intentMode := brain.IntentToMode(intent)
 
-	// --- Cortex sensor-gate (web sense) ---
-	gateModel := eg.ModelFor("gate", modelSpeaker)
+	// --- Cortex sensor-gate: decide if WebSense is required ---
+	gateModel := eg.ModelFor("scout", eg.ModelFor("speaker", modelSpeaker))
 	rd := brain.DecideResearchCortex(db, oc, gateModel, userText, intent, ws, tr, dr, aff)
 	if ws != nil {
 		ws.LastSenseNeedWeb = rd.Do
@@ -106,6 +116,7 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 	// --- A/B training mode (preference data for LoRA / behavior) ---
 	// Notes:
 	// - We skip EXTERNAL_FACT to avoid double websense runs.
+	// - We also skip if cortex says research is needed (avoid training on hallucinations).
 	// - If training is enabled but cannot be produced (missing model, Ollama down, etc.),
 	//   we return a clear diagnostic instead of silently falling back.
 	if trainEnabled(db) && intent != brain.IntentExternalFact && !rd.Do {
@@ -119,17 +130,6 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 			"2) Läuft Ollama? (Terminal: `ollama ps` oder `curl http://localhost:11434/api/tags`)\n" +
 			"3) Teste ohne LoRA: `/ab set b_model llama3.1:8b`", nil
 	}
-
-	intentMode := brain.IntentToMode(intent)
-
-	survival := 0.0
-	social := 0.0
-	if ws != nil {
-		survival = ws.DrivesEnergyDeficit
-		social = ws.SocialCraving
-	}
-
-	brain.ApplySurvivalGate(ws, survival)
 
 	topic := ""
 	if ws != nil && ws.ActiveTopic != "" {
@@ -184,8 +184,8 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 			return "Ich würde dafür normalerweise kurz recherchieren, aber ich bin gerade im Ressourcen-Schonmodus. Gib mir bitte einen konkreten Aspekt oder eine Quelle, dann antworte ich kompakt.", nil
 		}
 		q := strings.TrimSpace(brain.NormalizeSearchQuery(userText))
-		if rd.Do && strings.TrimSpace(rd.Query) != "" {
-			q = rd.Query
+		if strings.TrimSpace(rd.Query) != "" {
+			q = strings.TrimSpace(rd.Query)
 		}
 		if q == "" {
 			q = topic

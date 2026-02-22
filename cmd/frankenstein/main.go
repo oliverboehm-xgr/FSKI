@@ -1394,7 +1394,7 @@ func say(db *sql.DB, epiPath string, oc *ollama.Client, model string, stanceMode
 			if ws != nil && ws.LastSenseText == userText {
 				rd = brain.ResearchDecision{Do: ws.LastSenseNeedWeb, Score: ws.LastSenseScore, Query: ws.LastSenseQuery, Reason: ws.LastSenseReason}
 			} else {
-				gateModel := eg.ModelFor("gate", model)
+				gateModel := eg.ModelFor("scout", eg.ModelFor("speaker", model))
 				rd = brain.DecideResearchCortex(db, oc, gateModel, userText, intent, ws, tr, dr, aff)
 				if ws != nil {
 					ws.LastSenseNeedWeb = rd.Do
