@@ -163,6 +163,61 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"stopword_min_df":     8,    // token must be frequently observed before suppression
 			}},
 
+			// Generic semantic long-term memory (facts)
+			"semantic_memory": {Type: "semantic_memory", Enabled: true, Params: map[string]any{
+				"enabled":             true,
+				"max_writes_per_turn": 3,
+				"max_reads_per_turn":  2,
+				"write_rules": []any{
+					map[string]any{
+						"name":           "user_name_de_1",
+						"regex":          `(?i)\bich\s+hei(?:ß|ss)e\s+([A-Za-zÄÖÜäöüß\-]{2,32})\b`,
+						"subject":        "user",
+						"predicate":      "name",
+						"object":         "$1",
+						"confidence":     0.95,
+						"salience":       0.80,
+						"half_life_days": 3650,
+						"source":         "user",
+						"ack":            "Okay. Ich speichere das im Langzeitgedächtnis: Dein Name ist {{object}}.",
+					},
+					map[string]any{
+						"name":           "user_name_de_2",
+						"regex":          `(?i)\bmein\s+name\s+ist\s+([A-Za-zÄÖÜäöüß\-]{2,32})\b`,
+						"subject":        "user",
+						"predicate":      "name",
+						"object":         "$1",
+						"confidence":     0.95,
+						"salience":       0.80,
+						"half_life_days": 3650,
+						"source":         "user",
+						"ack":            "Okay. Ich speichere das im Langzeitgedächtnis: Dein Name ist {{object}}.",
+					},
+					map[string]any{
+						"name":           "remember_request_de",
+						"regex":          `(?i)\b(merk|speicher)\w*\s+dir\s+(.{3,80})$`,
+						"subject":        "user",
+						"predicate":      "remember_request",
+						"object":         "$2",
+						"confidence":     0.70,
+						"salience":       0.50,
+						"half_life_days": 365,
+						"source":         "user",
+						"ack":            "Okay. Ich speichere das im Langzeitgedächtnis: {{object}}.",
+					},
+				},
+				"read_rules": []any{
+					map[string]any{
+						"name":           "ask_user_name_de",
+						"regex":          `(?i)\b(kennst|wei(?:ß|ss)t)\s+du\s+meinen\s+namen\b|\bmeinen\s+namen\?\b|\bmeine[n]?\s+name[n]?\b`,
+						"subject":        "user",
+						"predicate":      "name",
+						"answer_found":   "Ja. Du heißt {{object}}.",
+						"answer_missing": "Noch nicht. Wie heißt du?",
+					},
+				},
+			}},
+
 			// Ollama backend manager (opt-in)
 			"ollama_manager": {Type: "ollama_manager", Enabled: true, Params: map[string]any{
 				"enabled":            true,
@@ -270,6 +325,13 @@ func (eg *Epigenome) ensureDefaults() (changed bool) {
 		"start_retry_ms":     250,
 		"pull_timeout_sec":   1800,
 		"max_models_to_pull": 3,
+	}})
+	add("semantic_memory", &ModuleSpec{Type: "semantic_memory", Enabled: true, Params: map[string]any{
+		"enabled":             true,
+		"max_writes_per_turn": 3,
+		"max_reads_per_turn":  2,
+		"write_rules":         []any{},
+		"read_rules":          []any{},
 	}})
 
 	def := func(k string, base, decay, coupling float64) {
@@ -730,6 +792,99 @@ type DrivesV1Params struct {
 	Enabled                       bool
 }
 
+type SemWriteRule struct {
+	Name         string
+	Regex        string
+	Subject      string
+	Predicate    string
+	Object       string
+	Confidence   float64
+	Salience     float64
+	HalfLifeDays float64
+	Source       string
+	Ack          string
+}
+
+type SemReadRule struct {
+	Name          string
+	Regex         string
+	Subject       string
+	Predicate     string
+	AnswerFound   string
+	AnswerMissing string
+}
+
+func (eg *Epigenome) SemanticMemoryRules() (enabled bool, maxWrites int, maxReads int, wr []SemWriteRule, rr []SemReadRule) {
+	m := eg.Modules["semantic_memory"]
+	if m == nil || !m.Enabled {
+		return false, 0, 0, nil, nil
+	}
+	if v, ok := m.Params["enabled"].(bool); ok {
+		enabled = v
+	} else {
+		enabled = true
+	}
+	maxWrites = int(asFloat(m.Params["max_writes_per_turn"], 3))
+	maxReads = int(asFloat(m.Params["max_reads_per_turn"], 2))
+	if maxWrites < 0 {
+		maxWrites = 0
+	}
+	if maxWrites > 20 {
+		maxWrites = 20
+	}
+	if maxReads < 0 {
+		maxReads = 0
+	}
+	if maxReads > 20 {
+		maxReads = 20
+	}
+
+	if arr, ok := m.Params["write_rules"].([]any); ok {
+		for _, it := range arr {
+			mm, _ := it.(map[string]any)
+			if mm == nil {
+				continue
+			}
+			r := SemWriteRule{
+				Name:         asString(mm["name"], ""),
+				Regex:        asString(mm["regex"], ""),
+				Subject:      asString(mm["subject"], ""),
+				Predicate:    asString(mm["predicate"], ""),
+				Object:       asString(mm["object"], ""),
+				Confidence:   asFloat(mm["confidence"], 0.7),
+				Salience:     asFloat(mm["salience"], 0.5),
+				HalfLifeDays: asFloat(mm["half_life_days"], 365),
+				Source:       asString(mm["source"], "user"),
+				Ack:          asString(mm["ack"], ""),
+			}
+			if r.Regex != "" && r.Subject != "" && r.Predicate != "" && r.Object != "" {
+				wr = append(wr, r)
+			}
+		}
+	}
+
+	if arr, ok := m.Params["read_rules"].([]any); ok {
+		for _, it := range arr {
+			mm, _ := it.(map[string]any)
+			if mm == nil {
+				continue
+			}
+			r := SemReadRule{
+				Name:          asString(mm["name"], ""),
+				Regex:         asString(mm["regex"], ""),
+				Subject:       asString(mm["subject"], ""),
+				Predicate:     asString(mm["predicate"], ""),
+				AnswerFound:   asString(mm["answer_found"], ""),
+				AnswerMissing: asString(mm["answer_missing"], ""),
+			}
+			if r.Regex != "" && r.Subject != "" && r.Predicate != "" {
+				rr = append(rr, r)
+			}
+		}
+	}
+	return
+}
+
 func (eg *Epigenome) DrivesV1() DrivesV1Params {
 	m := eg.Modules["drives_v1"]
 	if m == nil || !m.Enabled {
@@ -756,6 +911,13 @@ func (eg *Epigenome) DrivesV1() DrivesV1Params {
 	p.EmaCaught = asFloat(m.Params["ema_caught"], 0.20)
 	p.HelpMinIntervalSec = asFloat(m.Params["help_min_interval_seconds"], 180)
 	return p
+}
+
+func asString(v any, d string) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return d
 }
 
 func asFloat(v any, def float64) float64 {
