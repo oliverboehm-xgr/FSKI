@@ -102,16 +102,23 @@ func TickAutonomy(db *sql.DB, now time.Time, lastUserAt time.Time, lastAutoAt ti
 	}
 	talkDrive = ComputeTalkDrive(curiosity, idle, aff)
 
+	// Respect cooldown for ALL autonomous messages.
+	if !lastAutoAt.IsZero() && now.Sub(lastAutoAt).Seconds() < p.CooldownSeconds {
+		return "", talkDrive
+	}
+
 	// Boost talk drive if there are pending proposals.
 	schemaN, codeN := CountPendingProposals(db)
 	pending := schemaN + codeN
 	if pending > 0 {
+		pref := GetPreference01(db, "auto:proposal_pings", 0.5)
 		boost := 0.08 * float64(pending)
 		if boost > 0.35 {
 			boost = 0.35
 		}
+		boost *= pref
 		talkDrive = clamp01(talkDrive + boost)
-		if talkDrive >= p.MinTalkDrive {
+		if pref >= 0.30 && talkDrive >= p.MinTalkDrive {
 			return "Ich habe offene Vorschläge zur Selbstverbesserung (Schema: " + itoa(schemaN) + ", Code: " + itoa(codeN) + "). Soll ich sie kurz zusammenfassen? (Commands: /schema list | /schema show <id> | /schema apply <id> | /code list | /code show <id>)", talkDrive
 		}
 	}
@@ -120,20 +127,19 @@ func TickAutonomy(db *sql.DB, now time.Time, lastUserAt time.Time, lastAutoAt ti
 		var tp int
 		_ = db.QueryRow(`SELECT COUNT(*) FROM thought_proposals WHERE status='proposed'`).Scan(&tp)
 		if tp > 0 {
+			pref := GetPreference01(db, "auto:thought_pings", 0.5)
 			boost := 0.06 * float64(tp)
 			if boost > 0.25 {
 				boost = 0.25
 			}
+			boost *= pref
 			talkDrive = clamp01(talkDrive + boost)
-			if talkDrive >= p.MinTalkDrive {
+			if pref >= 0.30 && talkDrive >= p.MinTalkDrive {
 				return "Ich habe " + itoa(tp) + " offene Selbstverbesserungs-Ideen aus meiner Gedankenwelt (thought_proposals). Soll ich sie anzeigen oder materialisieren? (Commands: /thought list | /thought show <id> | /thought materialize <id|all>)", talkDrive
 			}
 		}
 	}
 
-	if !lastAutoAt.IsZero() && now.Sub(lastAutoAt).Seconds() < p.CooldownSeconds {
-		return "", talkDrive
-	}
 	if talkDrive < p.MinTalkDrive {
 		return "", talkDrive
 	}

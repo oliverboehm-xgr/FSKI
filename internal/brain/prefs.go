@@ -5,6 +5,32 @@ import (
 	"time"
 )
 
+// GetPreference returns a preference value in [-1..1].
+// If missing, returns def.
+func GetPreference(db *sql.DB, key string, def float64) float64 {
+	if db == nil || key == "" {
+		return def
+	}
+	var cur sql.NullFloat64
+	_ = db.QueryRow(`SELECT value FROM preferences WHERE key=?`, key).Scan(&cur)
+	if !cur.Valid {
+		return def
+	}
+	return clamp11(cur.Float64)
+}
+
+// GetPreference01 maps a preference in [-1..1] to [0..1].
+func GetPreference01(db *sql.DB, key string, def01 float64) float64 {
+	if def01 < 0 {
+		def01 = 0
+	}
+	if def01 > 1 {
+		def01 = 1
+	}
+	v := GetPreference(db, key, 2*def01-1)
+	return clamp01((v + 1) / 2)
+}
+
 func clamp11(x float64) float64 {
 	if x < -1 {
 		return -1

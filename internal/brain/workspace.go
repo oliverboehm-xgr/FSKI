@@ -40,6 +40,12 @@ type Workspace struct {
 	// Router bookkeeping for learning
 	LastRoutedIntent string
 
+	// UI plumbing: last persisted user message id (so training trials can link it)
+	LastUserMsgID int64
+
+	// Training: when true, candidate generation should avoid side-effects (no concept acquisition, no web, etc.)
+	TrainingDryRun bool
+
 	// Policy selection (bandit)
 	LastPolicyCtx    string
 	LastPolicyAction string
