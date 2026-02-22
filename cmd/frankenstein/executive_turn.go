@@ -88,15 +88,19 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		return "Hi 🙂 Willst du einfach reden oder soll ich ein Thema vorschlagen?", nil
 	}
 
-	// --- Intent detection ---
-	intent := brain.DetectIntentWithEpigenome(userText, eg)
+	// --- Intent detection (hybrid: epigenome rules + NB fallback) ---
+	nb := brain.NewNBIntent(db)
+	intent := brain.DetectIntentHybrid(userText, eg, nb)
+
+	// --- Research gate (truth kernel) ---
+	rd := brain.DecideResearch(db, userText, intent, ws, tr, dr, aff)
 
 	// --- A/B training mode (preference data for LoRA / behavior) ---
 	// Notes:
 	// - We skip EXTERNAL_FACT to avoid double websense runs.
 	// - If training is enabled but cannot be produced (missing model, Ollama down, etc.),
 	//   we return a clear diagnostic instead of silently falling back.
-	if trainEnabled(db) && intent != brain.IntentExternalFact {
+	if trainEnabled(db) && intent != brain.IntentExternalFact && !rd.Do {
 		msg, ok := runTrainTrial(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, userText)
 		if ok {
 			return msg, nil
@@ -135,6 +139,11 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		ws.LastPolicyStyle = choice.Style
 		ws.LastRoutedIntent = intentMode
 	}
+	// Truth-gate: if research is indicated, avoid direct_answer bluffing.
+	if rd.Do && ws != nil && ws.WebAllowed && choice.Action == "direct_answer" {
+		choice.Action = "research_then_answer"
+		ws.LastPolicyAction = choice.Action
+	}
 	brain.PlanFromAction(ws, topic, choice.Action)
 
 	if ws != nil && ws.SurvivalMode && choice.Action == "research_then_answer" {
@@ -167,6 +176,9 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 			return "Ich würde dafür normalerweise kurz recherchieren, aber ich bin gerade im Ressourcen-Schonmodus. Gib mir bitte einen konkreten Aspekt oder eine Quelle, dann antworte ich kompakt.", nil
 		}
 		q := strings.TrimSpace(brain.NormalizeSearchQuery(userText))
+		if rd.Do && strings.TrimSpace(rd.Query) != "" {
+			q = rd.Query
+		}
 		if q == "" {
 			q = topic
 		}
