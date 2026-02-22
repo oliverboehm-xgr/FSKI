@@ -247,12 +247,28 @@ func handleCodeCommands(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, userTe
 		if err != nil {
 			return true, "LLM draft failed: " + err.Error()
 		}
-		out = strings.TrimSpace(out)
+		out = sanitizeUnifiedDiff(strings.TrimSpace(out))
 		if !strings.Contains(out, "diff --git") {
 			return true, "LLM hat keinen unified diff geliefert. (Erwartet: diff --git ...)"
 		}
-		if bad := firstDisallowedPath(out); bad != "" {
-			return true, "Diff enthält disallowed path: " + bad
+		if msg, err := validateDraftUnifiedDiff(out); err != nil {
+			// One retry with error feedback
+			retrySys := "Du korrigierst einen fehlerhaften unified diff. Gib NUR einen korrigierten unified diff aus (git apply kompatibel). Keine Erklärungen."
+			retryUser := "GIT_APPLY_OR_PARSE_ERROR:\n" + msg + "\n\nBAD_DIFF:\n" + out + "\n\nREQUIREMENTS:\n- unified diff mit 'diff --git a/... b/... '\n- Jede Zeile in einem Hunk muss mit ' ', '+', '-' beginnen\n- Nur cmd/ oder internal/ ändern, keine go.mod/go.sum"
+			out2, err2 := oc.Chat(coder, []ollama.Message{{Role: "system", Content: retrySys}, {Role: "user", Content: retryUser}})
+			if err2 == nil {
+				out2 = sanitizeUnifiedDiff(strings.TrimSpace(out2))
+				if bad := firstDisallowedPath(out2); bad != "" {
+					return true, "Diff enthält disallowed path: " + bad
+				}
+				if msg2, err3 := validateDraftUnifiedDiff(out2); err3 == nil {
+					out = out2
+				} else {
+					return true, "LLM diff ungültig (git apply --check):\n" + msg2 + "\n\nTipp: In Hunks müssen alle Zeilen mit ' ', '+', '-' beginnen. Außerdem nur echte Dateien unter cmd/ oder internal/ ändern."
+				}
+			} else {
+				return true, "LLM diff ungültig (git apply --check):\n" + msg + "\n(LLM retry failed: " + err2.Error() + ")"
+			}
 		}
 		brain.UpdateCodeProposal(db, id, out, "proposed")
 		return true, "OK. Diff erzeugt und in code_proposal #" + strconv.FormatInt(id, 10) + " gespeichert.\nWeiter: /code apply " + strconv.FormatInt(id, 10)
@@ -357,6 +373,77 @@ func firstDisallowedPath(diff string) string {
 		return "go.mod/go.sum"
 	}
 	return ""
+}
+
+func sanitizeUnifiedDiff(s string) string {
+	s = strings.TrimSpace(s)
+	// Strip markdown fences if present
+	if strings.HasPrefix(s, "```") {
+		lines := strings.Split(s, "\n")
+		if len(lines) >= 2 {
+			// drop first fence line
+			lines = lines[1:]
+			// drop last fence line if it is a fence
+			if len(lines) > 0 && strings.HasPrefix(strings.TrimSpace(lines[len(lines)-1]), "```") {
+				lines = lines[:len(lines)-1]
+			}
+			s = strings.Join(lines, "\n")
+		}
+	}
+	// Drop leading noise before the first diff header
+	if i := strings.Index(s, "diff --git "); i > 0 {
+		s = s[i:]
+	}
+	return strings.TrimSpace(s)
+}
+
+func firstInvalidHunkLine(diff string) (lineNo int, line string) {
+	lines := strings.Split(diff, "\n")
+	inHunk := false
+	for i, ln := range lines {
+		if strings.HasPrefix(ln, "diff --git ") || strings.HasPrefix(ln, "--- ") || strings.HasPrefix(ln, "+++ ") || strings.HasPrefix(ln, "index ") {
+			inHunk = false
+			continue
+		}
+		if strings.HasPrefix(ln, "@@") {
+			inHunk = true
+			continue
+		}
+		if !inHunk || ln == "" {
+			continue
+		}
+		c := ln[0]
+		if c != ' ' && c != '+' && c != '-' && c != '\\' {
+			return i + 1, ln
+		}
+	}
+	return 0, ""
+}
+
+func validateDraftUnifiedDiff(diff string) (string, error) {
+	diff = strings.TrimSpace(diff)
+	if diff == "" {
+		return "empty diff", fmt.Errorf("empty diff")
+	}
+	if n, ln := firstInvalidHunkLine(diff); n > 0 {
+		return fmt.Sprintf("invalid hunk line prefix at line %d: %q", n, ln), fmt.Errorf("invalid hunk line prefix")
+	}
+	repo, err := gitRepoRoot()
+	if err != nil {
+		// If we can't locate the repo, we can't run git apply --check here.
+		return "skip git apply --check (repo root unknown): " + err.Error(), nil
+	}
+	tmp := filepath.Join(os.TempDir(), fmt.Sprintf("bunny_draft_%d.diff", time.Now().UnixNano()))
+	_ = os.WriteFile(tmp, []byte(diff), 0644)
+	defer os.Remove(tmp)
+	out, err := runCmdDir(repo, "git", "apply", "--check", tmp)
+	if err != nil {
+		if strings.TrimSpace(out) == "" {
+			out = err.Error()
+		}
+		return "git apply --check failed:\n" + strings.TrimSpace(out), err
+	}
+	return "git apply --check OK", nil
 }
 
 func applyPatchInRepo(id int64, title string, diff string) (string, error) {
