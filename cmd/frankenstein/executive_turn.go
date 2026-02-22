@@ -82,25 +82,27 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 	}
 
 	// --- A/B training mode (preference data for LoRA / behavior) ---
-// Notes:
-// - We intentionally avoid running A/B for EXTERNAL_FACT (would trigger web sense twice).
-// - We also avoid OPINION, because the stance engine uses stanceModel (so A/B wouldn't vary).
-// - If A/B is enabled but cannot be produced (missing model, Ollama down, etc.), we return a clear diagnostic
-//   instead of silently falling back to a normal reply.
-if abEnabled(db) {
-	intent := brain.DetectIntentWithEpigenome(userText, eg)
-	if intent != brain.IntentExternalFact && intent != brain.IntentOpinion {
-		msg, ok := runABTrial(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, userText)
-		if ok {
-			return msg, nil
+	// Notes:
+	// - We intentionally avoid running A/B for EXTERNAL_FACT (would trigger web sense twice).
+	// - We also avoid OPINION, because the stance engine uses stanceModel (so A/B wouldn't vary).
+	// - If A/B is enabled but cannot be produced (missing model, Ollama down, etc.), we return a clear diagnostic
+	//   instead of silently falling back to a normal reply.
+	if abEnabled(db) {
+		intent := brain.DetectIntentWithEpigenome(userText, eg)
+		if intent != brain.IntentExternalFact && intent != brain.IntentOpinion {
+			msg, ok := runABTrial(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, userText)
+			if ok {
+				return msg, nil
+			}
+			return "A/B Training ist AN, aber der Trial konnte nicht erzeugt werden.\n" +
+				"Prüfe:\n" +
+				"1) Existiert das B-Model wirklich? (Terminal: `ollama list`)\n" +
+				"2) Läuft Ollama? (Terminal: `ollama ps` oder `curl http://localhost:11434/api/tags`)\n" +
+				"3) Teste ohne LoRA: `/ab set b_model llama3.1:8b`", nil
 		}
-		return "A/B Training ist AN, aber der Trial konnte nicht erzeugt werden.\n" +
-			"Prüfe:\n" +
-			"1) Existiert das B-Model wirklich? (Terminal: `ollama list`)\n" +
-			"2) Läuft Ollama? (Terminal: `ollama ps` oder `curl http://localhost:11434/api/tags`)\n" +
-			"3) Teste ohne LoRA: `/ab set b_model llama3.1:8b`", nil
 	}
-}	intent := brain.DetectIntentWithEpigenome(userText, eg)
+
+	intent := brain.DetectIntentWithEpigenome(userText, eg)
 	intentMode := brain.IntentToMode(intent)
 
 	survival := 0.0
@@ -542,16 +544,16 @@ func runABTrial(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mod
 	// IMPORTANT: Do not silently fall back.
 	if errA != nil || errB != nil {
 		return "A/B Trial konnte nicht erzeugt werden (LLM Fehler).\n" +
-			"A (" + aModel + "): " + errString(errA) + "\n" +
-			"B (" + bModel + "): " + errString(errB) + "\n\n" +
-			"Tipp: Prüfe Modelnamen mit `ollama list`. Falls dein LoRA-Model fehlt, baue es per `ollama create <name> -f Modelfile`.",
+				"A (" + aModel + "): " + errString(errA) + "\n" +
+				"B (" + bModel + "): " + errString(errB) + "\n\n" +
+				"Tipp: Prüfe Modelnamen mit `ollama list`. Falls dein LoRA-Model fehlt, baue es per `ollama create <name> -f Modelfile`.",
 			true
 	}
 	if aOut == "" || bOut == "" {
 		return "A/B Trial konnte nicht erzeugt werden (leere Kandidaten).\n" +
-			"A (" + aModel + ") len=" + strconv.Itoa(len(aOut)) + "\n" +
-			"B (" + bModel + ") len=" + strconv.Itoa(len(bOut)) + "\n\n" +
-			"Tipp: Teste B-Model erst als normales Model: `/ab set b_model llama3.1:8b`.",
+				"A (" + aModel + ") len=" + strconv.Itoa(len(aOut)) + "\n" +
+				"B (" + bModel + ") len=" + strconv.Itoa(len(bOut)) + "\n\n" +
+				"Tipp: Teste B-Model erst als normales Model: `/ab set b_model llama3.1:8b`.",
 			true
 	}
 
@@ -562,8 +564,6 @@ func runABTrial(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mod
 	t, _ := brain.GetABTrial(db, id)
 	return brain.RenderABTrial(t), true
 }
-
-
 
 func errString(err error) string {
 	if err == nil {
