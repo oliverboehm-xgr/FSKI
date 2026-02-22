@@ -38,6 +38,7 @@ type SourceRecord struct {
 	Domain    string `json:"domain"`
 	Title     string `json:"title"`
 	Snippet   string `json:"snippet"`
+	Body      string `json:"body,omitempty"` // full text for LLM, omitted in DB/display
 	FetchedAt string `json:"fetched_at"`
 	Hash      string `json:"hash"`
 }
@@ -1108,6 +1109,53 @@ Antworte NUR als JSON:
 				s := renderStatus(&body, aff, ws, tr, eg)
 				mu.Unlock()
 				fmt.Println(s)
+			case "/model":
+				// /model           -> show current models
+				// /model test <m>  -> set all areas to model m (for testing)
+				// /model set <area> <m> -> set specific area
+				mu.Lock()
+				if len(args) == 0 {
+					fmt.Printf("speaker=%s critic=%s daydream=%s scout=%s hippocampus=%s stance=%s\n",
+						eg.ModelFor("speaker", model), eg.ModelFor("critic", model),
+						eg.ModelFor("daydream", model), eg.ModelFor("scout", model),
+						eg.ModelFor("hippocampus", model), eg.ModelFor("stance", model))
+				} else if args[0] == "test" && len(args) >= 2 {
+					testM := strings.Join(args[1:], " ")
+					for _, area := range []string{"speaker", "critic", "daydream", "scout", "hippocampus", "stance", "default"} {
+						eg.SetModel(area, testM)
+					}
+					modelSpeaker = testM
+					modelCritic = testM
+					modelDaydream = testM
+					modelScout = testM
+					modelHippo = testM
+					modelStance = testM
+					_ = eg.Save(epiPath)
+					fmt.Printf("All areas set to %s – testing mode active\n", testM)
+				} else if args[0] == "set" && len(args) >= 3 {
+					area := args[1]
+					testM := strings.Join(args[2:], " ")
+					eg.SetModel(area, testM)
+					switch area {
+					case "speaker", "default":
+						modelSpeaker = testM
+					case "critic":
+						modelCritic = testM
+					case "daydream":
+						modelDaydream = testM
+					case "scout":
+						modelScout = testM
+					case "hippocampus":
+						modelHippo = testM
+					case "stance":
+						modelStance = testM
+					}
+					_ = eg.Save(epiPath)
+					fmt.Printf("Area %s set to %s\n", area, testM)
+				} else {
+					fmt.Println("Usage: /model | /model test <modelname> | /model set <area> <modelname>")
+				}
+				mu.Unlock()
 			case "/mutate":
 				if len(args) == 0 {
 					fmt.Println("Use: /mutate add|enable|disable|set ...")
@@ -1544,6 +1592,7 @@ func answerWithEvidence(db *sql.DB, oc *ollama.Client, model string, body *BodyS
 			Domain:    fr.Domain,
 			Title:     pick(fr.Title, results[i].Title),
 			Snippet:   snip,
+			Body:      fr.Body, // full text for LLM
 			FetchedAt: fr.FetchedAt.Format(time.RFC3339),
 			Hash:      fr.Hash,
 		})
@@ -1574,11 +1623,15 @@ func answerWithEvidence(db *sql.DB, oc *ollama.Client, model string, body *BodyS
 		return "Ich bekomme gerade weder Fetch noch brauchbare Snippets. Das ist ein Sensorik-Problem (Netz/Parser).", nil
 	}
 
-	sys := `Du bist Bunny. Nutze deine Sinnesorgane.
-Regel: Externe Fakten nur aus SOURCES_JSON ableiten. Wenn SOURCES_JSON nicht reicht: eine Rückfrage oder offen sagen, was fehlt.`
-	selfJSON, _ := json.MarshalIndent(epi.BuildSelfModel(body, aff, ws, tr, eg), "", "  ")
+	sys := `Du bist Bunny. Du hast gerade das Web als Sinnesorgan genutzt.
+Die Quellen in SOURCES_JSON enthalten echte Inhalte (Body = Seitentext, Snippet = Kurzfassung).
+Regel: Beantworte die Frage direkt aus den Inhalten. Nenne konkrete Fakten, Namen, Zahlen aus den Quellen.
+Gib KEINE Liste von Webseiten zurück. Zeige, was du gelesen hast.
+Wenn der Inhalt nicht ausreicht: sag konkret was fehlt und biete an, tiefer zu suchen.
+Kein Selbstmodell-Geschwätz in der Antwort.`
+	// strip Body from sources before marshaling for DB/display (keep for LLM only via inline)
 	srcJSON, _ := json.MarshalIndent(sources, "", "  ")
-	user := "SelfModel:\n" + string(selfJSON) + "\n\nSOURCES_JSON:\n" + string(srcJSON) + "\n\nFrage:\n" + userText
+	user := "SOURCES_JSON:\n" + string(srcJSON) + "\n\nFrage:\n" + userText
 	out, err := oc.Chat(model, []ollama.Message{
 		{Role: "system", Content: sys},
 		{Role: "user", Content: user},

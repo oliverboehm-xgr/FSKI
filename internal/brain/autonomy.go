@@ -2,19 +2,22 @@ package brain
 
 import (
 	"database/sql"
+	"fmt"
 	"math"
+	"math/rand"
 	"strings"
 	"time"
 )
 
 type AutonomyParams struct {
-	IdleSeconds     float64
-	MinTalkDrive    float64
-	CooldownSeconds float64
-	TopicK          int
+	IdleSeconds         float64
+	MinTalkDrive        float64
+	CooldownSeconds     float64
+	TopicK              int
+	ProposalPingMinutes float64 // min gap between proposal-nag messages (default 30)
 }
 
-// TalkDrive: generic “Mitteilungsbedürfnis” (0..1).
+// TalkDrive: generic "Mitteilungsbedürfnis" (0..1).
 // No hardcoded greetings. Uses time-since-user + curiosity + negative affect inhibition.
 func ComputeTalkDrive(curiosity float64, idleSec float64, aff *AffectState) float64 {
 	tau := 120.0
@@ -37,7 +40,7 @@ func LoadAutonomyParams(eg interface {
 	ModuleEnabled(string) bool
 	ModuleParams(string) map[string]any
 }) AutonomyParams {
-	p := AutonomyParams{IdleSeconds: 45, MinTalkDrive: 0.55, CooldownSeconds: 60, TopicK: 5}
+	p := AutonomyParams{IdleSeconds: 45, MinTalkDrive: 0.55, CooldownSeconds: 60, TopicK: 5, ProposalPingMinutes: 30}
 	if eg == nil || !eg.ModuleEnabled("autonomy") {
 		return p
 	}
@@ -53,6 +56,9 @@ func LoadAutonomyParams(eg interface {
 	}
 	if v, ok := m["topic_k"].(float64); ok && int(v) > 0 {
 		p.TopicK = int(v)
+	}
+	if v, ok := m["proposal_ping_minutes"].(float64); ok && v > 0 {
+		p.ProposalPingMinutes = v
 	}
 	return p
 }
@@ -91,6 +97,26 @@ func LastUserMessageAt(db *sql.DB) time.Time {
 	return t
 }
 
+// pingThrottled checks if a named ping was sent within pingGap minutes.
+// If not, records it and returns true (allowed).
+func pingThrottled(db *sql.DB, key string, now time.Time, pingGap float64) bool {
+	if db == nil {
+		return true
+	}
+	var last string
+	_ = db.QueryRow(`SELECT value FROM kv_state WHERE key=?`, key).Scan(&last)
+	if last != "" {
+		if lp, err := time.Parse(time.RFC3339, last); err == nil {
+			if now.Sub(lp).Minutes() < pingGap {
+				return false
+			}
+		}
+	}
+	_, _ = db.Exec(`INSERT INTO kv_state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
+		key, now.Format(time.RFC3339), now.Format(time.RFC3339))
+	return true
+}
+
 // TickAutonomy returns a spontaneous message or "".
 func TickAutonomy(db *sql.DB, now time.Time, lastUserAt time.Time, lastAutoAt time.Time, curiosity float64, aff *AffectState, topics []string, p AutonomyParams) (msg string, talkDrive float64) {
 	idle := now.Sub(lastUserAt).Seconds()
@@ -102,40 +128,49 @@ func TickAutonomy(db *sql.DB, now time.Time, lastUserAt time.Time, lastAutoAt ti
 	}
 	talkDrive = ComputeTalkDrive(curiosity, idle, aff)
 
-	// Respect cooldown for ALL autonomous messages.
+	// Respect global cooldown for ALL autonomous messages.
 	if !lastAutoAt.IsZero() && now.Sub(lastAutoAt).Seconds() < p.CooldownSeconds {
 		return "", talkDrive
 	}
 
-	// Boost talk drive if there are pending proposals.
+	pingGap := p.ProposalPingMinutes
+	if pingGap <= 0 {
+		pingGap = 30
+	}
+
+	// --- Pending code/schema proposals ---
+	// Default pref is 0.15 (low) so it doesn't spam out of the box.
+	// User can raise via /rate or preference tuning.
 	schemaN, codeN := CountPendingProposals(db)
 	pending := schemaN + codeN
 	if pending > 0 {
-		pref := GetPreference01(db, "auto:proposal_pings", 0.5)
-		boost := 0.08 * float64(pending)
-		if boost > 0.35 {
-			boost = 0.35
-		}
-		boost *= pref
+		pref := GetPreference01(db, "auto:proposal_pings", 0.15)
+		boost := clamp01(0.05*float64(pending)) * pref
 		talkDrive = clamp01(talkDrive + boost)
-		if pref >= 0.30 && talkDrive >= p.MinTalkDrive {
-			return "Ich habe offene Vorschläge zur Selbstverbesserung (Schema: " + itoa(schemaN) + ", Code: " + itoa(codeN) + "). Soll ich sie kurz zusammenfassen? (Commands: /schema list | /schema show <id> | /schema apply <id> | /code list | /code show <id>)", talkDrive
+		if pref >= 0.10 && talkDrive >= p.MinTalkDrive && pingThrottled(db, "auto:last_proposal_ping", now, pingGap) {
+			msgs := []string{
+				fmt.Sprintf("Ich hab %d offene Selbst-Ideen liegen. Soll ich kurz sortieren? (/code list)", pending),
+				fmt.Sprintf("Es warten %d Code-Vorschläge – kein Druck, aber ich könnt's zusammenfassen.", pending),
+				fmt.Sprintf("%d Verbesserungsideen offen. Interessiert dich das? (/code list)", pending),
+			}
+			return msgs[rand.Intn(len(msgs))], talkDrive
 		}
 	}
 
+	// --- Thought proposals ---
 	if db != nil {
 		var tp int
 		_ = db.QueryRow(`SELECT COUNT(*) FROM thought_proposals WHERE status='proposed'`).Scan(&tp)
 		if tp > 0 {
-			pref := GetPreference01(db, "auto:thought_pings", 0.5)
-			boost := 0.06 * float64(tp)
-			if boost > 0.25 {
-				boost = 0.25
-			}
-			boost *= pref
+			pref := GetPreference01(db, "auto:thought_pings", 0.15)
+			boost := clamp01(0.04*float64(tp)) * pref
 			talkDrive = clamp01(talkDrive + boost)
-			if pref >= 0.30 && talkDrive >= p.MinTalkDrive {
-				return "Ich habe " + itoa(tp) + " offene Selbstverbesserungs-Ideen aus meiner Gedankenwelt (thought_proposals). Soll ich sie anzeigen oder materialisieren? (Commands: /thought list | /thought show <id> | /thought materialize <id|all>)", talkDrive
+			if pref >= 0.10 && talkDrive >= p.MinTalkDrive && pingThrottled(db, "auto:last_thought_ping", now, pingGap) {
+				msgs := []string{
+					fmt.Sprintf("Ich hab %d Gedankenvorschläge im Kopf. Soll ich die mal rauslassen? (/thought list)", tp),
+					fmt.Sprintf("Mein innerer Monolog hat %d Ideen angesammelt – interessiert? (/thought list)", tp),
+				}
+				return msgs[rand.Intn(len(msgs))], talkDrive
 			}
 		}
 	}
@@ -144,21 +179,31 @@ func TickAutonomy(db *sql.DB, now time.Time, lastUserAt time.Time, lastAutoAt ti
 		return "", talkDrive
 	}
 
+	// --- Interest-driven thought ---
 	if len(topics) > 0 {
 		t := topics[0]
 		if db != nil {
 			if c, ok := GetConcept(db, t); ok && strings.TrimSpace(c.Summary) != "" {
 				sum := strings.TrimSpace(c.Summary)
-				if len(sum) > 220 {
-					sum = sum[:220] + "..."
+				if len(sum) > 200 {
+					sum = sum[:200] + "..."
 				}
-				return "Kurzer Gedanke zu \"" + t + "\": " + sum + "\nSoll ich dazu weiter scouten (Web) oder willst du die Richtung vorgeben?", talkDrive
+				templates := []string{
+					"Ich denk gerade über \"%s\" nach: %s",
+					"Kurzer Gedanke zu \"%s\" – %s",
+					"\"%s\" beschäftigt mich: %s",
+				}
+				return fmt.Sprintf(templates[rand.Intn(len(templates))], t, sum), talkDrive
 			}
 		}
-		return "Ich hab gerade Mitteilungsdrang zu \"" + t + "\". Soll ich kurz scouten (Web) oder willst du ein anderes Thema setzen?", talkDrive
+		// No concept yet – low probability ask to avoid spam
+		if rand.Float64() < 0.30 {
+			return fmt.Sprintf("Ich bin neugierig auf \"%s\" – soll ich kurz nachsehen?", t), talkDrive
+		}
 	}
 
-	return "Ich hab gerade Lust auf ein kurzes Gespräch. Willst du ein Thema setzen – oder soll ich eins vorschlagen?", talkDrive
+	// Don't emit generic filler messages – silence is better than noise.
+	return "", talkDrive
 }
 
 func itoa(n int) string {
@@ -174,7 +219,7 @@ func itoa(n int) string {
 	i := len(b)
 	for n > 0 {
 		i--
-		b[i] = byte('0' + (n % 10))
+		b[i] = byte('0' + n%10)
 		n /= 10
 	}
 	if neg {

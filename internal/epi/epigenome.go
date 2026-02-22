@@ -357,10 +357,11 @@ func (eg *Epigenome) ensureDefaults() (changed bool) {
 	}
 	add("auto_speak", &ModuleSpec{Type: "auto_speak", Enabled: true, Params: map[string]any{"cooldown_seconds": 18}})
 	add("autonomy", &ModuleSpec{Type: "autonomy", Enabled: true, Params: map[string]any{
-		"idle_seconds":     45,
-		"min_talk_drive":   0.55,
-		"cooldown_seconds": 60,
-		"topic_k":          5,
+		"idle_seconds":          45,
+		"min_talk_drive":        0.55,
+		"cooldown_seconds":      60,
+		"topic_k":               5,
+		"proposal_ping_minutes": 30.0, // min gap between proposal-nag messages
 	}})
 	add("ollama_manager", &ModuleSpec{Type: "ollama_manager", Enabled: true, Params: map[string]any{
 		"enabled":            true,
@@ -1338,4 +1339,21 @@ func (eg *Epigenome) ModelFor(area string, fallback string) string {
 		return fallback
 	}
 	return "llama3.1:8b"
+}
+
+// SetModel updates the model for a specific area in the epigenome (in-memory only; call Save to persist).
+func (eg *Epigenome) SetModel(area string, modelName string) {
+	area = strings.ToLower(strings.TrimSpace(area))
+	if area == "" || modelName == "" {
+		return
+	}
+	m := eg.Modules["models"]
+	if m == nil {
+		eg.Modules["models"] = &ModuleSpec{Type: "models", Enabled: true, Params: map[string]any{area: modelName}}
+		return
+	}
+	if m.Params == nil {
+		m.Params = map[string]any{}
+	}
+	m.Params[area] = modelName
 }
