@@ -228,6 +228,12 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"pull_timeout_sec":   1800, // safety timeout for pull command
 				"max_models_to_pull": 3,    // avoid pulling too much automatically
 			}},
+			"proposal_drive": {Type: "proposal_drive", Enabled: true, Params: map[string]any{
+				"enabled":             true,
+				"boost_per_pending":   0.08,
+				"max_boost":           0.35,
+				"notify_interval_sec": 300,
+			}},
 			"cooldown": {
 				Type:    "cooldown",
 				Enabled: true,
@@ -332,6 +338,12 @@ func (eg *Epigenome) ensureDefaults() (changed bool) {
 		"max_reads_per_turn":  2,
 		"write_rules":         []any{},
 		"read_rules":          []any{},
+	}})
+	add("proposal_drive", &ModuleSpec{Type: "proposal_drive", Enabled: true, Params: map[string]any{
+		"enabled":             true,
+		"boost_per_pending":   0.08,
+		"max_boost":           0.35,
+		"notify_interval_sec": 300,
 	}})
 
 	def := func(k string, base, decay, coupling float64) {
@@ -559,6 +571,37 @@ func (eg *Epigenome) OllamaManagerParams() (enabled, autoStart, autoPull bool, s
 	}
 	if maxPull > 20 {
 		maxPull = 20
+	}
+	return
+}
+
+func (eg *Epigenome) ProposalDriveParams() (enabled bool, boostPer float64, maxBoost float64, notifyIntervalSec float64) {
+	m := eg.Modules["proposal_drive"]
+	if m == nil || !m.Enabled {
+		return false, 0, 0, 0
+	}
+	if v, ok := m.Params["enabled"].(bool); ok {
+		enabled = v
+	} else {
+		enabled = true
+	}
+	boostPer = asFloat(m.Params["boost_per_pending"], 0.08)
+	maxBoost = asFloat(m.Params["max_boost"], 0.35)
+	notifyIntervalSec = asFloat(m.Params["notify_interval_sec"], 300)
+	if boostPer < 0 {
+		boostPer = 0
+	}
+	if maxBoost < 0 {
+		maxBoost = 0
+	}
+	if maxBoost > 0.9 {
+		maxBoost = 0.9
+	}
+	if notifyIntervalSec < 30 {
+		notifyIntervalSec = 30
+	}
+	if notifyIntervalSec > 3600 {
+		notifyIntervalSec = 3600
 	}
 	return
 }

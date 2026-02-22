@@ -18,6 +18,7 @@ import (
 	"frankenstein-v0/internal/codeindex"
 	"frankenstein-v0/internal/epi"
 	"frankenstein-v0/internal/ollama"
+	"frankenstein-v0/internal/schema"
 	"frankenstein-v0/internal/sensors"
 	"frankenstein-v0/internal/state"
 	"frankenstein-v0/internal/ui"
@@ -674,7 +675,7 @@ Antworte NUR als JSON:
 		autonomy := brain.LoadAutonomyParams(eg)
 		lastUserAt := brain.LastUserMessageAt(db.DB)
 		topics, _ := brain.TopInterests(db.DB, autonomy.TopicK)
-		msg, talkDrive := brain.TickAutonomy(now, lastUserAt, lastAutoSpeak, dr.Curiosity, aff, topics, autonomy)
+		msg, talkDrive := brain.TickAutonomy(db.DB, now, lastUserAt, lastAutoSpeak, dr.Curiosity, aff, topics, autonomy)
 		if tr != nil {
 			tr.TalkBias = talkDrive
 		}
@@ -721,6 +722,164 @@ Antworte NUR als JSON:
 			}
 			cmd, args := splitCmd(line)
 			switch cmd {
+			case "/schema":
+				if len(args) < 1 {
+					fmt.Println("Use: /schema propose <title>|<sql> | /schema list [status] | /schema show <id> | /schema apply <id>")
+					continue
+				}
+				sub := args[0]
+				switch sub {
+				case "propose":
+					rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "/schema propose"))
+					seg := strings.SplitN(rest, "|", 2)
+					if len(seg) != 2 {
+						fmt.Println("Use: /schema propose <title>|<sql>")
+						continue
+					}
+					title := strings.TrimSpace(seg[0])
+					sqlText := strings.TrimSpace(seg[1])
+					if err := schema.ValidateSchemaSQL(sqlText); err != nil {
+						fmt.Println("Schema SQL rejected:", err)
+						continue
+					}
+					id, err := brain.InsertSchemaProposal(db.DB, title, sqlText, "")
+					if err != nil {
+						fmt.Println("ERR:", err)
+					} else {
+						fmt.Println("OK: schema proposal saved with id", id)
+					}
+					continue
+				case "list":
+					status := ""
+					if len(args) >= 2 {
+						status = strings.TrimSpace(args[1])
+					}
+					rows, err := brain.ListSchemaProposals(db.DB, status, 20)
+					if err != nil {
+						fmt.Println("ERR:", err)
+						continue
+					}
+					for _, r := range rows {
+						fmt.Printf("#%d [%s] %s (%s)\n", r.ID, r.Status, r.Title, r.CreatedAt)
+					}
+					continue
+				case "show":
+					if len(args) < 2 {
+						fmt.Println("Use: /schema show <id>")
+						continue
+					}
+					id, _ := strconv.ParseInt(args[1], 10, 64)
+					title, sqlText, status, ok := brain.GetSchemaProposal(db.DB, id)
+					if !ok {
+						fmt.Println("not found")
+						continue
+					}
+					fmt.Printf("Schema #%d [%s] %s\n%s\n", id, status, title, sqlText)
+					continue
+				case "apply":
+					if len(args) < 2 {
+						fmt.Println("Use: /schema apply <id>")
+						continue
+					}
+					id, _ := strconv.ParseInt(args[1], 10, 64)
+					_, sqlText, status, ok := brain.GetSchemaProposal(db.DB, id)
+					if !ok {
+						fmt.Println("not found")
+						continue
+					}
+					if status != "proposed" {
+						fmt.Println("not in proposed state")
+						continue
+					}
+					if err := schema.ValidateSchemaSQL(sqlText); err != nil {
+						fmt.Println("Schema SQL rejected:", err)
+						continue
+					}
+					applyErr := false
+					for _, st := range strings.Split(sqlText, ";") {
+						st = strings.TrimSpace(st)
+						if st == "" {
+							continue
+						}
+						if _, err := db.DB.Exec(st); err != nil {
+							fmt.Println("apply failed:", err)
+							applyErr = true
+							break
+						}
+					}
+					if applyErr {
+						continue
+					}
+					brain.MarkSchemaProposal(db.DB, id, "applied")
+					fmt.Println("OK: schema applied")
+					continue
+				default:
+					fmt.Println("Use: /schema propose|list|show|apply")
+					continue
+				}
+			case "/code":
+				if len(args) < 1 {
+					fmt.Println("Use: /code propose <title>|<diff> | /code list [status] | /code show <id>")
+					continue
+				}
+				sub := args[0]
+				switch sub {
+				case "propose":
+					rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "/code propose"))
+					seg := strings.SplitN(rest, "|", 2)
+					if len(seg) != 2 {
+						fmt.Println("Use: /code propose <title>|<diff>")
+						continue
+					}
+					id, err := brain.InsertCodeProposal(db.DB, strings.TrimSpace(seg[0]), strings.TrimSpace(seg[1]), "")
+					if err != nil {
+						fmt.Println("ERR:", err)
+					} else {
+						fmt.Println("OK: code proposal saved with id", id)
+					}
+					continue
+				case "list":
+					status := ""
+					if len(args) >= 2 {
+						status = strings.TrimSpace(args[1])
+					}
+					q := `SELECT id, created_at, title, status FROM code_proposals`
+					var qargs []any
+					if status != "" {
+						q += ` WHERE status=?`
+						qargs = append(qargs, status)
+					}
+					q += ` ORDER BY id DESC LIMIT 20`
+					rows, err := db.DB.Query(q, qargs...)
+					if err != nil {
+						fmt.Println("ERR:", err)
+						continue
+					}
+					for rows.Next() {
+						var id int64
+						var ca, t, st string
+						_ = rows.Scan(&id, &ca, &t, &st)
+						fmt.Printf("#%d [%s] %s (%s)\n", id, st, t, ca)
+					}
+					rows.Close()
+					continue
+				case "show":
+					if len(args) < 2 {
+						fmt.Println("Use: /code show <id>")
+						continue
+					}
+					id, _ := strconv.ParseInt(args[1], 10, 64)
+					title, diffText, status, ok := brain.GetCodeProposal(db.DB, id)
+					if !ok {
+						fmt.Println("not found")
+						continue
+					}
+					fmt.Printf("Code #%d [%s] %s\n%s\n", id, status, title, diffText)
+					continue
+				default:
+					fmt.Println("Use: /code propose|list|show")
+					continue
+				}
 			case "/think":
 				mu.Lock()
 				msgText, sources, err := oneThinkCycle(db.DB, oc, model, &body, aff, ws, tr, eg)
