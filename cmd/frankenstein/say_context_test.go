@@ -1,21 +1,29 @@
 package main
 
-import "testing"
+import (
+	"path/filepath"
+	"strings"
+	"testing"
 
-func TestExtractNumberedListItem(t *testing.T) {
-	text := `Hier sind Punkte:
-1. Eins
-2. Zwei
-**3.** Drei fett
-4. Vier normal`
+	"frankenstein-v0/internal/state"
+)
 
-	if got := ExtractNumberedListItem(text, 2); got != "Zwei" {
-		t.Fatalf("expected 'Zwei', got %q", got)
+func TestBuildReferenceCandidates_PicksRecentSemanticallyMatchingTurns(t *testing.T) {
+	db, err := state.Open(filepath.Join(t.TempDir(), "ctx.sqlite"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
 	}
-	if got := ExtractNumberedListItem(text, 3); got != "Drei fett" {
-		t.Fatalf("expected 'Drei fett', got %q", got)
-	}
-	if got := ExtractNumberedListItem(text, 5); got != "" {
-		t.Fatalf("expected empty for missing item, got %q", got)
+	t.Cleanup(func() { _ = db.Close() })
+
+	_, _ = db.Exec(`INSERT INTO messages(id,created_at,priority,text,sources_json) VALUES(100,'t',0.5,'1. Foo 2. Iran Schlagzeile 3. Bar','[]')`)
+	_, _ = db.Exec(`INSERT INTO message_meta(message_id,kind) VALUES(100,'reply')`)
+	_, _ = db.Exec(`INSERT INTO messages(id,created_at,priority,text,sources_json) VALUES(101,'t',0.5,'Lass uns über Iran weiterreden','[]')`)
+	_, _ = db.Exec(`INSERT INTO message_meta(message_id,kind) VALUES(101,'user')`)
+	_, _ = db.Exec(`INSERT INTO messages(id,created_at,priority,text,sources_json) VALUES(102,'t',0.5,'Börse und DAX heute','[]')`)
+	_, _ = db.Exec(`INSERT INTO message_meta(message_id,kind) VALUES(102,'reply')`)
+
+	out := BuildReferenceCandidates(db.DB, "lass uns über den iran punkt sprechen", 2)
+	if !strings.Contains(out, "Iran") {
+		t.Fatalf("expected Iran candidate in reference anchors, got: %q", out)
 	}
 }

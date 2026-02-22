@@ -1502,7 +1502,7 @@ HARTE REGELN
 	mentalImage := ""
 	innerSpeech := ""
 	policy := ""
-	followupAnchor := BuildFollowupAnchor(db, userText)
+	referenceCands := BuildReferenceCandidates(db, userText, 3)
 	if ws != nil {
 		mentalImage = ws.VisualScene
 		innerSpeech = ws.InnerSpeech
@@ -1525,7 +1525,7 @@ HARTE REGELN
 		"\n\nCONCEPTS:\n" + concepts +
 		"\n\nSTANCE:\n" + stance +
 		"\n\nRECENT_TURNS:\n" + turns +
-		"\n\n" + followupAnchor +
+		"\n\n" + referenceCands +
 		"\n\nSELFMODEL_LINES:\n" + selfLines +
 		"\n\nUSER:\n" + userText
 	out, err := oc.Chat(model, []ollama.Message{

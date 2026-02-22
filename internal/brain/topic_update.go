@@ -15,7 +15,7 @@ func UpdateActiveTopic(ws *Workspace, userText string) string {
 	if t == "" {
 		return ws.ActiveTopic
 	}
-	if isFollowupReference(t) {
+	if isLikelyContextFollowup(t) {
 		return ws.ActiveTopic
 	}
 
@@ -40,31 +40,28 @@ func UpdateActiveTopic(ws *Workspace, userText string) string {
 		return ws.ActiveTopic
 	}
 
-	// If message is long-ish and candidate differs, allow shift.
-	if len([]rune(t)) >= 28 && cand != ws.ActiveTopic {
+	// Only shift implicitly on clearly long turns to avoid drift on short follow-ups.
+	if len([]rune(t)) >= 48 && cand != ws.ActiveTopic {
 		ws.ActiveTopic = cand
 	}
 	return ws.ActiveTopic
 }
 
-func isFollowupReference(t string) bool {
+func isLikelyContextFollowup(t string) bool {
 	if t == "" {
 		return false
 	}
-	if !(strings.Contains(t, "nachricht") || strings.Contains(t, "punkt") || strings.Contains(t, "nummer") || strings.Contains(t, "nr.")) {
+	r := []rune(t)
+	if len(r) > 80 {
 		return false
 	}
-	hasDigit := false
-	for _, r := range t {
-		if r >= '0' && r <= '9' {
-			hasDigit = true
-			break
+	cues := []string{"dazu", "darüber", "darueber", "davon", "vorhin", "oben", "nochmal", "genannte", "letzte", "dies", "diese", "diesen", "dem", "den"}
+	for _, c := range cues {
+		if strings.Contains(t, c) {
+			return true
 		}
 	}
-	if !hasDigit {
-		return false
-	}
-	return strings.Contains(t, "lass uns") || strings.Contains(t, "sprechen") || strings.Contains(t, "weiter") || strings.Contains(t, "darüber") || strings.Contains(t, "darueber")
+	return false
 }
 
 func isMetaTopic(t string) bool {
