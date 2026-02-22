@@ -369,24 +369,23 @@ const indexHTML = `<!doctype html>
 
   function esc(s){ return (s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
 
-  function scrollTopNow(){
-    requestAnimationFrame(()=>{ chat.scrollTop = 0; });
+  function scrollBottomNow(){
+    requestAnimationFrame(()=>{ chat.scrollTop = chat.scrollHeight; });
   }
 
-  function addMsgTop(m){
+  function addMsgBottom(m){
     const el = renderMsg(m);
-    if (chat.firstChild) chat.insertBefore(el, chat.firstChild);
-    else chat.appendChild(el);
-    scrollTopNow();
+    chat.appendChild(el);
+    scrollBottomNow();
   }
 
   async function loadMessages(){
     const res = await fetch('/api/messages?limit=80');
     const msgs = await res.json();
     chat.innerHTML = '';
-    // API returns newest first (ORDER BY id DESC) -> render newest at the top.
-    msgs.forEach(m => chat.appendChild(renderMsg(m)));
-    scrollTopNow();
+    // API returns newest first (ORDER BY id DESC) -> render newest at the bottom.
+    msgs.reverse().forEach(m => chat.appendChild(renderMsg(m)));
+    scrollBottomNow();
   }
 
   function renderMsg(m){
@@ -468,7 +467,7 @@ const indexHTML = `<!doctype html>
     const es = new EventSource('/api/stream');
     es.addEventListener('message', (ev)=>{
       const m = JSON.parse(ev.data);
-      addMsgTop(m);
+      addMsgBottom(m);
     });
     es.addEventListener('status', (ev)=>{
       const st = JSON.parse(ev.data);
