@@ -148,12 +148,7 @@ func TickAutonomy(db *sql.DB, now time.Time, lastUserAt time.Time, lastAutoAt ti
 		boost := clamp01(0.05*float64(pending)) * pref
 		talkDrive = clamp01(talkDrive + boost)
 		if pref >= 0.10 && talkDrive >= p.MinTalkDrive && pingThrottled(db, "auto:last_proposal_ping", now, pingGap) {
-			msgs := []string{
-				fmt.Sprintf("Ich hab %d offene Selbst-Ideen liegen. Soll ich kurz sortieren? (/code list)", pending),
-				fmt.Sprintf("Es warten %d Code-Vorschläge – kein Druck, aber ich könnt's zusammenfassen.", pending),
-				fmt.Sprintf("%d Verbesserungsideen offen. Interessiert dich das? (/code list)", pending),
-			}
-			return msgs[rand.Intn(len(msgs))], talkDrive
+			return composeAutonomyNudge("code", pending), talkDrive
 		}
 	}
 
@@ -166,11 +161,7 @@ func TickAutonomy(db *sql.DB, now time.Time, lastUserAt time.Time, lastAutoAt ti
 			boost := clamp01(0.04*float64(tp)) * pref
 			talkDrive = clamp01(talkDrive + boost)
 			if pref >= 0.10 && talkDrive >= p.MinTalkDrive && pingThrottled(db, "auto:last_thought_ping", now, pingGap) {
-				msgs := []string{
-					fmt.Sprintf("Ich hab %d Gedankenvorschläge im Kopf. Soll ich die mal rauslassen? (/thought list)", tp),
-					fmt.Sprintf("Mein innerer Monolog hat %d Ideen angesammelt – interessiert? (/thought list)", tp),
-				}
-				return msgs[rand.Intn(len(msgs))], talkDrive
+				return composeAutonomyNudge("thought", tp), talkDrive
 			}
 		}
 	}
@@ -204,6 +195,36 @@ func TickAutonomy(db *sql.DB, now time.Time, lastUserAt time.Time, lastAutoAt ti
 
 	// Don't emit generic filler messages – silence is better than noise.
 	return "", talkDrive
+}
+
+func composeAutonomyNudge(kind string, n int) string {
+	openers := []string{"Kurzes Update:", "Status:", "Hinweis:"}
+	actions := map[string]string{
+		"code":    "/code list",
+		"thought": "/thought list",
+	}
+	labels := map[string][]string{
+		"code":    {"offene Code-Vorschläge", "laufende Verbesserungsentwürfe", "ausstehende Patch-Ideen"},
+		"thought": {"offene Gedankenvorschläge", "ungeprüfte Hypothesen", "innere Notizen"},
+	}
+	verbs := []string{"Soll ich priorisieren", "Soll ich kurz sortieren", "Möchtest du eine kurze Zusammenfassung"}
+
+	labelSet, ok := labels[kind]
+	if !ok || len(labelSet) == 0 {
+		labelSet = []string{"offene Punkte"}
+	}
+	cmd := actions[kind]
+	if strings.TrimSpace(cmd) == "" {
+		cmd = "/code list"
+	}
+
+	return fmt.Sprintf("%s %d %s. %s? (%s)",
+		openers[rand.Intn(len(openers))],
+		n,
+		labelSet[rand.Intn(len(labelSet))],
+		verbs[rand.Intn(len(verbs))],
+		cmd,
+	)
 }
 
 func itoa(n int) string {

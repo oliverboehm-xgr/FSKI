@@ -236,12 +236,13 @@ func handleCodeCommands(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, userTe
 		if spec == "" {
 			return true, "Kein Inhalt vorhanden (notes+diff leer)."
 		}
-		coder := eg.ModelFor("coder", eg.ModelFor("speaker", "llama3.1:8b"))
+		coder := selectCoderModel(oc, eg)
 		ctx := codeIndexContext(db, title, spec)
 		sys := "Du bist ein Go-Engineer. Gib NUR einen unified diff aus (git apply kompatibel). " +
 			"Keine Erklärungen. Minimaler Patch. Pfade relativ zum Repo-Root. " +
 			"Nur in cmd/ oder internal/ ändern. Kein go.mod/go.sum. " +
-			"Wenn möglich: Tests hinzufügen."
+			"Wenn möglich: Tests hinzufügen. " +
+			"WICHTIG: In jedem Hunk muss JEDE Zeile mit genau einem Prefix beginnen: ' ', '+', '-', oder '\\\\'."
 		user := "GOAL/TITLE:\n" + title + "\n\nSPEC/NOTES:\n" + spec + "\n\nCODE_INDEX_CONTEXT:\n" + ctx
 		out, err := oc.Chat(coder, []ollama.Message{{Role: "system", Content: sys}, {Role: "user", Content: user}})
 		if err != nil {
@@ -250,6 +251,18 @@ func handleCodeCommands(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, userTe
 
 		// 1) sanitize / strip fences
 		out = stripCodeFences(strings.TrimSpace(out))
+
+		if retryPrompt := draftDiffRetryPrompt(out); strings.TrimSpace(retryPrompt) != "" {
+			fixOut, fixErr := oc.Chat(coder, []ollama.Message{
+				{Role: "system", Content: sys},
+				{Role: "user", Content: user},
+				{Role: "assistant", Content: out},
+				{Role: "user", Content: retryPrompt},
+			})
+			if fixErr == nil {
+				out = stripCodeFences(strings.TrimSpace(fixOut))
+			}
+		}
 
 		// 2) basic validation
 		if !strings.Contains(out, "diff --git") {
@@ -373,6 +386,48 @@ func stripCodeFences(s string) string {
 		return strings.TrimSpace(rest)
 	}
 	return strings.TrimSpace(rest[:k])
+}
+
+func draftDiffRetryPrompt(diff string) string {
+	d := strings.TrimSpace(diff)
+	if d == "" {
+		return "Du hast keinen Diff geliefert. Bitte liefere JETZT nur einen vollständigen unified diff ab `diff --git ...` ohne Erklärungen."
+	}
+	if !strings.Contains(d, "diff --git") {
+		return "Das Format ist falsch. Bitte liefere NUR einen unified diff im Format `diff --git a/... b/...` ohne Zusatztext."
+	}
+	if err := validateUnifiedDiffSyntax(d); err != nil {
+		return "Dein Diff ist syntaktisch ungültig (" + err.Error() + "). Bitte gib den kompletten Diff erneut aus."
+	}
+	return ""
+}
+
+func selectCoderModel(oc *ollama.Client, eg *epi.Epigenome) string {
+	fallback := eg.ModelFor("coder", eg.ModelFor("speaker", "llama3.1:8b"))
+	if oc == nil {
+		return fallback
+	}
+	models, err := oc.ListModels()
+	if err != nil || len(models) == 0 {
+		return fallback
+	}
+	candidates := []string{
+		eg.ModelFor("coder", ""),
+		"qwen2.5-coder:7b",
+		"deepseek-coder:6.7b",
+		"starcoder2:7b",
+		fallback,
+	}
+	for _, m := range candidates {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			continue
+		}
+		if _, ok := models[m]; ok {
+			return m
+		}
+	}
+	return fallback
 }
 
 func validateUnifiedDiffSyntax(diff string) error {
