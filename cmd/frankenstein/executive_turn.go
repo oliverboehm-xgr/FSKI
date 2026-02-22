@@ -55,9 +55,9 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		return out, nil
 	}
 
-	// Topic should follow current user turn (no lock-in to previous topic).
+	// Topic update is conservative to avoid accidental drift on follow-up questions.
 	if ws != nil {
-		t := brain.ExtractTopic(userText)
+		t := brain.UpdateActiveTopic(ws, userText)
 		if t != "" {
 			ws.ActiveTopic = t
 			ws.LastTopic = t

@@ -15,6 +15,9 @@ func UpdateActiveTopic(ws *Workspace, userText string) string {
 	if t == "" {
 		return ws.ActiveTopic
 	}
+	if isLikelyContextFollowup(t) {
+		return ws.ActiveTopic
+	}
 
 	cand := ExtractTopic(userText)
 	if cand == "" || isMetaTopic(cand) {
@@ -37,11 +40,28 @@ func UpdateActiveTopic(ws *Workspace, userText string) string {
 		return ws.ActiveTopic
 	}
 
-	// If message is long-ish and candidate differs, allow shift.
-	if len([]rune(t)) >= 28 && cand != ws.ActiveTopic {
+	// Only shift implicitly on clearly long turns to avoid drift on short follow-ups.
+	if len([]rune(t)) >= 48 && cand != ws.ActiveTopic {
 		ws.ActiveTopic = cand
 	}
 	return ws.ActiveTopic
+}
+
+func isLikelyContextFollowup(t string) bool {
+	if t == "" {
+		return false
+	}
+	r := []rune(t)
+	if len(r) > 80 {
+		return false
+	}
+	cues := []string{"dazu", "darüber", "darueber", "davon", "vorhin", "oben", "nochmal", "genannte", "letzte", "dies", "diese", "diesen", "dem", "den"}
+	for _, c := range cues {
+		if strings.Contains(t, c) {
+			return true
+		}
+	}
+	return false
 }
 
 func isMetaTopic(t string) bool {

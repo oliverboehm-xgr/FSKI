@@ -62,7 +62,7 @@ func LoadOrInit(path string) (*Epigenome, error) {
 			"auto_speak":       {Type: "auto_speak", Enabled: true, Params: map[string]any{"cooldown_seconds": 18}},
 			"memory": {Type: "memory", Enabled: true, Params: map[string]any{
 				"consolidate_every_events": 16,
-				"context_turns":            10,
+				"context_turns":            16,
 				"detail_items":             6,
 				"detail_half_life_days":    14.0,
 				"episode_half_life_days":   120.0,
