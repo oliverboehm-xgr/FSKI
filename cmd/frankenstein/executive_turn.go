@@ -94,10 +94,10 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 	// --- A/B training mode (preference data for LoRA / behavior) ---
 	// Notes:
 	// - We skip EXTERNAL_FACT to avoid double websense runs.
-	// - If A/B is enabled but cannot be produced (missing model, Ollama down, etc.),
+	// - If training is enabled but cannot be produced (missing model, Ollama down, etc.),
 	//   we return a clear diagnostic instead of silently falling back.
 	if trainEnabled(db) && intent != brain.IntentExternalFact {
-		msg, ok := runABTrial(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, userText)
+		msg, ok := runTrainTrial(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, userText)
 		if ok {
 			return msg, nil
 		}
@@ -458,7 +458,7 @@ func handleABCommands(db *sql.DB, eg *epi.Epigenome, userText string) (bool, str
 		return true, renderABStatus(db, eg)
 	case "set":
 		if len(parts) < 4 {
-			return true, "Use: /ab set a_model|b_model|a_style|b_style <value>"
+			return true, "Use: /ab set b_model|b_style|mutant_strength|pool <value>"
 		}
 		k := strings.ToLower(strings.TrimSpace(parts[2]))
 		v := strings.TrimSpace(strings.TrimPrefix(line, parts[0]+" "+parts[1]+" "+parts[2]))
@@ -466,13 +466,26 @@ func handleABCommands(db *sql.DB, eg *epi.Epigenome, userText string) (bool, str
 		if v == "" {
 			return true, "Value leer."
 		}
-		allowed := map[string]string{"a_model": "ab_model_a", "b_model": "ab_model_b", "a_style": "ab_style_a", "b_style": "ab_style_b"}
-		key, ok := allowed[k]
-		if !ok {
-			return true, "Use: /ab set a_model|b_model|a_style|b_style <value>"
+		switch k {
+		case "b_model":
+			// Optional override. If empty, Bunny auto-picks a mutant model or uses the same model.
+			kvSet(db, "train_mutant_model", v)
+			kvSet(db, "ab_model_b", v) // legacy
+			return true, "OK. b_model gesetzt.\n" + renderABStatus(db, eg)
+		case "b_style":
+			// Persistent mutant overlay (phenotype)
+			kvSet(db, "train_mutant_prompt", v)
+			kvSet(db, "ab_style_b", v)
+			return true, "OK. b_style gesetzt.\n" + renderABStatus(db, eg)
+		case "mutant_strength":
+			kvSet(db, "train_mutant_strength", v)
+			return true, "OK. mutant_strength gesetzt.\n" + renderABStatus(db, eg)
+		case "pool":
+			kvSet(db, "train_model_pool", v)
+			return true, "OK. pool gesetzt.\n" + renderABStatus(db, eg)
+		default:
+			return true, "Use: /ab set b_model|b_style|mutant_strength|pool <value>"
 		}
-		kvSet(db, key, v)
-		return true, "OK. " + k + " gesetzt.\n" + renderABStatus(db, eg)
 	default:
 		return true, "Use: /ab on|off|status|set ..."
 	}
@@ -485,26 +498,44 @@ func handlePickCommand(db *sql.DB, userText string) (bool, string) {
 	}
 	parts := strings.Fields(line)
 	if len(parts) < 3 {
-		return true, "Use: /pick <ab_id> a|b|none"
+		return true, "Use: /pick <id> A|B|none"
 	}
 	id := parseID(parts[1])
 	choiceRaw := strings.TrimSpace(parts[2])
-	choiceUpper := strings.ToUpper(choiceRaw)
-	if choiceUpper == "A" || choiceUpper == "B" || strings.EqualFold(choiceRaw, "none") {
+	choice := strings.ToUpper(choiceRaw)
+	if choice == "A" || choice == "B" || strings.EqualFold(choice, "none") {
+		if strings.EqualFold(choice, "none") {
+			choice = "NONE"
+		}
+		// Prefer train_trials (online learning)
 		if tt, ok := brain.GetTrainTrialFull(db, id); ok {
-			if strings.EqualFold(choiceRaw, "none") {
+			if tt.Chosen != "" {
+				switch strings.ToUpper(tt.Chosen) {
+				case "A":
+					return true, tt.AText
+				case "B":
+					return true, tt.BText
+				default:
+					return true, "OK. (none)"
+				}
+			}
+			if choice == "NONE" {
 				_ = brain.ChooseTrainTrial(db, id, "NONE")
 				kvSet(db, "speech_overlay", "")
 				kvSet(db, "speaker_model_override", "")
 				return true, "OK. (none)"
 			}
-			_ = brain.ChooseTrainTrial(db, id, choiceUpper)
-			brain.ApplyTrainChoice(db, id, choiceUpper)
-			if choiceUpper == "B" {
+			_ = brain.ChooseTrainTrial(db, id, choice)
+			brain.ApplyTrainChoice(db, id, choice)
+
+			// Apply phenotype immediately based on stored note.
+			if choice == "B" {
+				// Note JSON is optional; fall back to B style text.
 				overlay := strings.TrimSpace(tt.BStyle)
-				model := ""
+				m := ""
 				if strings.TrimSpace(tt.Note) != "" {
 					var meta struct {
+						AModel  string `json:"a_model"`
 						BModel  string `json:"b_model"`
 						BPrompt string `json:"b_prompt"`
 					}
@@ -512,29 +543,31 @@ func handlePickCommand(db *sql.DB, userText string) (bool, string) {
 						if strings.TrimSpace(meta.BPrompt) != "" {
 							overlay = strings.TrimSpace(meta.BPrompt)
 						}
-						model = strings.TrimSpace(meta.BModel)
+						m = strings.TrimSpace(meta.BModel)
 					}
 				}
 				if overlay != "" {
 					kvSet(db, "speech_overlay", overlay)
 				}
-				if model != "" {
-					kvSet(db, "speaker_model_override", model)
+				if m != "" {
+					kvSet(db, "speaker_model_override", m)
 				}
 				return true, tt.BText
 			}
+			// choice A
 			kvSet(db, "speech_overlay", "")
 			kvSet(db, "speaker_model_override", "")
 			return true, tt.AText
 		}
 	}
-	choice := strings.ToLower(choiceRaw)
+
+	// Legacy fallback: AB trials
+	choice2 := strings.ToLower(strings.TrimSpace(choiceRaw))
 	t, ok := brain.GetABTrial(db, id)
 	if !ok {
-		return true, "AB# nicht gefunden."
+		return true, "ID nicht gefunden."
 	}
 	if t.Status == "chosen" {
-		// already chosen → return the chosen answer
 		switch t.Choice {
 		case "a":
 			return true, t.AText
@@ -544,10 +577,10 @@ func handlePickCommand(db *sql.DB, userText string) (bool, string) {
 			return true, "OK. (none)"
 		}
 	}
-	if err := brain.ChooseABTrial(db, id, choice); err != nil {
+	if err := brain.ChooseABTrial(db, id, choice2); err != nil {
 		return true, "ERR: " + err.Error()
 	}
-	switch choice {
+	switch choice2 {
 	case "a":
 		return true, t.AText
 	case "b":
@@ -569,26 +602,46 @@ func trainEnabled(db *sql.DB) bool {
 }
 
 func renderABStatus(db *sql.DB, eg *epi.Epigenome) string {
-	aModel := strings.TrimSpace(kvGet(db, "ab_model_a"))
-	bModel := strings.TrimSpace(kvGet(db, "ab_model_b"))
-	aStyle := strings.TrimSpace(kvGet(db, "ab_style_a"))
-	bStyle := strings.TrimSpace(kvGet(db, "ab_style_b"))
-	if aModel == "" {
-		aModel = eg.ModelFor("speaker", "llama3.1:8b")
+	champ := strings.TrimSpace(kvGet(db, "speaker_model_override"))
+	if champ == "" {
+		champ = eg.ModelFor("speaker", "llama3.1:8b")
 	}
-	if bStyle == "" {
-		bStyle = "empathisch-direkt"
+	mutModel := strings.TrimSpace(kvGet(db, "train_mutant_model"))
+	mutPrompt := strings.TrimSpace(kvGet(db, "train_mutant_prompt"))
+	if mutPrompt == "" {
+		mutPrompt = "STYLE: empathisch-direkt. Kurz, warm, direkt. Keine unnötigen Rückfragen. 2–5 Sätze."
 	}
+	mutStr := strings.TrimSpace(kvGet(db, "train_mutant_strength"))
+	if mutStr == "" {
+		mutStr = "0.20"
+	}
+	pool := strings.TrimSpace(kvGet(db, "train_model_pool"))
+
 	en := "OFF"
 	if trainEnabled(db) {
 		en = "ON"
 	}
 	return "A/B Training: " + en + "\n" +
-		"A model: " + aModel + "\n" +
-		"B model: " + pickNonEmpty(bModel, "<unset>") + "\n" +
-		"A style: " + pickNonEmpty(aStyle, "default") + "\n" +
-		"B style: " + bStyle + "\n\n" +
-		"Setze B-Model z.B.: /ab set b_model bunny-speaker-lora-v1"
+		"Champion model: " + champ + "\n" +
+		"Mutant model: " + pickNonEmpty(mutModel, "<auto>") + "\n" +
+		"Mutant strength: " + mutStr + "\n" +
+		"Mutant prompt: " + firstLine(mutPrompt) + "\n" +
+		"Model pool: " + pickNonEmpty(pool, "<auto>") + "\n\n" +
+		"Tipps: /ab set b_style <prompt> | /ab set b_model <model> | /ab set pool <csv> | /ab off"
+}
+
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 90 {
+		s = s[:90] + "..."
+	}
+	return s
 }
 
 func pickNonEmpty(v, fb string) string {
@@ -616,19 +669,31 @@ func kvSet(db *sql.DB, key, val string) {
 		strings.TrimSpace(key), strings.TrimSpace(val), time.Now().Format(time.RFC3339))
 }
 
-func runABTrial(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, modelStance string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string) (string, bool) {
-	bModel := strings.TrimSpace(kvGet(db, "ab_model_b"))
-	if bModel == "" {
-		return "A/B Training ist AN, aber B-Model ist nicht gesetzt.\nNutze: /ab set b_model <modelName>", true
-	}
-	aModel := strings.TrimSpace(kvGet(db, "ab_model_a"))
+func runTrainTrial(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, modelStance string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string) (string, bool) {
+	// Champion model: current override or configured speaker.
+	aModel := strings.TrimSpace(kvGet(db, "speaker_model_override"))
 	if aModel == "" {
 		aModel = eg.ModelFor("speaker", modelSpeaker)
 	}
-	aStyle := strings.TrimSpace(kvGet(db, "ab_style_a"))
-	bStyle := strings.TrimSpace(kvGet(db, "ab_style_b"))
-	if bStyle == "" {
-		bStyle = "STYLE: empathisch-direkt. Kurz, warm, direkt. Keine unnötigen Rückfragen. 2–5 Sätze."
+
+	// Mutant model: optional override; otherwise auto-pick or fall back to champion.
+	bModel := strings.TrimSpace(kvGet(db, "train_mutant_model"))
+	if bModel == "" {
+		bModel = autoPickMutantModel(oc, strings.TrimSpace(kvGet(db, "train_model_pool")), aModel)
+	}
+	if bModel == "" {
+		bModel = aModel
+	}
+
+	mutPrompt := strings.TrimSpace(kvGet(db, "train_mutant_prompt"))
+	if mutPrompt == "" {
+		mutPrompt = "STYLE: empathisch-direkt. Kurz, warm, direkt. Keine unnötigen Rückfragen. 2–5 Sätze."
+	}
+	mutStrength := 0.20
+	if v := strings.TrimSpace(kvGet(db, "train_mutant_strength")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			mutStrength = f
+		}
 	}
 
 	// Clone state to avoid double side-effects.
@@ -640,34 +705,79 @@ func runABTrial(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mod
 	affB := cloneAffect(aff)
 	drA := *dr
 	drB := *dr
+	if wsA != nil {
+		wsA.TrainingDryRun = true
+	}
+	if wsB != nil {
+		wsB.TrainingDryRun = true
+	}
 
-	aOut, errA := sayWithMutation(db, epiPath, oc, aModel, modelStance, &bodyA, affA, wsA, tr, &drA, eg, userText, aStyle)
-	bOut, errB := sayWithMutation(db, epiPath, oc, bModel, modelStance, &bodyB, affB, wsB, tr, &drB, eg, userText, bStyle)
+	aOut, aAct, aSty, ctxKey, topic, intentMode := ExecuteTurnWithMeta(db, epiPath, oc, aModel, modelStance, &bodyA, affA, wsA, tr, &drA, eg, userText, nil)
+	mut := &MutantOverlay{Strength: mutStrength, Prompt: mutPrompt, Model: bModel}
+	bOut, bAct, bSty, _, _, _ := ExecuteTurnWithMeta(db, epiPath, oc, aModel, modelStance, &bodyB, affB, wsB, tr, &drB, eg, userText, mut)
 	aOut = strings.TrimSpace(aOut)
 	bOut = strings.TrimSpace(bOut)
-
-	// IMPORTANT: Do not silently fall back.
-	if errA != nil || errB != nil {
-		return "A/B Trial konnte nicht erzeugt werden (LLM Fehler).\n" +
-				"A (" + aModel + "): " + errString(errA) + "\n" +
-				"B (" + bModel + "): " + errString(errB) + "\n\n" +
-				"Tipp: Prüfe Modelnamen mit `ollama list`. Falls dein LoRA-Model fehlt, baue es per `ollama create <name> -f Modelfile`.",
-			true
-	}
 	if aOut == "" || bOut == "" {
-		return "A/B Trial konnte nicht erzeugt werden (leere Kandidaten).\n" +
-				"A (" + aModel + ") len=" + strconv.Itoa(len(aOut)) + "\n" +
-				"B (" + bModel + ") len=" + strconv.Itoa(len(bOut)) + "\n\n" +
-				"Tipp: Teste B-Model erst als normales Model: `/ab set b_model llama3.1:8b`.",
-			true
+		return "Train-Trial konnte nicht erzeugt werden (leere Kandidaten).", false
 	}
 
-	id, err := brain.InsertABTrial(db, userText, aModel, aOut, bModel, bOut)
+	userMsgID := int64(0)
+	if ws != nil {
+		userMsgID = ws.LastUserMsgID
+	}
+	id, err := brain.InsertTrainTrial(db, userMsgID, topic, intentMode, ctxKey, aAct, aSty, aOut, bAct, bSty, bOut)
 	if err != nil {
 		return "ERR: " + err.Error(), true
 	}
-	t, _ := brain.GetABTrial(db, id)
-	return brain.RenderABTrial(t), true
+	meta := map[string]any{"a_model": aModel, "b_model": bModel, "b_prompt": mutPrompt, "mut_strength": mutStrength}
+	metaJSON, _ := json.Marshal(meta)
+	_ = brain.UpdateTrainTrialNote(db, id, string(metaJSON))
+
+	var b strings.Builder
+	b.WriteString("TRAIN#" + strconv.FormatInt(id, 10) + "\n")
+	b.WriteString("A (" + aModel + ", action=" + aAct + ", style=" + aSty + "):\n" + aOut + "\n\n")
+	b.WriteString("B (" + bModel + ", action=" + bAct + ", style=" + bSty + "):\n" + bOut + "\n\n")
+	b.WriteString("Wähle: /pick " + strconv.FormatInt(id, 10) + " A|B|none")
+	return strings.TrimSpace(b.String()), true
+}
+
+func autoPickMutantModel(oc *ollama.Client, poolCSV string, fallback string) string {
+	poolCSV = strings.TrimSpace(poolCSV)
+	if poolCSV != "" {
+		parts := strings.Split(poolCSV, ",")
+		for _, p := range parts {
+			m := strings.TrimSpace(p)
+			if m != "" && m != fallback {
+				return m
+			}
+		}
+	}
+	if oc == nil {
+		return ""
+	}
+	models, err := oc.ListModels()
+	if err != nil || len(models) == 0 {
+		return ""
+	}
+	// Prefer bunny-* or *lora* or *adapter*.
+	cands := []string{}
+	for m := range models {
+		lm := strings.ToLower(strings.TrimSpace(m))
+		if lm == "" || lm == strings.ToLower(fallback) {
+			continue
+		}
+		if strings.HasPrefix(lm, "bunny-") || strings.Contains(lm, "lora") || strings.Contains(lm, "adapter") {
+			cands = append(cands, m)
+		}
+	}
+	if len(cands) > 0 {
+		idx := int(time.Now().UnixNano() % int64(len(cands)))
+		if idx < 0 {
+			idx = -idx
+		}
+		return cands[idx]
+	}
+	return ""
 }
 func parseID(raw string) int64 {
 	raw = strings.TrimSpace(raw)
