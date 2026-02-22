@@ -15,6 +15,9 @@ func UpdateActiveTopic(ws *Workspace, userText string) string {
 	if t == "" {
 		return ws.ActiveTopic
 	}
+	if isFollowupReference(t) {
+		return ws.ActiveTopic
+	}
 
 	cand := ExtractTopic(userText)
 	if cand == "" || isMetaTopic(cand) {
@@ -42,6 +45,26 @@ func UpdateActiveTopic(ws *Workspace, userText string) string {
 		ws.ActiveTopic = cand
 	}
 	return ws.ActiveTopic
+}
+
+func isFollowupReference(t string) bool {
+	if t == "" {
+		return false
+	}
+	if !(strings.Contains(t, "nachricht") || strings.Contains(t, "punkt") || strings.Contains(t, "nummer") || strings.Contains(t, "nr.")) {
+		return false
+	}
+	hasDigit := false
+	for _, r := range t {
+		if r >= '0' && r <= '9' {
+			hasDigit = true
+			break
+		}
+	}
+	if !hasDigit {
+		return false
+	}
+	return strings.Contains(t, "lass uns") || strings.Contains(t, "sprechen") || strings.Contains(t, "weiter") || strings.Contains(t, "darüber") || strings.Contains(t, "darueber")
 }
 
 func isMetaTopic(t string) bool {

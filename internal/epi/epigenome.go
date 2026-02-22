@@ -205,18 +205,6 @@ func LoadOrInit(path string) (*Epigenome, error) {
 						"source":         "user",
 						"ack":            "Okay. Ich speichere das im Langzeitgedächtnis: {{object}}.",
 					},
-					map[string]any{
-						"name":           "user_identity_claim_de",
-						"regex":          `(?i)\b([A-Za-zÄÖÜäöüß0-9 .\-]{3,80}?)\s+das\s+bin\s+(?:(?:(?:ü|ue)brigens)\s+)?ich\b`,
-						"subject":        "user",
-						"predicate":      "self_identity",
-						"object":         "$1",
-						"confidence":     0.97,
-						"salience":       0.90,
-						"half_life_days": 3650,
-						"source":         "user",
-						"ack":            "Verstanden. Ich habe gespeichert: Du bist {{object}}.",
-					},
 				},
 				"read_rules": []any{
 					map[string]any{
@@ -226,14 +214,6 @@ func LoadOrInit(path string) (*Epigenome, error) {
 						"predicate":      "name",
 						"answer_found":   "Ja. Du heißt {{object}}.",
 						"answer_missing": "Noch nicht. Wie heißt du?",
-					},
-					map[string]any{
-						"name":           "ask_user_identity_de",
-						"regex":          `(?i)\bwer\s+bin\s+ich\b|\bwei(?:ß|ss)t\s+du\s+wer\s+ich\s+bin\b|\bwer\s+ich\s+bin\b`,
-						"subject":        "user",
-						"predicate":      "self_identity",
-						"answer_found":   "Ja. Du bist {{object}}.",
-						"answer_missing": "Noch nicht sicher. Sag mir in einem Satz, wer du bist, dann speichere ich es.",
 					},
 				},
 			}},
@@ -399,9 +379,6 @@ func (eg *Epigenome) ensureDefaults() (changed bool) {
 		"write_rules":         []any{},
 		"read_rules":          []any{},
 	}})
-	if ensureSemanticMemoryIdentityRules(eg) {
-		changed = true
-	}
 	add("proposal_drive", &ModuleSpec{Type: "proposal_drive", Enabled: true, Params: map[string]any{
 		"enabled":             true,
 		"boost_per_pending":   0.08,
@@ -459,78 +436,6 @@ func (eg *Epigenome) ensureDefaults() (changed bool) {
 	def("shame", 0.00, 0.03, 0.0)
 	def("fear", 0.00, 0.03, 0.0)
 	return changed
-}
-
-func ensureSemanticMemoryIdentityRules(eg *Epigenome) bool {
-	if eg == nil || eg.Modules == nil {
-		return false
-	}
-	m := eg.Modules["semantic_memory"]
-	if m == nil {
-		return false
-	}
-	if m.Params == nil {
-		m.Params = map[string]any{}
-	}
-	changed := false
-
-	writeRule := map[string]any{
-		"name":           "user_identity_claim_de",
-		"regex":          `(?i)\b([A-Za-zÄÖÜäöüß0-9 .\-]{3,80}?)\s+das\s+bin\s+(?:(?:(?:ü|ue)brigens)\s+)?ich\b`,
-		"subject":        "user",
-		"predicate":      "self_identity",
-		"object":         "$1",
-		"confidence":     0.97,
-		"salience":       0.90,
-		"half_life_days": 3650,
-		"source":         "user",
-		"ack":            "Verstanden. Ich habe gespeichert: Du bist {{object}}.",
-	}
-	readRule := map[string]any{
-		"name":           "ask_user_identity_de",
-		"regex":          `(?i)\bwer\s+bin\s+ich\b|\bwei(?:ß|ss)t\s+du\s+wer\s+ich\s+bin\b|\bwer\s+ich\s+bin\b`,
-		"subject":        "user",
-		"predicate":      "self_identity",
-		"answer_found":   "Ja. Du bist {{object}}.",
-		"answer_missing": "Noch nicht sicher. Sag mir in einem Satz, wer du bist, dann speichere ich es.",
-	}
-
-	if appendRuleIfMissingByName(m.Params, "write_rules", writeRule) {
-		changed = true
-	}
-	if appendRuleIfMissingByName(m.Params, "read_rules", readRule) {
-		changed = true
-	}
-	return changed
-}
-
-func appendRuleIfMissingByName(params map[string]any, key string, rule map[string]any) bool {
-	if params == nil || rule == nil {
-		return false
-	}
-	name, _ := rule["name"].(string)
-	if strings.TrimSpace(name) == "" {
-		return false
-	}
-	raw, ok := params[key]
-	if !ok {
-		params[key] = []any{rule}
-		return true
-	}
-	arr, ok := raw.([]any)
-	if !ok {
-		params[key] = []any{rule}
-		return true
-	}
-	for _, item := range arr {
-		if mm, ok := item.(map[string]any); ok {
-			if strings.EqualFold(asString(mm["name"], ""), name) {
-				return false
-			}
-		}
-	}
-	params[key] = append(arr, rule)
-	return true
 }
 
 type OfflineReflexRule struct {
