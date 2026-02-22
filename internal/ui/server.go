@@ -292,8 +292,9 @@ const indexHTML = `<!doctype html>
   <title>Bunny UI</title>
   <style>
     body { font-family: system-ui, sans-serif; margin: 0; background: #0b0b0c; color: #eaeaea; }
-    .wrap { display: grid; grid-template-columns: 1fr 320px; height: 100vh; }
-    .chat { padding: 16px; overflow: auto; }
+    .wrap { display: grid; grid-template-columns: 1fr 360px; height: 100vh; }
+    .main { display:flex; flex-direction:column; height:100vh; min-height: 100vh; }
+    .chat { flex:1; padding: 16px; overflow: auto; }
     .side { border-left: 1px solid #222; padding: 16px; overflow: auto; background: #0f0f11; }
     .msg { background: #131316; border: 1px solid #242428; border-radius: 12px; padding: 12px; margin: 10px 0; }
     .msg.user { background:#0f1a12; border-color:#21402b; margin-left: 64px; }
@@ -305,15 +306,22 @@ const indexHTML = `<!doctype html>
     button:hover { background:#24242a; }
     button:disabled { opacity:0.45; cursor: default; }
     .ack { font-size: 12px; opacity: 0.75; margin-left: 6px; }
-    .row { display:flex; gap: 10px; padding: 12px; border-top: 1px solid #222; }
+    .row { display:flex; gap: 10px; padding: 12px; border-top: 1px solid #222; background:#0b0b0c; position: sticky; bottom: 0; z-index: 5; }
     input { flex:1; background:#101012; border:1px solid #2b2b33; border-radius:10px; padding:10px; color:#eaeaea; }
     .tag { font-size: 11px; padding:2px 8px; border:1px solid #2b2b33; border-radius:999px; }
     pre { white-space: pre-wrap; font-size: 12px; opacity: 0.9; }
+    .cmds { margin-top: 18px; }
+    .cmds h3 { margin: 0 0 10px 0; font-size: 13px; opacity: 0.9; }
+    .cmdgrid { display: grid; grid-template-columns: 1fr; gap: 8px; }
+    .cmd { display:flex; justify-content: space-between; align-items:center; gap: 10px; width: 100%; text-align:left; padding: 10px; border-radius: 12px; background:#131316; border:1px solid #242428; cursor:pointer; }
+    .cmd:hover { background:#18181c; }
+    .cmd code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; opacity: 0.95; }
+    .cmd span { font-size: 12px; opacity: 0.7; }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div>
+    <div class="main">
       <div id="chat" class="chat"></div>
       <div class="row">
         <input id="inp" placeholder="Schreib an Bunny…" />
@@ -329,6 +337,20 @@ const indexHTML = `<!doctype html>
       <div style="margin-top:16px; opacity:0.8; font-size:12px;">
         Feedback: 👍 = gut, 😐 = ok, 👎 = schlecht, ❌ = gelogen / grob falsch
       </div>
+      <div class="cmds">
+        <h3>Befehle (klickbar)</h3>
+        <div class="cmdgrid">
+          <button class="cmd" data-insert="/thought list"><code>/thought list</code><span>Ideen</span></button>
+          <button class="cmd" data-insert="/thought show 1"><code>/thought show &lt;id&gt;</code><span>Details</span></button>
+          <button class="cmd" data-insert="/thought materialize all"><code>/thought materialize all</code><span>→ Code</span></button>
+          <button class="cmd" data-insert="/code list"><code>/code list</code><span>Proposals</span></button>
+          <button class="cmd" data-insert="/code draft 1"><code>/code draft &lt;id&gt;</code><span>Diff bauen</span></button>
+          <button class="cmd" data-insert="/code apply 1"><code>/code apply &lt;id&gt;</code><span>Gated apply</span></button>
+          <button class="cmd" data-insert="/ab on"><code>/ab on</code><span>A/B an</span></button>
+          <button class="cmd" data-insert="/ab status"><code>/ab status</code><span>Status</span></button>
+          <button class="cmd" data-insert="/web test ibft consensus"><code>/web test &lt;query&gt;</code><span>Websense</span></button>
+        </div>
+      </div>
     </div>
   </div>
 <script>
@@ -337,6 +359,13 @@ const indexHTML = `<!doctype html>
   const sendBtn = document.getElementById('send');
   const statusEl = document.getElementById('status');
   const refreshBtn = document.getElementById('refresh');
+
+  document.querySelectorAll('[data-insert]').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      inp.value = el.dataset.insert || '';
+      inp.focus();
+    });
+  });
 
   function esc(s){ return (s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
 
