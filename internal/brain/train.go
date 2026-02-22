@@ -21,12 +21,47 @@ func InsertTrainTrial(db *sql.DB, userMsgID int64, topic, intent, ctxKey string,
 	return id, nil
 }
 
+func UpdateTrainTrialNote(db *sql.DB, id int64, note string) error {
+	if db == nil || id <= 0 {
+		return nil
+	}
+	_, err := db.Exec(`UPDATE train_trials SET note=? WHERE id=?`, strings.TrimSpace(note), id)
+	return err
+}
+
+type TrainTrialFull struct {
+	ID        int64
+	CreatedAt string
+	UserMsgID int64
+	Topic     string
+	Intent    string
+	CtxKey    string
+	AAction   string
+	AStyle    string
+	AText     string
+	BAction   string
+	BStyle    string
+	BText     string
+	Chosen    string
+	Note      string
+}
+
+func GetTrainTrialFull(db *sql.DB, id int64) (TrainTrialFull, bool) {
+	if db == nil || id <= 0 {
+		return TrainTrialFull{}, false
+	}
+	var t TrainTrialFull
+	_ = db.QueryRow(`SELECT id,created_at,user_msg_id,topic,intent,ctx_key,a_action,a_style,a_text,b_action,b_style,b_text,chosen,note FROM train_trials WHERE id=?`, id).
+		Scan(&t.ID, &t.CreatedAt, &t.UserMsgID, &t.Topic, &t.Intent, &t.CtxKey, &t.AAction, &t.AStyle, &t.AText, &t.BAction, &t.BStyle, &t.BText, &t.Chosen, &t.Note)
+	return t, t.ID > 0
+}
+
 func ChooseTrainTrial(db *sql.DB, id int64, choice string) error {
 	if db == nil || id <= 0 {
 		return nil
 	}
 	choice = strings.ToUpper(strings.TrimSpace(choice))
-	if choice != "A" && choice != "B" {
+	if choice != "A" && choice != "B" && choice != "NONE" {
 		return nil
 	}
 	_, err := db.Exec(`UPDATE train_trials SET chosen=? WHERE id=?`, choice, id)
@@ -47,6 +82,7 @@ func ApplyTrainChoice(db *sql.DB, trialID int64, choice string) {
 	if !ok {
 		return
 	}
+	choice = strings.ToUpper(strings.TrimSpace(choice))
 	if choice == "A" {
 		UpdatePolicy(db, ctxKey, aAct, 1.0)
 		UpdatePolicy(db, ctxKey, bAct, 0.0)

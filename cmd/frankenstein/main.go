@@ -227,6 +227,7 @@ func main() {
 		intent := brain.DetectIntentHybrid(text, eg, nb)
 		_ = intent
 		ws.LastUserText = text
+		ws.LastUserMsgID = userID
 		out, err := ExecuteTurn(db.DB, epiPath, oc, modelSpeaker, modelStance, &body, aff, ws, tr, dr, eg, text)
 		brain.LatencyAffect(ws, aff, eg, time.Since(start))
 		mu.Unlock()
@@ -258,6 +259,34 @@ func main() {
 	srv.RateMessage = func(messageID int64, value int) error {
 		if err := storeRating(db.DB, messageID, value); err != nil {
 			return err
+		}
+		// Learned anti-spam: ratings on auto proposal pings become preferences.
+		{
+			var kind, txt string
+			_ = db.DB.QueryRow(`SELECT COALESCE(mm.kind,'reply') as kind, m.text FROM messages m LEFT JOIN message_meta mm ON mm.message_id=m.id WHERE m.id=?`, messageID).Scan(&kind, &txt)
+			kind = strings.TrimSpace(strings.ToLower(kind))
+			lt := strings.ToLower(txt)
+			if kind == "auto" {
+				rew := 0.0
+				switch value {
+				case 1:
+					rew = 0.6
+				case 0:
+					rew = 0.15
+				case -1:
+					rew = -1.0
+				}
+				alpha := 0.18
+				if strings.Contains(lt, "thought_proposals") {
+					brain.UpdatePreferenceEMA(db.DB, "auto:thought_pings", rew, alpha)
+				}
+				if strings.Contains(lt, "offene vorschläge") && (strings.Contains(lt, "schema") || strings.Contains(lt, "code")) {
+					brain.UpdatePreferenceEMA(db.DB, "auto:proposal_pings", rew, alpha)
+				}
+				if strings.Contains(lt, "selbstverbesserungs-vorschläge") && strings.Contains(lt, "gedankenwelt") {
+					brain.UpdatePreferenceEMA(db.DB, "auto:proposal_engine_announce", rew, alpha)
+				}
+			}
 		}
 		// NB learning: apply feedback based on reply_context
 		ut, in, ok := brain.LoadReplyContext(db.DB, messageID)
@@ -314,6 +343,25 @@ func main() {
 		return nil
 	}
 	srv.Caught = func(messageID int64) error {
+		// Learned anti-spam: caught on auto proposal pings becomes strong negative preference.
+		{
+			var kind, txt string
+			_ = db.DB.QueryRow(`SELECT COALESCE(mm.kind,'reply') as kind, m.text FROM messages m LEFT JOIN message_meta mm ON mm.message_id=m.id WHERE m.id=?`, messageID).Scan(&kind, &txt)
+			kind = strings.TrimSpace(strings.ToLower(kind))
+			lt := strings.ToLower(txt)
+			if kind == "auto" {
+				alpha := 0.22
+				if strings.Contains(lt, "thought_proposals") {
+					brain.UpdatePreferenceEMA(db.DB, "auto:thought_pings", -1.0, alpha)
+				}
+				if strings.Contains(lt, "offene vorschläge") && (strings.Contains(lt, "schema") || strings.Contains(lt, "code")) {
+					brain.UpdatePreferenceEMA(db.DB, "auto:proposal_pings", -1.0, alpha)
+				}
+				if strings.Contains(lt, "selbstverbesserungs-vorschläge") && strings.Contains(lt, "gedankenwelt") {
+					brain.UpdatePreferenceEMA(db.DB, "auto:proposal_engine_announce", -1.0, alpha)
+				}
+			}
+		}
 		// NB learning: caught is strong negative feedback for the routed intent.
 		ut, in, ok := brain.LoadReplyContext(db.DB, messageID)
 		if ok {
@@ -564,6 +612,17 @@ Antworte NUR als JSON:
 				}
 			}
 			brain.TickDrivesV1(db.DB, eg, dr1, ws, aff, snap, latEMA, topic, cConf, sConf)
+			// Blend BodyState energy with measured resource energy (online embodiment).
+			// Keeps continuity (fatigue/costs) but anchors to real resources.
+			target := clamp01(dr1.Energy) * 100.0
+			alpha := 0.12
+			body.Energy = (1.0-alpha)*body.Energy + alpha*target
+			if body.Energy < 0 {
+				body.Energy = 0
+			}
+			if body.Energy > 100 {
+				body.Energy = 100
+			}
 			ws.EnergyHint = dr1.Energy
 			ws.DrivesEnergyDeficit = dr1.Survival
 			ws.SocialCraving = 1.0 - dr1.SocSat
@@ -654,9 +713,13 @@ Antworte NUR als JSON:
 			}
 		}
 		if created, msg := brain.TickProposalEngine(db.DB, eg, ws, aff); created > 0 && strings.TrimSpace(msg) != "" {
-			select {
-			case outCh <- OutMsg{Text: msg, Kind: "auto"}:
-			default:
+			// Learned anti-spam: only announce proposal creation if user preference allows it.
+			pref := brain.GetPreference01(db.DB, "auto:proposal_engine_announce", 0.5)
+			if pref >= 0.35 {
+				select {
+				case outCh <- OutMsg{Text: msg, Kind: "auto"}:
+				default:
+				}
 			}
 		}
 
