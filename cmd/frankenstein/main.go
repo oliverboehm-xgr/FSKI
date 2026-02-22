@@ -234,7 +234,7 @@ func main() {
 			return ui.Message{}, err
 		}
 		if strings.TrimSpace(out) == "" {
-			return ui.Message{}, nil
+			out = "Ich bin da. Magst du kurz sagen, was du von mir willst (Status / Idee / Umsetzung)?"
 		}
 		id := persistMessageWithKind(db.DB, out, nil, 0.2, "reply")
 		// link reply -> user_text + intent + policy for learning

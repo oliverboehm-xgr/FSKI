@@ -3,6 +3,7 @@ package brain
 import (
 	"database/sql"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -125,7 +126,7 @@ func TickAutonomy(db *sql.DB, now time.Time, lastUserAt time.Time, lastAutoAt ti
 			}
 			talkDrive = clamp01(talkDrive + boost)
 			if talkDrive >= p.MinTalkDrive {
-				return "Ich habe " + itoa(tp) + " offene Selbstverbesserungs-Ideen aus meiner Gedankenwelt. Soll ich sie als Schema/Code-Proposal ausformulieren?", talkDrive
+				return "Ich habe " + itoa(tp) + " offene Selbstverbesserungs-Ideen aus meiner Gedankenwelt (thought_proposals). Soll ich sie anzeigen oder materialisieren? (Commands: /thought list | /thought show <id> | /thought materialize <id|all>)", talkDrive
 			}
 		}
 	}
@@ -139,7 +140,16 @@ func TickAutonomy(db *sql.DB, now time.Time, lastUserAt time.Time, lastAutoAt ti
 
 	if len(topics) > 0 {
 		t := topics[0]
-		return "Ich hab gerade Mitteilungsdrang. Wollen wir kurz über \"" + t + "\" sprechen? Was daran interessiert dich am meisten?", talkDrive
+		if db != nil {
+			if c, ok := GetConcept(db, t); ok && strings.TrimSpace(c.Summary) != "" {
+				sum := strings.TrimSpace(c.Summary)
+				if len(sum) > 220 {
+					sum = sum[:220] + "..."
+				}
+				return "Kurzer Gedanke zu \"" + t + "\": " + sum + "\nSoll ich dazu weiter scouten (Web) oder willst du die Richtung vorgeben?", talkDrive
+			}
+		}
+		return "Ich hab gerade Mitteilungsdrang zu \"" + t + "\". Soll ich kurz scouten (Web) oder willst du ein anderes Thema setzen?", talkDrive
 	}
 
 	return "Ich hab gerade Lust auf ein kurzes Gespräch. Willst du ein Thema setzen – oder soll ich eins vorschlagen?", talkDrive

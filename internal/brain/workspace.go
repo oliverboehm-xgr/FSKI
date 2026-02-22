@@ -116,11 +116,16 @@ func TickWorkspace(ws *Workspace, body any, aff *AffectState, tr *Traits, eg *ep
 	}
 }
 
+var topicStopwords = map[string]struct{}{"bist": {}, "bin": {}, "sind": {}, "seid": {}, "sein": {}, "hast": {}, "habt": {}, "hat": {}, "haben": {}, "ja": {}, "ok": {}, "okay": {}, "bitte": {}, "danke": {}, "nochmal": {}, "wieder": {}, "genau": {}, "klar": {}, "mach": {}, "machst": {}, "machstdu": {}, "du": {}, "ich": {}, "wir": {}, "ihr": {}, "sie": {}, "er": {}, "es": {}}
+
 func ExtractTopic(s string) string {
 	toks := TokenizeAlphaNumLower(s)
 	best := ""
 	for _, t := range toks {
 		if len(t) < 3 {
+			continue
+		}
+		if _, bad := topicStopwords[t]; bad {
 			continue
 		}
 		if len(t) >= len(best) {

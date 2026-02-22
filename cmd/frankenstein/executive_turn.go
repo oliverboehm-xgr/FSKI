@@ -2,16 +2,31 @@ package main
 
 import (
 	"database/sql"
+	"strconv"
 	"strings"
+	"time"
 
 	"frankenstein-v0/internal/brain"
 	"frankenstein-v0/internal/epi"
 	"frankenstein-v0/internal/ollama"
+	"frankenstein-v0/internal/websense"
 )
 
 // ExecuteTurn: single place where strategy becomes actual execution.
 // This replaces "policy as prompt hint".
 func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, modelStance string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string) (string, error) {
+	// UI commands (were previously only available in console loop).
+	if ok, out := handleWebCommands(userText); ok {
+		return out, nil
+	}
+	if ok, out := handleThoughtCommands(db, userText); ok {
+		return out, nil
+	}
+	// Natural confirmation: if last auto asked about materializing thought_proposals and user says "ja", show them.
+	if isAffirmative(userText) && brain.CountThoughtProposals(db, "proposed") > 0 && lastAutoAsked(db, "ausformulieren", 10*time.Minute) {
+		return brain.RenderThoughtProposalList(db, 10), nil
+	}
+
 	// Semantic memory (generic long-term facts): can answer/store before LLM.
 	if ok, out := brain.SemanticMemoryStep(db, eg, userText); ok && strings.TrimSpace(out) != "" {
 		return out, nil
@@ -123,5 +138,110 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 			return "Ich bin da. Sag mir kurz, was du von mir willst: Status, Meinung oder einfach reden?", nil
 		}
 		return out, err
+	}
+}
+
+func isAffirmative(s string) bool {
+	t := strings.TrimSpace(strings.ToLower(s))
+	switch t {
+	case "ja", "j", "jo", "yes", "y", "ok", "okay", "klar", "bitte", "gerne", "mach", "mach das", "mach es", "genau":
+		return true
+	default:
+		return false
+	}
+}
+
+func lastAutoAsked(db *sql.DB, contains string, within time.Duration) bool {
+	if db == nil {
+		return false
+	}
+	var txt string
+	var ts string
+	_ = db.QueryRow(`SELECT m.text, m.created_at
+		FROM messages m
+		JOIN message_meta mm ON mm.message_id=m.id
+		WHERE mm.kind='auto'
+		ORDER BY m.id DESC LIMIT 1`).Scan(&txt, &ts)
+	txt = strings.ToLower(strings.TrimSpace(txt))
+	if txt == "" || !strings.Contains(txt, strings.ToLower(contains)) {
+		return false
+	}
+	tm, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return false
+	}
+	return time.Since(tm) <= within
+}
+
+func handleWebCommands(userText string) (bool, string) {
+	line := strings.TrimSpace(userText)
+	if !strings.HasPrefix(line, "/web") && !strings.HasPrefix(line, "/websense") {
+		return false, ""
+	}
+	// Usage:
+	// /web test <query>
+	parts := strings.Fields(line)
+	if len(parts) < 2 {
+		return true, "Use: /web test <query>"
+	}
+	if parts[1] != "test" {
+		return true, "Use: /web test <query>"
+	}
+	q := strings.TrimSpace(strings.TrimPrefix(line, parts[0]+" "+parts[1]))
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return true, "Use: /web test <query>"
+	}
+	results, err := websense.Search(q, 6)
+	if err != nil || len(results) == 0 {
+		if err != nil {
+			return true, "websense.Search failed: " + err.Error()
+		}
+		return true, "Keine Ergebnisse."
+	}
+	var b strings.Builder
+	b.WriteString("websense.Search OK. Top Ergebnisse:\n")
+	for i := 0; i < len(results) && i < 5; i++ {
+		title := strings.TrimSpace(results[i].Title)
+		u := strings.TrimSpace(results[i].URL)
+		sn := strings.TrimSpace(results[i].Snippet)
+		if len(sn) > 140 {
+			sn = sn[:140] + "..."
+		}
+		b.WriteString("- " + title + "\n  " + u + "\n  " + sn + "\n")
+	}
+	return true, strings.TrimSpace(b.String())
+}
+func handleThoughtCommands(db *sql.DB, userText string) (bool, string) {
+	line := strings.TrimSpace(userText)
+	if !strings.HasPrefix(line, "/thought") {
+		return false, ""
+	}
+	parts := strings.Fields(line)
+	if len(parts) == 1 {
+		return true, brain.RenderThoughtProposalList(db, 10)
+	}
+	switch parts[1] {
+	case "list":
+		return true, brain.RenderThoughtProposalList(db, 10)
+	case "show":
+		if len(parts) < 3 {
+			return true, "Use: /thought show <id>"
+		}
+		id, _ := strconv.ParseInt(parts[2], 10, 64)
+		return true, brain.RenderThoughtProposal(db, id)
+	case "materialize":
+		if len(parts) < 3 {
+			return true, "Use: /thought materialize <id|all>"
+		}
+		arg := strings.ToLower(strings.TrimSpace(parts[2]))
+		if arg == "all" {
+			return true, brain.MaterializeAllThoughtProposals(db, 25)
+		}
+		id, _ := strconv.ParseInt(arg, 10, 64)
+		msg, _ := brain.MaterializeThoughtProposal(db, id)
+		return true, msg
+	default:
+		return true, "Use: /thought list | /thought show <id> | /thought materialize <id|all>"
 	}
 }
