@@ -727,6 +727,12 @@ Antworte NUR als JSON:
 				}
 			}
 		}
+		if ran, msg := brain.TickEvolutionTournament(db.DB, eg, time.Now()); ran && strings.TrimSpace(msg) != "" {
+			select {
+			case outCh <- OutMsg{Text: msg, Kind: "auto"}:
+			default:
+			}
+		}
 
 		tickN++
 		if tickN%60 == 0 {
