@@ -12,6 +12,22 @@ import (
 // ExecuteTurn: single place where strategy becomes actual execution.
 // This replaces "policy as prompt hint".
 func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, modelStance string, body *BodyState, aff *brain.AffectState, ws *brain.Workspace, tr *brain.Traits, dr *brain.Drives, eg *epi.Epigenome, userText string) (string, error) {
+	// Semantic memory (generic long-term facts): can answer/store before LLM.
+	if ok, out := brain.SemanticMemoryStep(db, eg, userText); ok && strings.TrimSpace(out) != "" {
+		return out, nil
+	}
+
+	// Topic should follow current user turn (no lock-in to previous topic).
+	if ws != nil {
+		t := brain.ExtractTopic(userText)
+		if t != "" {
+			ws.ActiveTopic = t
+			ws.LastTopic = t
+			brain.SaveActiveTopic(db, t)
+			brain.BumpInterest(db, t, 0.10)
+		}
+	}
+
 	if ws != nil && !ws.LLMAvailable {
 		low := strings.ToLower(userText)
 		if strings.Contains(low, "fühl") || strings.Contains(low, "wie geht") {

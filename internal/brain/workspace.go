@@ -2,8 +2,6 @@ package brain
 
 import (
 	"math/rand"
-	"regexp"
-	"strings"
 	"time"
 
 	"frankenstein-v0/internal/epi"
@@ -118,12 +116,16 @@ func TickWorkspace(ws *Workspace, body any, aff *AffectState, tr *Traits, eg *ep
 	}
 }
 
-var topicRe = regexp.MustCompile(`(?i)\b(wetter|glücklich|stress|beziehung|code|patch|github|fski|ollama|sqlite|xgr|xda?la|mutat|modul|schlaf|angst)\b`)
-
 func ExtractTopic(s string) string {
-	m := topicRe.FindStringSubmatch(s)
-	if len(m) == 0 {
-		return ""
+	toks := TokenizeAlphaNumLower(s)
+	best := ""
+	for _, t := range toks {
+		if len(t) < 3 {
+			continue
+		}
+		if len(t) >= len(best) {
+			best = t
+		}
 	}
-	return strings.ToLower(m[1])
+	return best
 }

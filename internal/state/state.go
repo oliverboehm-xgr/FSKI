@@ -182,6 +182,34 @@ func migrate(db *sql.DB) error {
 			updated_at TEXT NOT NULL
 		);`,
 
+		// Generic semantic long-term memory (facts)
+		`CREATE TABLE IF NOT EXISTS facts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			subject TEXT NOT NULL,
+			predicate TEXT NOT NULL,
+			object TEXT NOT NULL,
+			confidence REAL NOT NULL,
+			salience REAL NOT NULL,
+			half_life_days REAL NOT NULL,
+			source TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			UNIQUE(subject, predicate)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject);`,
+		`CREATE INDEX IF NOT EXISTS idx_facts_predicate ON facts(predicate);`,
+
+		// Schema proposals (generic table-evolution proposals)
+		`CREATE TABLE IF NOT EXISTS schema_proposals (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			title TEXT NOT NULL,
+			sql TEXT NOT NULL,
+			status TEXT NOT NULL,
+			notes TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_schema_proposals_status ON schema_proposals(status);`,
+
 		// ---------- ResourceSpace ----------
 		`CREATE TABLE IF NOT EXISTS resources (
 			id TEXT PRIMARY KEY,              -- e.g. disk:C:, ram, cpu
