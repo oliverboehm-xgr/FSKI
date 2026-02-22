@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -38,6 +39,12 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 	// Natural confirmation: if last auto asked about materializing thought_proposals and user says "ja", show them.
 	if isAffirmative(userText) && brain.CountThoughtProposals(db, "proposed") > 0 && lastAutoAsked(db, "ausformulieren", 10*time.Minute) {
 		return brain.RenderThoughtProposalList(db, 10), nil
+	}
+	if isStopProposalSpam(userText) {
+		brain.UpdatePreferenceEMA(db, "auto:proposal_pings", -1.0, 0.25)
+		brain.UpdatePreferenceEMA(db, "auto:thought_pings", -1.0, 0.25)
+		brain.UpdatePreferenceEMA(db, "auto:proposal_engine_announce", -1.0, 0.25)
+		return "Verstanden. Ich pinge dich mit Selbstverbesserungs-Ideen nur noch sehr sparsam. Wenn du sie sehen willst: /thought list (oder /code list).", nil
 	}
 
 	// Semantic memory (generic long-term facts): can answer/store before LLM.
@@ -89,7 +96,7 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 	// - We skip EXTERNAL_FACT to avoid double websense runs.
 	// - If A/B is enabled but cannot be produced (missing model, Ollama down, etc.),
 	//   we return a clear diagnostic instead of silently falling back.
-	if abEnabled(db) && intent != brain.IntentExternalFact {
+	if trainEnabled(db) && intent != brain.IntentExternalFact {
 		msg, ok := runABTrial(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, userText)
 		if ok {
 			return msg, nil
@@ -440,9 +447,11 @@ func handleABCommands(db *sql.DB, eg *epi.Epigenome, userText string) (bool, str
 	sub := strings.ToLower(parts[1])
 	switch sub {
 	case "on":
+		kvSet(db, "train_enabled", "1")
 		kvSet(db, "ab_enabled", "1")
 		return true, "OK. A/B Training ist AN.\n" + renderABStatus(db, eg)
 	case "off":
+		kvSet(db, "train_enabled", "0")
 		kvSet(db, "ab_enabled", "0")
 		return true, "OK. A/B Training ist AUS."
 	case "status":
@@ -479,7 +488,47 @@ func handlePickCommand(db *sql.DB, userText string) (bool, string) {
 		return true, "Use: /pick <ab_id> a|b|none"
 	}
 	id := parseID(parts[1])
-	choice := strings.ToLower(strings.TrimSpace(parts[2]))
+	choiceRaw := strings.TrimSpace(parts[2])
+	choiceUpper := strings.ToUpper(choiceRaw)
+	if choiceUpper == "A" || choiceUpper == "B" || strings.EqualFold(choiceRaw, "none") {
+		if tt, ok := brain.GetTrainTrialFull(db, id); ok {
+			if strings.EqualFold(choiceRaw, "none") {
+				_ = brain.ChooseTrainTrial(db, id, "NONE")
+				kvSet(db, "speech_overlay", "")
+				kvSet(db, "speaker_model_override", "")
+				return true, "OK. (none)"
+			}
+			_ = brain.ChooseTrainTrial(db, id, choiceUpper)
+			brain.ApplyTrainChoice(db, id, choiceUpper)
+			if choiceUpper == "B" {
+				overlay := strings.TrimSpace(tt.BStyle)
+				model := ""
+				if strings.TrimSpace(tt.Note) != "" {
+					var meta struct {
+						BModel  string `json:"b_model"`
+						BPrompt string `json:"b_prompt"`
+					}
+					if json.Unmarshal([]byte(tt.Note), &meta) == nil {
+						if strings.TrimSpace(meta.BPrompt) != "" {
+							overlay = strings.TrimSpace(meta.BPrompt)
+						}
+						model = strings.TrimSpace(meta.BModel)
+					}
+				}
+				if overlay != "" {
+					kvSet(db, "speech_overlay", overlay)
+				}
+				if model != "" {
+					kvSet(db, "speaker_model_override", model)
+				}
+				return true, tt.BText
+			}
+			kvSet(db, "speech_overlay", "")
+			kvSet(db, "speaker_model_override", "")
+			return true, tt.AText
+		}
+	}
+	choice := strings.ToLower(choiceRaw)
 	t, ok := brain.GetABTrial(db, id)
 	if !ok {
 		return true, "AB# nicht gefunden."
@@ -512,6 +561,13 @@ func abEnabled(db *sql.DB) bool {
 	return strings.TrimSpace(kvGet(db, "ab_enabled")) == "1"
 }
 
+func trainEnabled(db *sql.DB) bool {
+	if strings.TrimSpace(kvGet(db, "train_enabled")) == "1" {
+		return true
+	}
+	return abEnabled(db)
+}
+
 func renderABStatus(db *sql.DB, eg *epi.Epigenome) string {
 	aModel := strings.TrimSpace(kvGet(db, "ab_model_a"))
 	bModel := strings.TrimSpace(kvGet(db, "ab_model_b"))
@@ -524,7 +580,7 @@ func renderABStatus(db *sql.DB, eg *epi.Epigenome) string {
 		bStyle = "empathisch-direkt"
 	}
 	en := "OFF"
-	if abEnabled(db) {
+	if trainEnabled(db) {
 		en = "ON"
 	}
 	return "A/B Training: " + en + "\n" +
@@ -661,6 +717,17 @@ func isAffirmative(s string) bool {
 	default:
 		return false
 	}
+}
+
+func isStopProposalSpam(s string) bool {
+	t := strings.ToLower(strings.TrimSpace(s))
+	if t == "" {
+		return false
+	}
+	neg := strings.Contains(t, "nicht")
+	spam := strings.Contains(t, "dauer") || strings.Contains(t, "ständig") || strings.Contains(t, "permanent") || strings.Contains(t, "spam")
+	idea := strings.Contains(t, "idee") || strings.Contains(t, "vorschlag") || strings.Contains(t, "verbesser") || strings.Contains(t, "thought_proposal")
+	return neg && spam && idea
 }
 
 func lastAutoAsked(db *sql.DB, contains string, within time.Duration) bool {
