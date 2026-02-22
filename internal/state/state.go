@@ -269,6 +269,17 @@ func migrate(db *sql.DB) error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_code_proposals_status ON code_proposals(status);`,
 
+		// ---------- Epigenome proposals (gated self-modifying config) ----------
+		`CREATE TABLE IF NOT EXISTS epigenome_proposals (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			title TEXT NOT NULL,
+			patch_json TEXT NOT NULL,
+			status TEXT NOT NULL, -- proposed|applied|rejected
+			notes TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_epigenome_proposals_status ON epigenome_proposals(status);`,
+
 		// ---------- A/B trials (preference data for LoRA / behavior) ----------
 		`CREATE TABLE IF NOT EXISTS ab_trials (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,

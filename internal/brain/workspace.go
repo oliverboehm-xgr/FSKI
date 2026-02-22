@@ -68,6 +68,8 @@ type Workspace struct {
 	LastUserInfoScore float64
 	LastUserTopToken  string
 	LLMAvailable      bool
+	// Non-fatal: configured Ollama models that are missing (used for graceful routing)
+	OLLAMAMissing []string
 
 	// Cortex sensor-gate traces (per turn)
 	LastSenseNeedWeb bool
