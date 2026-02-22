@@ -512,6 +512,21 @@ func handleABCommands(db *sql.DB, eg *epi.Epigenome, userText string) (bool, str
 		return true, "OK. A/B Training ist AUS."
 	case "status":
 		return true, renderABStatus(db, eg)
+	case "explain":
+		if len(parts) < 3 {
+			return true, "Use: /ab explain on|off"
+		}
+		v2 := strings.ToLower(strings.TrimSpace(parts[2]))
+		switch v2 {
+		case "on", "1", "true":
+			kvSet(db, "train_explain", "1")
+			return true, "OK. explain=ON\n" + renderABStatus(db, eg)
+		case "off", "0", "false":
+			kvSet(db, "train_explain", "0")
+			return true, "OK. explain=OFF"
+		default:
+			return true, "Use: /ab explain on|off"
+		}
 	case "set":
 		if len(parts) < 4 {
 			return true, "Use: /ab set b_model|b_style|mutant_strength|pool <value>"
@@ -543,7 +558,7 @@ func handleABCommands(db *sql.DB, eg *epi.Epigenome, userText string) (bool, str
 			return true, "Use: /ab set b_model|b_style|mutant_strength|pool <value>"
 		}
 	default:
-		return true, "Use: /ab on|off|status|set ..."
+		return true, "Use: /ab on|off|status|set|explain ..."
 	}
 }
 
@@ -582,7 +597,39 @@ func handlePickCommand(db *sql.DB, userText string) (bool, string) {
 				return true, "OK. (none)"
 			}
 			_ = brain.ChooseTrainTrial(db, id, choice)
+
+			// Capture before-stats for explain mode.
+			ctxKey := tt.CtxKey
+			aAct := tt.AAction
+			bAct := tt.BAction
+			aSty := tt.AStyle
+			bSty := tt.BStyle
+			aA0, aB0 := getPolicyAlphaBeta(db, ctxKey, aAct)
+			bA0, bB0 := getPolicyAlphaBeta(db, ctxKey, bAct)
+			psA0 := getPrefValue(db, "style:"+aSty)
+			psB0 := getPrefValue(db, "style:"+bSty)
+			ptA0 := getPrefValue(db, "strat:"+aAct)
+			ptB0 := getPrefValue(db, "strat:"+bAct)
+
 			brain.ApplyTrainChoice(db, id, choice)
+
+			aA1, aB1 := getPolicyAlphaBeta(db, ctxKey, aAct)
+			bA1, bB1 := getPolicyAlphaBeta(db, ctxKey, bAct)
+			psA1 := getPrefValue(db, "style:"+aSty)
+			psB1 := getPrefValue(db, "style:"+bSty)
+			ptA1 := getPrefValue(db, "strat:"+aAct)
+			ptB1 := getPrefValue(db, "strat:"+bAct)
+
+			learned := ""
+			if trainExplainEnabled(db) {
+				learned = "LEARNED (ctx=" + ctxKey + ", choice=" + choice + ")\n" +
+					"- policy[" + aAct + "] α/β: " + fmtAB(aA0, aB0) + " → " + fmtAB(aA1, aB1) + "\n" +
+					"- policy[" + bAct + "] α/β: " + fmtAB(bA0, bB0) + " → " + fmtAB(bA1, bB1) + "\n" +
+					"- pref[style:" + aSty + "]: " + fmtF(psA0) + " → " + fmtF(psA1) + "\n" +
+					"- pref[style:" + bSty + "]: " + fmtF(psB0) + " → " + fmtF(psB1) + "\n" +
+					"- pref[strat:" + aAct + "]: " + fmtF(ptA0) + " → " + fmtF(ptA1) + "\n" +
+					"- pref[strat:" + bAct + "]: " + fmtF(ptB0) + " → " + fmtF(ptB1) + "\n"
+			}
 
 			// Apply phenotype immediately based on stored note.
 			if choice == "B" {
@@ -608,11 +655,23 @@ func handlePickCommand(db *sql.DB, userText string) (bool, string) {
 				if m != "" {
 					kvSet(db, "speaker_model_override", m)
 				}
+				if learned != "" {
+					learned += "- phenotype: speech_overlay=" + firstLine(overlay) + "; speaker_model_override=" + pickNonEmpty(m, "<same>") + "\n"
+				}
+				if learned != "" {
+					return true, strings.TrimSpace(learned + "\n\n" + tt.BText)
+				}
 				return true, tt.BText
 			}
 			// choice A
 			kvSet(db, "speech_overlay", "")
 			kvSet(db, "speaker_model_override", "")
+			if learned != "" {
+				learned += "- phenotype: cleared speech_overlay + model_override\n"
+			}
+			if learned != "" {
+				return true, strings.TrimSpace(learned + "\n\n" + tt.AText)
+			}
 			return true, tt.AText
 		}
 	}
@@ -657,6 +716,53 @@ func trainEnabled(db *sql.DB) bool {
 	return abEnabled(db)
 }
 
+func trainExplainEnabled(db *sql.DB) bool {
+	// default ON
+	v := strings.TrimSpace(kvGet(db, "train_explain"))
+	if v == "0" {
+		return false
+	}
+	return true
+}
+
+func getPolicyAlphaBeta(db *sql.DB, ctx, action string) (float64, float64) {
+	if db == nil || strings.TrimSpace(ctx) == "" || strings.TrimSpace(action) == "" {
+		return 1.0, 1.0
+	}
+	a, b := 1.0, 1.0
+	_ = db.QueryRow(`SELECT alpha,beta FROM policy_stats WHERE context_key=? AND action=?`, ctx, action).Scan(&a, &b)
+	if a == 0 && b == 0 {
+		a, b = 1.0, 1.0
+	}
+	if a < 0.1 {
+		a = 0.1
+	}
+	if b < 0.1 {
+		b = 0.1
+	}
+	return a, b
+}
+
+func getPrefValue(db *sql.DB, key string) float64 {
+	if db == nil || strings.TrimSpace(key) == "" {
+		return 0
+	}
+	var v sql.NullFloat64
+	_ = db.QueryRow(`SELECT value FROM preferences WHERE key=?`, key).Scan(&v)
+	if !v.Valid {
+		return 0
+	}
+	return v.Float64
+}
+
+func fmtAB(a, b float64) string {
+	return fmt.Sprintf("%.2f/%.2f", a, b)
+}
+
+func fmtF(x float64) string {
+	return fmt.Sprintf("%.2f", x)
+}
+
 func renderABStatus(db *sql.DB, eg *epi.Epigenome) string {
 	champ := strings.TrimSpace(kvGet(db, "speaker_model_override"))
 	if champ == "" {
@@ -682,8 +788,9 @@ func renderABStatus(db *sql.DB, eg *epi.Epigenome) string {
 		"Mutant model: " + pickNonEmpty(mutModel, "<auto>") + "\n" +
 		"Mutant strength: " + mutStr + "\n" +
 		"Mutant prompt: " + firstLine(mutPrompt) + "\n" +
-		"Model pool: " + pickNonEmpty(pool, "<auto>") + "\n\n" +
-		"Tipps: /ab set b_style <prompt> | /ab set b_model <model> | /ab set pool <csv> | /ab off"
+		"Model pool: " + pickNonEmpty(pool, "<auto>") + "\n" +
+		"Explain: " + pickNonEmpty(kvGet(db, "train_explain"), "1") + " (1=on,0=off)\n\n" +
+		"Tipps: /ab set b_style <prompt> | /ab set b_model <model> | /ab set pool <csv> | /ab explain on|off | /ab off"
 }
 
 func firstLine(s string) string {
@@ -785,7 +892,20 @@ func runTrainTrial(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, 
 	if err != nil {
 		return "ERR: " + err.Error(), true
 	}
-	meta := map[string]any{"a_model": aModel, "b_model": bModel, "b_prompt": mutPrompt, "mut_strength": mutStrength}
+	meta := map[string]any{
+		"a_model":      aModel,
+		"b_model":      bModel,
+		"a_action":     aAct,
+		"b_action":     bAct,
+		"a_style":      aSty,
+		"b_style":      bSty,
+		"b_prompt":     mutPrompt,
+		"mut_strength": mutStrength,
+		"ctx_key":      ctxKey,
+		"topic":        topic,
+		"intent":       intentMode,
+		"weights_diff": !strings.EqualFold(strings.TrimSpace(aModel), strings.TrimSpace(bModel)),
+	}
 	metaJSON, _ := json.Marshal(meta)
 	_ = brain.UpdateTrainTrialNote(db, id, string(metaJSON))
 
@@ -793,6 +913,28 @@ func runTrainTrial(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, 
 	b.WriteString("TRAIN#" + strconv.FormatInt(id, 10) + "\n")
 	b.WriteString("A (" + aModel + ", action=" + aAct + ", style=" + aSty + "):\n" + aOut + "\n\n")
 	b.WriteString("B (" + bModel + ", action=" + bAct + ", style=" + bSty + "):\n" + bOut + "\n\n")
+
+	// Variation vector (what exactly differs between A and B)
+	wDiff := "SAME"
+	if !strings.EqualFold(strings.TrimSpace(aModel), strings.TrimSpace(bModel)) {
+		wDiff = "DIFF (different model)"
+	}
+	over := firstLine(mutPrompt)
+	if over == "" {
+		over = "<none>"
+	}
+	varV := "VARIATION\n" +
+		"- ctx: " + ctxKey + "\n" +
+		"- topic: " + pickNonEmpty(topic, "<none>") + "\n" +
+		"- intent: " + intentMode + "\n" +
+		"- Δmodel: " + aModel + " → " + bModel + "\n" +
+		"- Δweights: " + wDiff + "\n" +
+		"- Δaction: " + aAct + " → " + bAct + "\n" +
+		"- Δstyle: " + aSty + " → " + bSty + "\n" +
+		"- Δoverlay(B): " + over + " (strength=" + fmtF(mutStrength) + ")\n" +
+		"- Δepigenome (trial): none; learning happens on /pick (policy_stats, preferences, kv_state)\n"
+	b.WriteString(varV + "\n")
+
 	b.WriteString("Wähle: /pick " + strconv.FormatInt(id, 10) + " A|B|none")
 	return strings.TrimSpace(b.String()), true
 }
