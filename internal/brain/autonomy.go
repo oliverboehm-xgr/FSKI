@@ -91,7 +91,7 @@ func LastUserMessageAt(db *sql.DB) time.Time {
 }
 
 // TickAutonomy returns a spontaneous message or "".
-func TickAutonomy(now time.Time, lastUserAt time.Time, lastAutoAt time.Time, curiosity float64, aff *AffectState, topics []string, p AutonomyParams) (msg string, talkDrive float64) {
+func TickAutonomy(db *sql.DB, now time.Time, lastUserAt time.Time, lastAutoAt time.Time, curiosity float64, aff *AffectState, topics []string, p AutonomyParams) (msg string, talkDrive float64) {
 	idle := now.Sub(lastUserAt).Seconds()
 	if idle < 0 {
 		idle = 0
@@ -100,6 +100,21 @@ func TickAutonomy(now time.Time, lastUserAt time.Time, lastAutoAt time.Time, cur
 		return "", ComputeTalkDrive(curiosity, idle, aff)
 	}
 	talkDrive = ComputeTalkDrive(curiosity, idle, aff)
+
+	// Boost talk drive if there are pending proposals.
+	schemaN, codeN := CountPendingProposals(db)
+	pending := schemaN + codeN
+	if pending > 0 {
+		boost := 0.08 * float64(pending)
+		if boost > 0.35 {
+			boost = 0.35
+		}
+		talkDrive = clamp01(talkDrive + boost)
+		if talkDrive >= p.MinTalkDrive {
+			return "Ich habe offene Vorschläge zur Selbstverbesserung (Schema: " + itoa(schemaN) + ", Code: " + itoa(codeN) + "). Soll ich sie kurz zusammenfassen? (Commands: /schema list | /schema show <id> | /schema apply <id> | /code list | /code show <id>)", talkDrive
+		}
+	}
+
 	if !lastAutoAt.IsZero() && now.Sub(lastAutoAt).Seconds() < p.CooldownSeconds {
 		return "", talkDrive
 	}
@@ -113,4 +128,27 @@ func TickAutonomy(now time.Time, lastUserAt time.Time, lastAutoAt time.Time, cur
 	}
 
 	return "Ich hab gerade Lust auf ein kurzes Gespräch. Willst du ein Thema setzen – oder soll ich eins vorschlagen?", talkDrive
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := false
+	if n < 0 {
+		neg = true
+		n = -n
+	}
+	var b [32]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + (n % 10))
+		n /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
 }
