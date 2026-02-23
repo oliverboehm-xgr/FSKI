@@ -138,6 +138,7 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"speaker":  "llama3.1:8b",
 				"daydream": "llama3.1:8b",
 				"stance":   "llama3.1:8b",
+				"coder":    "qwen2.5-coder:7b",
 
 				// Small / efficient
 				"critic":      "llama3.2:3b",
@@ -427,6 +428,10 @@ func (eg *Epigenome) ensureDefaults() (changed bool) {
 			},
 		},
 	}})
+	add("wpnsxjetlit", &ModuleSpec{Type: "wpnsxjetlit", Enabled: false, Params: map[string]any{
+		"cmd":             "",
+		"timeout_seconds": 25,
+	}})
 
 	def := func(k string, base, decay, coupling float64) {
 		if _, ok := eg.AffectDefsMap[k]; !ok {
@@ -714,6 +719,28 @@ func (eg *Epigenome) OllamaManagerParams() (enabled, autoStart, autoPull bool, s
 	}
 	if maxPull > 20 {
 		maxPull = 20
+	}
+	return
+}
+
+func (eg *Epigenome) WpnsxjetlitParams() (enabled bool, cmd string, timeoutSec int) {
+	m := eg.Modules["wpnsxjetlit"]
+	if m == nil || !m.Enabled {
+		return false, "", 0
+	}
+	enabled = true
+	if v, ok := m.Params["cmd"].(string); ok {
+		cmd = strings.TrimSpace(v)
+	}
+	timeoutSec = int(asFloat(m.Params["timeout_seconds"], 25))
+	if timeoutSec < 1 {
+		timeoutSec = 1
+	}
+	if timeoutSec > 600 {
+		timeoutSec = 600
+	}
+	if cmd == "" {
+		enabled = false
 	}
 	return
 }
