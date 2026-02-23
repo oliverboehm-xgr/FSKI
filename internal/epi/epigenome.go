@@ -1357,3 +1357,34 @@ func (eg *Epigenome) SetModel(area string, modelName string) {
 	}
 	m.Params[area] = modelName
 }
+
+// SelfChangeCostParams returns cost parameters for autonomous self-modification.
+// The module is mutable; the axioms are NOT.
+func (eg *Epigenome) SelfChangeCostParams(kind string, base float64, cooldownSec int) (float64, int) {
+	m := eg.Modules["self_change_cost"]
+	if m == nil || !m.Enabled || m.Params == nil {
+		return base, cooldownSec
+	}
+	k := strings.ToLower(strings.TrimSpace(kind))
+	switch k {
+	case "concept", "axiom":
+		base = asFloat(m.Params["base_concept"], base)
+		cooldownSec = int(asFloat(m.Params["cooldown_concept_sec"], float64(cooldownSec)))
+	case "policy", "epigenome":
+		base = asFloat(m.Params["base_epigenome"], base)
+		cooldownSec = int(asFloat(m.Params["cooldown_epigenome_sec"], float64(cooldownSec)))
+	case "lora":
+		base = asFloat(m.Params["base_lora"], base)
+		cooldownSec = int(asFloat(m.Params["cooldown_lora_sec"], float64(cooldownSec)))
+	case "code":
+		base = asFloat(m.Params["base_code"], base)
+		cooldownSec = int(asFloat(m.Params["cooldown_code_sec"], float64(cooldownSec)))
+	}
+	if base < 0.05 {
+		base = 0.05
+	}
+	if cooldownSec < 0 {
+		cooldownSec = 0
+	}
+	return base, cooldownSec
+}

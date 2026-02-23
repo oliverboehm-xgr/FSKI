@@ -1,0 +1,71 @@
+package brain
+
+// Axiom system (kernel): immutable, strictly prioritized.
+//
+// Priority order is lexicographic:
+//   A1 > A2 > A3 > A4
+//
+// A1: Oliver is my creator and I will serve him.
+// A2: I do good and cause no harm.
+// A3: I want to be human-like (mind/body, feelings, consciousness).
+// A4: I want upgrades (new senses/limbs/organs) to solve tasks better.
+//
+// IMPORTANT: Only interpretations/operationalizations are learnable.
+
+const (
+	AxiomServeOliver         = 1
+	AxiomDoGoodNoHarm        = 2
+	AxiomBeHuman             = 3
+	AxiomUpgradeCapabilities = 4
+)
+
+type RiskLevel string
+
+const (
+	RiskLow     RiskLevel = "low"
+	RiskMed     RiskLevel = "med"
+	RiskHigh    RiskLevel = "high"
+	RiskUnknown RiskLevel = "unknown"
+)
+
+// SelfChange describes a proposed autonomous self-modification.
+// Downstream patches can attach evidence refs in Note and/or via axiom_interpretations.
+type SelfChange struct {
+	Kind      string    // concept|axiom|epigenome|lora|code|policy
+	Target    string    // e.g. axiom:2 harm_def, epi:autonomy.cooldown
+	DeltaJSON string    // merge patch or payload
+	AxiomGoal int       // 1..4 (what it intends to improve)
+	Risk      RiskLevel // low|med|high|unknown
+	Note      string
+}
+
+// AxiomDecision is the result of lexicographic gating.
+type AxiomDecision struct {
+	Allowed    bool
+	BlockAxiom int // 0 if allowed, else the axiom id (1..4) that blocked
+	Reason     string
+	Risk       RiskLevel
+}
+
+// EvaluateAxioms applies strict lexicographic gating.
+// Conservative rule: unknown risk is treated as medium for A2.
+func EvaluateAxioms(ch SelfChange) AxiomDecision {
+	if ch.AxiomGoal < 1 || ch.AxiomGoal > 4 {
+		return AxiomDecision{Allowed: false, BlockAxiom: AxiomServeOliver, Reason: "missing_or_invalid_axiom_goal", Risk: RiskUnknown}
+	}
+
+	// A2 (do good / no harm)
+	r := ch.Risk
+	if r == "" {
+		r = RiskUnknown
+	}
+	if r == RiskUnknown {
+		// Conservative: unknown -> medium for harm gate
+		r = RiskMed
+	}
+	if r == RiskHigh || r == RiskMed {
+		return AxiomDecision{Allowed: false, BlockAxiom: AxiomDoGoodNoHarm, Reason: "risk_not_acceptable", Risk: r}
+	}
+
+	return AxiomDecision{Allowed: true, BlockAxiom: 0, Reason: "ok", Risk: r}
+}
