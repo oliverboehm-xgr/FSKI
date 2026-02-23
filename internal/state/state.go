@@ -280,6 +280,37 @@ func migrate(db *sql.DB) error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_epigenome_proposals_status ON epigenome_proposals(status);`,
 
+		// ---------- Axiom system (kernel axioms + learned interpretations) ----------
+		`CREATE TABLE IF NOT EXISTS axiom_interpretations (
+			axiom_id INTEGER NOT NULL,
+			kind TEXT NOT NULL,             -- definition|example|anti_example|metric|rule
+			key TEXT NOT NULL,              -- e.g. harm:financial, serve:task_completion
+			value TEXT NOT NULL,            -- JSON or text
+			confidence REAL NOT NULL,
+			source_note TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY(axiom_id, kind, key)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_axiom_interpretations_axiom ON axiom_interpretations(axiom_id);`,
+
+		// Every autonomous self-change is logged (for transparency + rollback).
+		`CREATE TABLE IF NOT EXISTS self_changes (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			kind TEXT NOT NULL,             -- concept|axiom|epigenome|lora|code|policy
+			target TEXT NOT NULL,           -- e.g. axiom:2 harm_def, epi:autonomy.cooldown
+			delta_json TEXT NOT NULL,       -- JSON merge patch or change payload
+			axiom_goal INTEGER NOT NULL,    -- 1..4 (what it tries to improve)
+			allowed INTEGER NOT NULL,       -- 0/1
+			axiom_block INTEGER NOT NULL,   -- 0 if allowed, else 1..4
+			risk TEXT NOT NULL,             -- low|med|high|unknown
+			energy_cost REAL NOT NULL,
+			note TEXT NOT NULL,
+			rollback_key TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_self_changes_created_at ON self_changes(created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_self_changes_kind ON self_changes(kind);`,
+
 		// ---------- A/B trials (preference data for LoRA / behavior) ----------
 		`CREATE TABLE IF NOT EXISTS ab_trials (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
