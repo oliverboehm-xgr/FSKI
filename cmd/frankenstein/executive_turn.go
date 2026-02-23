@@ -36,6 +36,9 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 	if ok, out := handleABCommands(db, eg, userText); ok {
 		return out, nil
 	}
+	if ok, out := handleLoraCommand(db, userText); ok {
+		return out, nil
+	}
 	if ok, out := handlePickCommand(db, userText); ok {
 		return out, nil
 	}
@@ -938,6 +941,123 @@ func handleABCommands(db *sql.DB, eg *epi.Epigenome, userText string) (bool, str
 	}
 }
 
+func handleLoraCommand(db *sql.DB, userText string) (bool, string) {
+	line := strings.TrimSpace(userText)
+	if !strings.HasPrefix(line, "/lora") {
+		return false, ""
+	}
+	parts := strings.Fields(line)
+	if len(parts) < 2 {
+		return true, "Use: /lora samples [N] | /lora export [N] <path> | /lora queue <base_model> [N] <out_dir> | /lora jobs [N] | /lora run <job_id>"
+	}
+	sub := strings.ToLower(strings.TrimSpace(parts[1]))
+	switch sub {
+	case "samples":
+		lim := 20
+		if len(parts) >= 3 {
+			if v, err := strconv.Atoi(strings.TrimSpace(parts[2])); err == nil && v > 0 {
+				lim = v
+			}
+		}
+		items, err := brain.ListLoRASamples(db, lim)
+		if err != nil || len(items) == 0 {
+			return true, "Keine LoRA Samples."
+		}
+		var b strings.Builder
+		b.WriteString("lora_samples (neueste zuerst):\n")
+		for _, it := range items {
+			b.WriteString("- #" + fmt.Sprint(it.ID) + " " + it.CreatedAt + " (prompt=" + clipShort(it.Prompt, 40) + ")\n")
+		}
+		return true, strings.TrimSpace(b.String())
+	case "export":
+		if len(parts) < 3 {
+			return true, "Use: /lora export [N] <path>"
+		}
+		lim := 2000
+		path := ""
+		if len(parts) == 3 {
+			path = strings.TrimSpace(parts[2])
+		} else {
+			if v, err := strconv.Atoi(strings.TrimSpace(parts[2])); err == nil && v > 0 {
+				lim = v
+			}
+			path = strings.TrimSpace(parts[3])
+		}
+		n, err := brain.ExportLoRASamplesJSONL(db, lim, path)
+		if err != nil {
+			return true, "ERR: " + err.Error()
+		}
+		return true, fmt.Sprintf("OK. Exported %d samples to %s", n, path)
+	case "queue":
+		if len(parts) < 4 {
+			return true, "Use: /lora queue <base_model> [N] <out_dir>"
+		}
+		baseModel := strings.TrimSpace(parts[2])
+		lim := 2000
+		outDir := ""
+		if len(parts) == 4 {
+			outDir = strings.TrimSpace(parts[3])
+		} else {
+			if v, err := strconv.Atoi(strings.TrimSpace(parts[3])); err == nil && v > 0 {
+				lim = v
+			}
+			outDir = strings.TrimSpace(parts[4])
+		}
+		dsPath := filepath.Join(outDir, "dataset.jsonl")
+		if _, err := brain.ExportLoRASamplesJSONL(db, lim, dsPath); err != nil {
+			return true, "ERR export: " + err.Error()
+		}
+		jobID, err := brain.QueueLoRAJob(db, baseModel, dsPath, outDir, "queued via /lora queue")
+		if err != nil {
+			return true, "ERR queue: " + err.Error()
+		}
+		return true, fmt.Sprintf("OK. queued job #%d (base=%s, dataset=%s, out=%s)", jobID, baseModel, dsPath, outDir)
+	case "jobs":
+		lim := 25
+		if len(parts) >= 3 {
+			if v, err := strconv.Atoi(strings.TrimSpace(parts[2])); err == nil && v > 0 {
+				lim = v
+			}
+		}
+		jobs, err := brain.ListLoRAJobs(db, lim)
+		if err != nil || len(jobs) == 0 {
+			return true, "Keine LoRA Jobs."
+		}
+		var b strings.Builder
+		b.WriteString("lora_jobs (neueste zuerst):\n")
+		for _, j := range jobs {
+			b.WriteString(fmt.Sprintf("- #%d [%s] base=%s out=%s\n", j.ID, j.Status, j.BaseModel, j.OutDir))
+		}
+		return true, strings.TrimSpace(b.String())
+	case "run":
+		if len(parts) < 3 {
+			return true, "Use: /lora run <job_id>"
+		}
+		id := parseID(parts[2])
+		if id <= 0 {
+			return true, "Bad id."
+		}
+		log, err := brain.RunLoRAJob(db, id)
+		if err != nil {
+			return true, "ERR: " + err.Error() + "\n" + clipShort(log, 1200)
+		}
+		return true, "OK.\n" + clipShort(log, 1600)
+	default:
+		return true, "Use: /lora samples [N] | /lora export [N] <path> | /lora queue <base_model> [N] <out_dir> | /lora jobs [N] | /lora run <job_id>"
+	}
+}
+
+func clipShort(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	if n <= 3 {
+		return s[:n]
+	}
+	return s[:n-3] + "..."
+}
+
 func handlePickCommand(db *sql.DB, userText string) (bool, string) {
 	line := strings.TrimSpace(userText)
 	if !strings.HasPrefix(line, "/pick") {
@@ -1070,6 +1190,19 @@ func handlePickCommand(db *sql.DB, userText string) (bool, string) {
 	}
 	if err := brain.ChooseABTrial(db, id, choice2); err != nil {
 		return true, "ERR: " + err.Error()
+	}
+	// collect LoRA preference sample (legacy AB)
+	if choice2 == "a" || choice2 == "b" {
+		ch := ""
+		rj := ""
+		if choice2 == "a" {
+			ch = t.AText
+			rj = t.BText
+		} else {
+			ch = t.BText
+			rj = t.AText
+		}
+		brain.InsertLoRASample(db, "AB_TRIAL "+t.Prompt, ch, rj, "")
 	}
 	switch choice2 {
 	case "a":
