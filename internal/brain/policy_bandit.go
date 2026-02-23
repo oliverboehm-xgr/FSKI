@@ -101,6 +101,10 @@ func ChoosePolicy(db *sql.DB, ctx string) PolicyChoice {
 	for _, act := range DefaultPolicyActions {
 		a, b := ensureStat(db, ctx, act)
 		s := sampleBeta(a, b)
+		// "Synapse" bias: learned strategy preference in [-1..1].
+		// We bias gently to preserve exploration.
+		p := GetPreference(db, "strat:"+act, 0)
+		s = clamp01(s + 0.12*p)
 		if s > bestS {
 			bestS = s
 			bestA = act
@@ -109,13 +113,34 @@ func ChoosePolicy(db *sql.DB, ctx string) PolicyChoice {
 	if bestA == "" {
 		bestA = "direct_answer"
 	}
-	style := "direct"
+	// Axiom guardrail (A2: no harm): EXTERNAL_FACT must not be answered without evidence.
+	if strings.HasPrefix(ctx, "EXTERNAL_FACT") && bestA == "direct_answer" {
+		bestA = "research_then_answer"
+	}
+
+	// Style selection with gentle preference bias.
+	baseStyle := "direct"
 	if strings.Contains(ctx, "soc_hi") {
-		style = "warm"
+		baseStyle = "warm"
 	}
 	if strings.Contains(ctx, "sv_hi") {
-		style = "concise"
+		baseStyle = "concise"
 	}
+	styles := []string{"direct", "warm", "concise"}
+	bestStyle := baseStyle
+	bestStyleScore := 0.5
+	for _, st := range styles {
+		score := 0.4
+		if st == baseStyle {
+			score = 0.5
+		}
+		score += 0.20 * GetPreference(db, "style:"+st, 0)
+		if score > bestStyleScore {
+			bestStyleScore = score
+			bestStyle = st
+		}
+	}
+	style := bestStyle
 	return PolicyChoice{ContextKey: ctx, Action: bestA, Style: style}
 }
 

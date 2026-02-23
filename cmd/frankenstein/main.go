@@ -629,7 +629,7 @@ Antworte NUR als JSON:
 			if body.Energy > 100 {
 				body.Energy = 100
 			}
-			ws.EnergyHint = dr1.Energy
+			ws.EnergyHint = body.Energy
 			ws.DrivesEnergyDeficit = dr1.Survival
 			ws.SocialCraving = 1.0 - dr1.SocSat
 			ws.UrgeInteractHint = dr1.UrgeInteract
