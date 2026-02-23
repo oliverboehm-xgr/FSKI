@@ -8,4 +8,10 @@ type SpeakRequest struct {
 	ConceptSummary string
 	CurrentThought string
 	SelfModelJSON  string
+	RecentTurns    string
+	ThoughtSnips   string
+	EpisodeSummary string
+	RecallDetails  string
+	RecallConcepts string
+	WebGlanceJSON  string
 }

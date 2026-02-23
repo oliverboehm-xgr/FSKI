@@ -92,10 +92,14 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"tick_ms": 500,
 			}},
 			"daydream": {Type: "daydream", Enabled: true, Params: map[string]any{
-				"interval_seconds": 20,
-				"min_curiosity":    0.45,
-				"min_energy":       8,
-				"visual_weight":    0.55, // how visual vs verbal the thought is (0..1)
+				"interval_seconds":         20,
+				"min_curiosity":            0.45,
+				"min_energy":               8,
+				"visual_weight":            0.55, // how visual vs verbal the thought is (0..1)
+				"web_chance":               0.15,
+				"web_max_results":          3,
+				"web_min_interval_seconds": 900,
+				"history_k":                8,
 			}},
 			"critic": {Type: "critic", Enabled: true, Params: map[string]any{
 				"enabled":       true,
@@ -1013,6 +1017,50 @@ func (eg *Epigenome) DaydreamParams() (intervalSec int, minCuriosity float64, mi
 	}
 	if visualWeight > 1 {
 		visualWeight = 1
+	}
+	return
+}
+
+// DaydreamExtraParams configures the optional "web glance" and history depth.
+func (eg *Epigenome) DaydreamExtraParams() (webChance float64, webMaxResults int, webMinIntervalSec int, historyK int) {
+	webChance = 0.15
+	webMaxResults = 3
+	webMinIntervalSec = 900
+	historyK = 8
+	if eg == nil {
+		return
+	}
+	m := eg.Modules["daydream"]
+	if m == nil || !m.Enabled || m.Params == nil {
+		return
+	}
+	webChance = asFloat(m.Params["web_chance"], webChance)
+	if webChance < 0 {
+		webChance = 0
+	}
+	if webChance > 1 {
+		webChance = 1
+	}
+	webMaxResults = int(asFloat(m.Params["web_max_results"], float64(webMaxResults)))
+	if webMaxResults < 0 {
+		webMaxResults = 0
+	}
+	if webMaxResults > 8 {
+		webMaxResults = 8
+	}
+	webMinIntervalSec = int(asFloat(m.Params["web_min_interval_seconds"], float64(webMinIntervalSec)))
+	if webMinIntervalSec < 0 {
+		webMinIntervalSec = 0
+	}
+	if webMinIntervalSec > 86400 {
+		webMinIntervalSec = 86400
+	}
+	historyK = int(asFloat(m.Params["history_k"], float64(historyK)))
+	if historyK < 0 {
+		historyK = 0
+	}
+	if historyK > 20 {
+		historyK = 20
 	}
 	return
 }

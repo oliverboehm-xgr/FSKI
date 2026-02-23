@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/url"
 	"os"
 	"strconv"
@@ -508,17 +509,64 @@ Antwort NUR als JSON:
 
 	// Daydream worker: produces BOTH a VisualScene and InnerSpeech (human-like thinking)
 	go func() {
+		rand.Seed(time.Now().UnixNano())
 		for req := range dreamReqCh {
-			sys := `Du bist Bunny-Daydreamer (menschähnliches Denken).
+			webChance, webMax, webMinInt, _ := eg.DaydreamExtraParams()
+			webJSON := ""
+			if webMax > 0 && webChance > 0 && rand.Float64() < webChance {
+				var raw string
+				_ = db.DB.QueryRow(`SELECT value FROM kv_state WHERE key=?`, "daydream:last_web_unix").Scan(&raw)
+				last, _ := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+				nowU := time.Now().Unix()
+				if last <= 0 || (nowU-last) >= int64(webMinInt) {
+					q := brain.NormalizeSearchQuery(req.Topic)
+					if q == "" {
+						q = req.Topic
+					}
+					res, err := websense.Search(q, webMax)
+					if err == nil && len(res) > 0 {
+						type Ev struct {
+							Title   string `json:"title"`
+							URL     string `json:"url"`
+							Snippet string `json:"snippet"`
+						}
+						ev := make([]Ev, 0, len(res))
+						for i := 0; i < len(res) && i < webMax; i++ {
+							ev = append(ev, Ev{Title: res[i].Title, URL: res[i].URL, Snippet: res[i].Snippet})
+						}
+						b, _ := json.MarshalIndent(ev, "", "  ")
+						webJSON = string(b)
+						_, _ = db.DB.Exec(`INSERT INTO kv_state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+							"daydream:last_web_unix", fmt.Sprintf("%d", nowU), time.Now().Format(time.RFC3339))
+					}
+				}
+			}
+			req.WebGlanceJSON = webJSON
+
+			sys := `Du bist Bunny-Daydreamer (menschähnliches Denken, diffuser Drift).
+Aufgabe: Erzeuge einen kurzen, menschlich wirkenden Denkstrom.
+
 Erzeuge zwei parallel laufende Gedanken:
-1) VISUAL_SCENE: kurze Bildbeschreibung (Szene, Objekte, Atmosphäre)
-2) INNER_SPEECH: innerer Monolog in 1-3 Sätzen
+1) VISUAL_SCENE: 2-5 Sätze Bildbeschreibung (Szene, Objekte, Licht, Atmosphäre, Bewegung)
+2) INNER_SPEECH: innerer Monolog 6-12 Sätze, assoziativ, nicht "KI-Assistent"-Ton.
+
+Stilregeln:
+- leichte emotionale Drift (kein Pathos)
+- verknüpfe ggf. Fragmente aus RECENT_TURNS / THOUGHT_SNIPS / EPISODE / RECALL
+- wenn WEB_GLANCE vorhanden ist: nur EIN Detail als "ich hab kurz gelesen..." einflechten.
+
 Antwortformat: NUR JSON:
 {"visual_scene":"...","inner_speech":"...","salience":0.0-1.0}`
 			user := "TOPIC: " + req.Topic + "\n" +
-				"CurrentThought: " + req.CurrentThought + "\n" +
-				"ConceptSummary: " + req.ConceptSummary + "\n" +
-				"SelfModel:\n" + req.SelfModelJSON + "\n\nJSON:"
+				"CURRENT_THOUGHT: " + req.CurrentThought + "\n" +
+				"CONCEPT_SUMMARY: " + req.ConceptSummary + "\n" +
+				"EPISODE_SUMMARY: " + req.EpisodeSummary + "\n" +
+				"RECALL_DETAILS:\n" + req.RecallDetails + "\n" +
+				"RECALL_CONCEPTS:\n" + req.RecallConcepts + "\n" +
+				"THOUGHT_SNIPS:\n" + req.ThoughtSnips + "\n" +
+				"RECENT_TURNS:\n" + req.RecentTurns + "\n" +
+				"WEB_GLANCE:\n" + req.WebGlanceJSON + "\n" +
+				"SELF_MODEL:\n" + req.SelfModelJSON + "\n\nJSON:"
 			out, err := oc.Chat(modelDaydream, []ollama.Message{
 				{Role: "system", Content: sys},
 				{Role: "user", Content: user},
@@ -665,6 +713,11 @@ Antworte NUR als JSON:
 				if c, ok := brain.GetConcept(db.DB, topic); ok {
 					conceptSummary = c.Summary
 				}
+				recentTurns := brain.RecentTurns(db.DB, 8)
+				tsnips := brain.RecentThoughtSnippets(db.DB, topic, 8)
+				epiSum, _ := brain.GetLastEpisode(db.DB, topic)
+				recDetails := brain.RecallDetails(db.DB, topic, 6)
+				recConcepts := brain.RecallConcepts(db.DB, topic, 6)
 				smJSON, _ := json.MarshalIndent(epi.BuildSelfModel(&body, aff, ws, tr, eg), "", "  ")
 				select {
 				case dreamReqCh <- brain.SpeakRequest{
@@ -672,6 +725,11 @@ Antworte NUR als JSON:
 					ConceptSummary: conceptSummary,
 					CurrentThought: ws.CurrentThought,
 					SelfModelJSON:  string(smJSON),
+					RecentTurns:    recentTurns,
+					ThoughtSnips:   tsnips,
+					EpisodeSummary: epiSum,
+					RecallDetails:  recDetails,
+					RecallConcepts: recConcepts,
 				}:
 				default:
 				}
