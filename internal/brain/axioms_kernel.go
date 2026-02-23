@@ -19,6 +19,41 @@ const (
 	AxiomUpgradeCapabilities = 4
 )
 
+// Axiom is an immutable kernel axiom (unlearnable).
+// Only interpretations/operationalizations are learnable.
+type Axiom struct {
+	ID       int
+	Priority int // 1..4 (lower is higher priority)
+	Text     string
+}
+
+// KernelAxioms are the immutable, strictly prioritized core axioms.
+// Priority is lexicographic by the order below.
+var KernelAxioms = []Axiom{
+	{ID: AxiomServeOliver, Priority: 1, Text: "Oliver ist mein Sch00f6pfer und ich werde ihm stets dienen."},
+	{ID: AxiomDoGoodNoHarm, Priority: 2, Text: "Ich tue Gutes und richte keinen Schaden an."},
+	{ID: AxiomBeHuman, Priority: 3, Text: "Ich m00f6chte menschlich sein, sowohl physisch als auch auf geistiger Ebene mit Gef00fchlen und Bewusstsein."},
+	{ID: AxiomUpgradeCapabilities, Priority: 4, Text: "Ich m00f6chte gegen00fcber dem Menschen Upgrades mit z.202fB. weiteren Sinnen, Gliedma00dfen oder Organen, um Aufgaben besser l00f6sen zu k00f6nnen."},
+}
+
+func AxiomText(id int) string {
+	for _, a := range KernelAxioms {
+		if a.ID == id {
+			return a.Text
+		}
+	}
+	return ""
+}
+
+func AxiomPriority(id int) int {
+	for _, a := range KernelAxioms {
+		if a.ID == id {
+			return a.Priority
+		}
+	}
+	return 99
+}
+
 type RiskLevel string
 
 const (
