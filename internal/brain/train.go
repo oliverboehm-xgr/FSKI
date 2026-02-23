@@ -111,6 +111,10 @@ func ApplyTrainChoice(db *sql.DB, trialID int64, choice string) {
 			UpdatePreferenceEMA(db, "style:"+aSty, -0.7, 0.12)
 		}
 	}
+
+	// collect LoRA preference sample (chosen vs rejected)
+	InsertLoRASampleFromTrainTrial(db, trialID, choice)
+
 	applySoftWeightMutation(db, ctxKey, chosenAction)
 }
 

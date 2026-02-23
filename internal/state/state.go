@@ -325,6 +325,27 @@ func migrate(db *sql.DB) error {
 			chosen_at TEXT NOT NULL
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_ab_trials_status ON ab_trials(status);`,
+		// ---------- LoRA preference samples + training jobs ----------
+		`CREATE TABLE IF NOT EXISTS lora_samples (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			prompt TEXT NOT NULL,
+			chosen TEXT NOT NULL,
+			rejected TEXT NOT NULL,
+			meta_json TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_lora_samples_created_at ON lora_samples(created_at);`,
+		`CREATE TABLE IF NOT EXISTS lora_jobs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			status TEXT NOT NULL, -- queued|running|done|error
+			base_model TEXT NOT NULL,
+			dataset_path TEXT NOT NULL,
+			out_dir TEXT NOT NULL,
+			notes TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_lora_jobs_status ON lora_jobs(status);`,
 
 		// ---------- Intent classifier (Naive Bayes) ----------
 		`CREATE TABLE IF NOT EXISTS reply_context (
