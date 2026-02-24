@@ -1,22 +1,28 @@
 from __future__ import annotations
-import json, time
+
+import json
+import time
 from dataclasses import dataclass
 from typing import List
+
 from .events import Event
 from .state import StateVector, Why, now_iso
 from .db import DB
 from .integrator import Integrator
+
 
 @dataclass
 class HeartbeatConfig:
     tick_hz: float = 2.0
     snapshot_every_n_ticks: int = 1
 
+
 class Heartbeat:
     """The only loop that mutates state_current.
 
     External code enqueues events; heartbeat integrates them into S(t).
     """
+
     def __init__(self, db: DB, integrator: Integrator, cfg: HeartbeatConfig):
         self.db = db
         self.integrator = integrator
@@ -27,10 +33,13 @@ class Heartbeat:
     def enqueue(self, ev: Event) -> None:
         ev = ev.with_time()
         self._queue.append(ev)
+
         con = self.db.connect()
         try:
-            con.execute("INSERT INTO event_log(event_type,payload_json,created_at) VALUES(?,?,?)",
-                        (ev.event_type, ev.payload_json(), ev.created_at))
+            con.execute(
+                "INSERT INTO event_log(event_type,payload_json,created_at) VALUES(?,?,?)",
+                (ev.event_type, ev.payload_json(), ev.created_at),
+            )
             con.commit()
         finally:
             con.close()
@@ -46,39 +55,59 @@ class Heartbeat:
         con = self.db.connect()
         try:
             row = con.execute("SELECT vec_json FROM state_current WHERE id=1").fetchone()
+
+            # Initialize state if missing
             if row is None:
                 s = StateVector.zeros(self._axis_dim())
-                con.execute("INSERT OR REPLACE INTO state_current(id,vec_json,updated_at) VALUES(1,?,?)",
-                            (s.to_json(), now_iso()))
+                con.execute(
+                    "INSERT OR REPLACE INTO state_current(id,vec_json,updated_at) VALUES(1,?,?)",
+                    (s.to_json(), now_iso()),
+                )
                 con.commit()
                 return s
-            
-s = StateVector.from_json(row["vec_json"])
-dim = self._axis_dim()
-if s.dim() != dim:
-    # Schema evolves by adding axes; pad/truncate deterministically.
-    if s.dim() < dim:
-        s.values = list(s.values) + [0.0] * (dim - s.dim())
-    else:
-        s.values = list(s.values)[:dim]
-    con.execute("UPDATE state_current SET vec_json=?, updated_at=? WHERE id=1",
-                (s.to_json(), now_iso()))
-    con.commit()
-return s
+
+            # Load & reconcile dimension with axes registry
+            s = StateVector.from_json(row["vec_json"])
+            dim = self._axis_dim()
+
+            if s.dim() != dim:
+                # Schema evolves by adding axes; pad/truncate deterministically.
+                if s.dim() < dim:
+                    s.values = list(s.values) + [0.0] * (dim - s.dim())
+                else:
+                    s.values = list(s.values)[:dim]
+
+                con.execute(
+                    "UPDATE state_current SET vec_json=?, updated_at=? WHERE id=1",
+                    (s.to_json(), now_iso()),
+                )
+                con.commit()
+
+            return s
         finally:
             con.close()
 
     def save_state(self, s: StateVector, why: List[Why]) -> None:
         con = self.db.connect()
         try:
-            con.execute("INSERT OR REPLACE INTO state_current(id,vec_json,updated_at) VALUES(1,?,?)",
-                        (s.to_json(), now_iso()))
-            if self.cfg.snapshot_every_n_ticks > 0 and (self._tick % self.cfg.snapshot_every_n_ticks == 0):
-                con.execute("INSERT INTO state_snapshots(vec_json,why_json,tags_json,created_at) VALUES(?,?,?,?)",
-                            (s.to_json(),
-                             json.dumps([w.to_dict() for w in why], ensure_ascii=False),
-                             "[]",
-                             now_iso()))
+            con.execute(
+                "INSERT OR REPLACE INTO state_current(id,vec_json,updated_at) VALUES(1,?,?)",
+                (s.to_json(), now_iso()),
+            )
+
+            if self.cfg.snapshot_every_n_ticks > 0 and (
+                self._tick % self.cfg.snapshot_every_n_ticks == 0
+            ):
+                con.execute(
+                    "INSERT INTO state_snapshots(vec_json,why_json,tags_json,created_at) VALUES(?,?,?,?)",
+                    (
+                        s.to_json(),
+                        json.dumps([w.to_dict() for w in why], ensure_ascii=False),
+                        "[]",
+                        now_iso(),
+                    ),
+                )
+
             con.commit()
         finally:
             con.close()
@@ -87,6 +116,7 @@ return s
         s = self.load_state()
         events = self._queue
         self._queue = []
+
         s2, why = self.integrator.tick(s, events)
         self.save_state(s2, why)
         self._tick += 1

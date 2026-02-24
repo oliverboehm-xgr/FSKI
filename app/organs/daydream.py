@@ -4,8 +4,9 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from app.net import http_post_json
 
-import requests
+
 
 
 @dataclass
@@ -28,9 +29,10 @@ def _ollama_chat(cfg: OllamaConfig, system: str, user: str) -> str:
             {"role": "user", "content": user},
         ],
     }
-    r = requests.post(url, json=payload, timeout=120)
-    r.raise_for_status()
-    data = r.json()
+    status, txt = http_post_json(url, payload, timeout=120)
+    if status >= 400:
+        raise RuntimeError(f"ollama /api/chat HTTP {status}: {txt[:200]}")
+    data = json.loads(txt or "{}")
     msg = data.get("message") or {}
     return (msg.get("content") or "").strip()
 

@@ -1,0 +1,300 @@
+{
+  "version": 1,
+  "modules": {
+    "auto_speak": {
+      "type": "auto_speak",
+      "enabled": true,
+      "params": {
+        "cooldown_seconds": 18
+      }
+    },
+    "autonomy": {
+      "type": "autonomy",
+      "enabled": true,
+      "params": {
+        "cooldown_seconds": 60,
+        "idle_seconds": 45,
+        "min_talk_drive": 0.55,
+        "topic_k": 5
+      }
+    },
+    "cooldown": {
+      "type": "cooldown",
+      "enabled": true,
+      "params": {
+        "seconds": 120
+      }
+    },
+    "cortex_bus": {
+      "type": "cortex_bus",
+      "enabled": true,
+      "params": {
+        "tick_ms": 500
+      }
+    },
+    "critic": {
+      "type": "critic",
+      "enabled": true,
+      "params": {
+        "enabled": true,
+        "max_sentences": 8
+      }
+    },
+    "daydream": {
+      "type": "daydream",
+      "enabled": true,
+      "params": {
+        "interval_seconds": 20,
+        "min_curiosity": 0.45,
+        "min_energy": 8,
+        "visual_weight": 0.55
+      }
+    },
+    "drives_v1": {
+      "type": "drives_v1",
+      "enabled": true,
+      "params": {
+        "disk_path": "C:\\",
+        "disk_target_bytes": 10000000000,
+        "ema_caught": 0.2,
+        "ema_user_reward": 0.12,
+        "help_min_interval_seconds": 180,
+        "k_cpu": 3,
+        "k_disk": 4,
+        "k_ram": 5,
+        "latency_target_ms": 2500,
+        "ram_target_bytes": 3000000000,
+        "tau_social_seconds": 1200,
+        "w_cpu": 0.2,
+        "w_disk": 0.3,
+        "w_err": 0.05,
+        "w_lat": 0.15,
+        "w_ram": 0.3
+      }
+    },
+    "energy": {
+      "type": "energy",
+      "enabled": true,
+      "params": {
+        "max": 100
+      }
+    },
+    "heartbeat": {
+      "type": "heartbeat",
+      "enabled": true,
+      "params": {
+        "ms": 500
+      }
+    },
+    "info_gate": {
+      "type": "info_gate",
+      "enabled": true,
+      "params": {
+        "enabled": true,
+        "idf_2char_threshold": 3,
+        "idf_threshold": 1,
+        "min_info": 0.33,
+        "min_tokens": 1,
+        "stopword_ratio": 0.35
+      }
+    },
+    "intent_nb": {
+      "type": "intent_nb",
+      "enabled": true,
+      "params": {
+        "alpha": 1,
+        "enabled": true,
+        "min_tokens": 2,
+        "threshold": 0.72
+      }
+    },
+    "intent_router": {
+      "type": "intent_router",
+      "enabled": true,
+      "params": {
+        "rules": [
+          {
+            "contains": [
+              "wie geht",
+              "energie",
+              "cooldown",
+              "status",
+              "was denkst"
+            ],
+            "intent": "META_BUNNY",
+            "name": "meta_self",
+            "priority": 100
+          },
+          {
+            "contains": [
+              "recherch",
+              "im internet",
+              "nachsehen",
+              "quelle",
+              "quellen"
+            ],
+            "intent": "RESEARCH_CMD",
+            "name": "explicit_research",
+            "priority": 95
+          },
+          {
+            "contains": [
+              "meinung",
+              "haltung",
+              "position",
+              "gut oder schlecht",
+              "findest du"
+            ],
+            "intent": "OPINION",
+            "name": "opinion_request",
+            "priority": 90
+          },
+          {
+            "contains": [
+              "wetter",
+              "vorhersage",
+              "wo liegt",
+              "wo ist",
+              "wer ist",
+              "aktuell",
+              "kurs",
+              "preis"
+            ],
+            "intent": "EXTERNAL_FACT",
+            "name": "external_fact",
+            "priority": 70
+          },
+          {
+            "contains": [
+              "patch",
+              "github",
+              "go ",
+              "sqlite",
+              "ollama",
+              "fski"
+            ],
+            "intent": "TASK_TECH",
+            "name": "task_tech",
+            "priority": 50
+          }
+        ]
+      }
+    },
+    "locale": {
+      "type": "locale",
+      "enabled": true,
+      "params": {
+        "lang": "de"
+      }
+    },
+    "memory": {
+      "type": "memory",
+      "enabled": true,
+      "params": {
+        "auto_tune": true,
+        "consolidate_every_events": 8,
+        "context_turns": 6,
+        "detail_half_life_days": 6,
+        "detail_items": 6,
+        "episode_half_life_days": 120,
+        "latency_pain_ms": 2500
+      }
+    },
+    "models": {
+      "type": "models",
+      "enabled": true,
+      "params": {
+        "critic": "llama3.2:3b",
+        "daydream": "llama3.1:8b",
+        "default": "llama3.1:8b",
+        "hippocampus": "llama3.2:3b",
+        "scout": "llama3.2:3b",
+        "speaker": "llama3.1:8b",
+        "stance": "llama3.1:8b"
+      }
+    },
+    "ollama_manager": {
+      "type": "ollama_manager",
+      "enabled": true,
+      "params": {
+        "auto_pull": false,
+        "auto_start": true,
+        "enabled": true,
+        "max_models_to_pull": 3,
+        "pull_timeout_sec": 1800,
+        "start_retries": 20,
+        "start_retry_ms": 250
+      }
+    },
+    "say_energy_cost": {
+      "type": "say_energy_cost",
+      "enabled": true,
+      "params": {
+        "cost": 1
+      }
+    },
+    "scout": {
+      "type": "scout",
+      "enabled": true,
+      "params": {
+        "interval_seconds": 45,
+        "max_per_hour": 24,
+        "min_curiosity": 0.55
+      }
+    },
+    "stance": {
+      "type": "stance",
+      "enabled": true,
+      "params": {
+        "auto_update": true,
+        "half_life_days": 60,
+        "min_confidence": 0.35
+      }
+    },
+    "utterance_filter": {
+      "type": "utterance_filter",
+      "enabled": true,
+      "params": {
+        "banned_phrases": []
+      }
+    },
+    "values": {
+      "type": "values",
+      "enabled": true,
+      "params": {
+        "curiosity": 0.6,
+        "fairness": 0.8,
+        "minimize_suffering": 1,
+        "stability": 0.6,
+        "truthfulness": 1
+      }
+    }
+  },
+  "affect_defs": {
+    "fear": {
+      "baseline": 0,
+      "decayPerSec": 0.03,
+      "energyCoupling": 0
+    },
+    "pain": {
+      "baseline": 0.05,
+      "decayPerSec": 0.2,
+      "energyCoupling": 0.15
+    },
+    "shame": {
+      "baseline": 0,
+      "decayPerSec": 0.03,
+      "energyCoupling": 0
+    },
+    "sorrow": {
+      "baseline": 0.02,
+      "decayPerSec": 0.01,
+      "energyCoupling": 0
+    },
+    "unwell": {
+      "baseline": 0.05,
+      "decayPerSec": 0.15,
+      "energyCoupling": 0.1
+    }
+  }
+}

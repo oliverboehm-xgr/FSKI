@@ -29,7 +29,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
-import requests
 
 from bunnycore.core.db import init_db, DB
 from bunnycore.core.registry import ensure_axes
@@ -46,6 +45,7 @@ from bunnycore.core.matrices import identity
 from app.organs.websense import search_ddg, spider, SpiderBudget
 from app.organs.decider import decide as decide_pressures, OllamaConfig as DeciderConfig
 from app.organs.daydream import run_daydream, OllamaConfig as DaydreamConfig
+from app.net import http_post_json
 
 
 # -----------------------------
@@ -70,9 +70,12 @@ def ollama_chat(cfg: OllamaConfig, system: str, user: str) -> str:
             {"role": "user", "content": user},
         ],
     }
-    r = requests.post(url, json=payload, timeout=120)
-    r.raise_for_status()
-    data = r.json()
+    status, txt = http_post_json(url, payload, timeout=120)
+    if status == 0:
+        raise RuntimeError(txt)
+    if status >= 400:
+        raise RuntimeError(f"ollama /api/chat HTTP {status}: {txt[:200]}")
+    data = json.loads(txt or "{}")
     msg = data.get("message") or {}
     return (msg.get("content") or "").strip()
 
@@ -162,6 +165,21 @@ def db_list_messages(db: DB, limit: int) -> List[Dict[str, Any]]:
                 "rating": None if r["rating"] is None else int(r["rating"]),
                 "caught": int(r["caught"] or 0),
             })
+        return out
+    finally:
+        con.close()
+
+
+def db_get_memory_short(db: DB, limit: int = 12) -> List[Dict[str, Any]]:
+    """Return last N short-memory items (chronological order)."""
+    con = db.connect()
+    try:
+        rows = con.execute(
+            "SELECT role,content,created_at FROM memory_short ORDER BY id DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        out = [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in rows]
+        out.reverse()
         return out
     finally:
         con.close()
@@ -756,15 +774,15 @@ class Kernel:
                 "Be honest about uncertainty. If you don't have evidence, say so."
             )
             
-mem_items = db_get_memory_short(self.db, limit=14)
-mem_ctx = render_memory_context(mem_items)
-mem_block = f"\n\nMEMORY_SHORT:\n{mem_ctx}" if mem_ctx else ""
-
-user_prompt = (
-    f"INTERNAL_STATE: {self._state_summary()}{mem_block}\n\n"
-    f"USER: {text}{ws_context}\n\n"
-    "Reply as Bunny (German is ok if the user writes German)."
-)
+            mem_items = db_get_memory_short(self.db, limit=14)
+            mem_ctx = render_memory_context(mem_items)
+            mem_block = f"\n\nMEMORY_SHORT:\n{mem_ctx}" if mem_ctx else ""
+            
+            user_prompt = (
+                f"INTERNAL_STATE: {self._state_summary()}{mem_block}\n\n"
+                f"USER: {text}{ws_context}\n\n"
+                "Reply as Bunny (German is ok if the user writes German)."
+            )
 
             try:
                 out = ollama_chat(self.cfg, sys_prompt, user_prompt)
@@ -1021,8 +1039,7 @@ def main() -> int:
         pass
     return 0
 
-if __name__ == "__main__":
-    raise SystemExit(main()def db_get_memory_short(db: DB, limit: int = 12) -> List[Dict[str, Any]]:
+def db_get_memory_short(db: DB, limit: int = 12) -> List[Dict[str, Any]]:
     con = db.connect()
     try:
         rows = con.execute(
@@ -1051,4 +1068,7 @@ def render_memory_context(items: List[Dict[str, Any]]) -> str:
             lines.append(f"{prefix}: {c}")
     return "\n".join(lines)
 
-)
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

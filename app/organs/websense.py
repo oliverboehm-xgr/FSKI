@@ -5,9 +5,10 @@ import re
 import time
 from dataclasses import dataclass
 from typing import List, Optional
+from app.net import http_get
+
 from urllib.parse import urlparse, urljoin, quote_plus, parse_qs
 
-import requests
 
 
 @dataclass
@@ -126,9 +127,11 @@ def search_ddg(query: str, k: int = 6, timeout_s: float = 12.0) -> List[SearchRe
     last_err: Optional[str] = None
     for kind, u in endpoints:
         try:
-            r = requests.get(u, headers=DEFAULT_HEADERS, timeout=timeout_s, allow_redirects=True)
-            r.raise_for_status()
-            page = r.text or ""
+            resp = http_get(u, headers=DEFAULT_HEADERS, timeout=timeout_s)
+            if resp.status == 0 or resp.status >= 400:
+                last_err = f"ddg_http_{resp.status}" if resp.status else resp.text
+                continue
+            page = resp.text or ""
             low = page.lower()
 
             # Basic block/captcha detection
@@ -154,10 +157,11 @@ def fetch(url: str, timeout_s: float = 12.0) -> FetchResult:
     if not pu.scheme:
         raise ValueError("fetch: missing scheme")
 
-    r = requests.get(url_n, headers=DEFAULT_HEADERS, timeout=timeout_s)
-    r.raise_for_status()
-    ct = (r.headers.get("Content-Type") or "").lower()
-    raw = r.text
+    resp = http_get(url_n, headers=DEFAULT_HEADERS, timeout=timeout_s)
+    if resp.status == 0 or resp.status >= 400:
+        raise RuntimeError(f"fetch_http_{resp.status}: {resp.text[:120]}")
+    ct = (resp.content_type or "").lower()
+    raw = resp.text
 
     if "text/plain" in ct:
         text = re.sub(r"\s+", " ", raw.replace("\u00a0", " ")).strip()
@@ -228,14 +232,15 @@ def spider(seeds: List[str], bud: Optional[SpiderBudget] = None) -> List[FetchRe
             continue
 
         try:
-            r = requests.get(u, headers=DEFAULT_HEADERS, timeout=bud.timeout_s)
-            r.raise_for_status()
-            raw = r.text
+            resp = http_get(u, headers=DEFAULT_HEADERS, timeout=bud.timeout_s)
+            if resp.status == 0 or resp.status >= 400:
+                continue
+            raw = resp.text
             used += len(raw.encode("utf-8", errors="ignore"))
             if used >= bud.max_bytes_total:
                 break
 
-            ct = (r.headers.get("Content-Type") or "").lower()
+            ct = (resp.content_type or "").lower()
             if "text/html" in ct or ct == "":
                 for lk in _extract_links(raw, u, bud.max_links_per_page):
                     lk_n = _normalize_result_url(lk)

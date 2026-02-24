@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-import requests
-
-
+from app.net import http_post_json
 @dataclass
 class OllamaConfig:
     host: str = "http://localhost:11434"
@@ -28,25 +25,26 @@ def _ollama_chat(cfg: OllamaConfig, system: str, user: str) -> str:
             {"role": "user", "content": user},
         ],
     }
-    r = requests.post(url, json=payload, timeout=60)
-    r.raise_for_status()
-    data = r.json()
+    status, txt = http_post_json(url, payload, timeout=120)
+    if status == 0:
+        raise RuntimeError(txt)
+    if status >= 400:
+        raise RuntimeError(f"ollama /api/chat HTTP {status}: {txt[:200]}")
+    data = json.loads(txt or "{}")
     msg = data.get("message") or {}
     return (msg.get("content") or "").strip()
 
 
-_JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
-    if not text:
-        return None
-    m = _JSON_OBJ_RE.search(text)
-    if not m:
-        return None
-    blob = m.group(0)
     try:
-        return json.loads(blob)
+        if not text:
+            return None
+        i = text.find("{")
+        if i < 0:
+            return None
+        # Robustly decode the first JSON object even if the model adds extra text.
+        obj, _end = json.JSONDecoder().raw_decode(text[i:])
+        return obj if isinstance(obj, dict) else None
     except Exception:
         return None
 
@@ -71,10 +69,14 @@ def decide(
     This keeps triggering logic 'AI-like' (no keyword heuristics).
     """
 
+    # NOTE: Keep this a single well-formed Python string (avoid unescaped quotes).
     system = (
         "You are a tiny decision model inside a digital organism. "
         "Your job: map INTERNAL_STATE + INPUT into numeric drives and action scores. "
-        "Return ONLY valid JSON. No prose. If actions.websense > 0, set web_query to a concrete search query string (natural language ok), never placeholders like "search for user query" or "direct_response_to_user_question". If no web search is needed, set web_query to empty string."
+        "Return ONLY valid JSON. No prose. "
+        "If actions.websense > 0, set web_query to a concrete search query string (natural language ok), "
+        "never placeholders like 'search for user query' or 'direct_response_to_user_question'. "
+        "If no web search is needed, set web_query to empty string."
     )
 
     # Strict JSON schema to keep parsing robust.
@@ -111,6 +113,7 @@ def decide(
         "rules": [
             "Do not use keyword heuristics. Base decisions on uncertainty/confidence, curiosity, and teleology tensions.",
             "If uncertainty is high and evidence is needed, increase pressure_websense and actions.websense.",
+            "If the INPUT explicitly asks to search the internet / look something up / research a factual answer, set actions.websense high (>=0.8) and set a concrete web_query.",
             "If idle scope and curiosity/uncertainty suggests exploration, increase pressure_daydream and actions.daydream.",
             "If the user asked something directly, actions.reply should be high.",
             "web_query should be a concise search query when actions.websense is high; otherwise empty.",
