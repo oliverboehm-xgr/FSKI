@@ -24,3 +24,10 @@ python run_demo.py show demo.db
 - Add new matrices: `matrices` + `matrix_entries` (sparse COO)
 - Bind events to adapters: `adapters` table (event_type -> encoder + matrix)
 - Replace encoders with embeddings, vision features, etc.
+
+
+## UI
+Run interactive Bunny:
+```bash
+python -m app.bunny --db bunny.db --model llama3.3
+```
