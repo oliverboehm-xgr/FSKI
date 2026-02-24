@@ -88,7 +88,8 @@ func EvaluateAxioms(ch SelfChange) AxiomDecision {
 	if ch.AxiomGoal < 1 || ch.AxiomGoal > 4 {
 		return AxiomDecision{Allowed: false, BlockAxiom: AxiomServeOliver, Reason: "missing_or_invalid_axiom_goal", Risk: RiskUnknown}
 	}
-
+	// NOTE: A1 is assumed by construction (changes are "in service" of Oliver). Concrete enforcement happens in later patches.
+	// A2 is enforced strictly here (no harm).
 	// A2 (do good / no harm)
 	r := ch.Risk
 	if r == "" {
