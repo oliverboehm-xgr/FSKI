@@ -82,22 +82,23 @@ def _decode_ddg_redirect(ddg: str) -> str:
         return ddg
 
 
-def search_ddg(query: str, k: int = 6, timeout_s: float = 12.0) -> List[SearchResult]:
-    """DuckDuckGo HTML search. V1 robust enough for our needs (no API key)."""
-    k = max(1, int(k or 6))
-    u = "https://duckduckgo.com/html/?q=" + quote_plus(query)
-    r = requests.get(u, headers=DEFAULT_HEADERS, timeout=timeout_s)
-    r.raise_for_status()
-    page = r.text
+def _ddg_parse_html(page: str, k: int) -> List[SearchResult]:
+    # Newer DDG HTML variants can differ slightly; support a few patterns.
+    # 1) Standard: <a class="result__a" href="...">Title</a>
+    re_a1 = re.compile(r'(?is)<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>')
+    a = re_a1.findall(page)
 
-    re_a = re.compile(r'(?is)<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>')
-    a = re_a.findall(page)
+    # 2) Fallback: sometimes title anchor uses "result__url" wrapper
+    if not a:
+        re_a2 = re.compile(r'(?is)<a[^>]*href="([^"]+)"[^>]*class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>')
+        a = re_a2.findall(page)
 
+    # Snippets
     snippets: List[str] = []
-    re_s1 = re.compile(r'(?is)<a[^>]*class="result__snippet"[^>]*>(.*?)</a>')
+    re_s1 = re.compile(r'(?is)<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>')
     snippets = [_strip_html(x) for x in re_s1.findall(page)[:k]]
     if not snippets:
-        re_s2 = re.compile(r'(?is)<div[^>]*class="result__snippet"[^>]*>(.*?)</div>')
+        re_s2 = re.compile(r'(?is)<div[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</div>')
         snippets = [_strip_html(x) for x in re_s2.findall(page)[:k]]
 
     out: List[SearchResult] = []
@@ -107,6 +108,43 @@ def search_ddg(query: str, k: int = 6, timeout_s: float = 12.0) -> List[SearchRe
         snip = snippets[i] if i < len(snippets) else ""
         out.append(SearchResult(title=title, url=url, snippet=snip))
     return out
+
+
+def search_ddg(query: str, k: int = 6, timeout_s: float = 12.0) -> List[SearchResult]:
+    """DuckDuckGo HTML search (no API key). Tries multiple DDG HTML endpoints and parses several variants.
+
+    Raises RuntimeError on block/captcha or when no results are extractable.
+    """
+    k = max(1, int(k or 6))
+    # Two endpoints; the html.duckduckgo.com host often works when duckduckgo.com/html is blocked.
+    endpoints = [
+        "https://duckduckgo.com/html/?q=" + quote_plus(query),
+        "https://html.duckduckgo.com/html/?q=" + quote_plus(query),
+    ]
+
+    last_err: Optional[str] = None
+    for u in endpoints:
+        try:
+            r = requests.get(u, headers=DEFAULT_HEADERS, timeout=timeout_s, allow_redirects=True)
+            r.raise_for_status()
+            page = r.text or ""
+            low = page.lower()
+
+            # Basic block/captcha detection
+            if "captcha" in low or "unusual traffic" in low or "verify you are a human" in low:
+                raise RuntimeError("ddg_block_or_captcha")
+
+            out = _ddg_parse_html(page, k)
+            if out:
+                return out
+
+            # If HTML endpoint returned an empty template, treat as failure so caller can react.
+            last_err = "ddg_no_results"
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    raise RuntimeError(last_err or "ddg_search_failed")
 
 
 def fetch(url: str, timeout_s: float = 12.0) -> FetchResult:

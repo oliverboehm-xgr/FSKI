@@ -90,13 +90,27 @@ def run_daydream(
             "learning_targets": ["list of things to learn / clarify"],
             "web_queries": ["0-5 concise search queries"],
             "questions_for_user": ["0-3 crisp questions"],
-            "drives": {"pressure_daydream": "-1..1", "pressure_websense": "-1..1", "curiosity": "-1..1", "uncertainty": "-1..1"},
+            "drives": {
+                "pressure_daydream": "-1..1",
+                "pressure_websense": "-1..1",
+                "curiosity": "-1..1",
+                "uncertainty": "-1..1",
+                "purpose_a1": "-1..1",
+                "purpose_a2": "-1..1",
+                "purpose_a3": "-1..1",
+                "purpose_a4": "-1..1",
+                "tension_a1": "-1..1",
+                "tension_a2": "-1..1",
+                "tension_a3": "-1..1",
+                "tension_a4": "-1..1"
+            },
         },
         "rules": [
             "No canned assistant talk.",
             "Axioms are goals; reinterpretations must preserve their meaning but can refine details.",
             "If you propose web_queries, make them specific and researchable.",
             "Drives: use small deltas, not huge swings.",
+            "If your axiom_interpretations suggest a new emphasis, reflect it in purpose_* and/or tension_* deltas.",
         ],
     }
 

@@ -114,6 +114,7 @@ def decide(
             "If idle scope and curiosity/uncertainty suggests exploration, increase pressure_daydream and actions.daydream.",
             "If the user asked something directly, actions.reply should be high.",
             "web_query should be a concise search query when actions.websense is high; otherwise empty.",
+            "Always include pressure_websense and pressure_daydream in drives (use 0 if no change).",
             "All numbers must be valid JSON numbers.",
         ],
     }

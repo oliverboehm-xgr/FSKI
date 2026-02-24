@@ -1,4 +1,5 @@
-import sys
+from __future__ import annotations
+
 """Bunny UI server (stdlib HTTP + SSE) with speech organ and teleology hints.
 
 Run:
@@ -14,7 +15,7 @@ Endpoints match the old Go UI:
   GET  /sse              Server-Sent Events stream (message/status)
 """
 
-from __future__ import annotations
+import sys
 
 import argparse
 import json
@@ -442,8 +443,10 @@ class Kernel:
         self._lock = threading.Lock()
 
         # activation thresholds (generic; tunable via env)
-        self.th_websense = float(os.environ.get("BUNNY_TH_WEBSENSE", "0.55"))
-        self.th_daydream = float(os.environ.get("BUNNY_TH_DAYDREAM", "0.55"))
+        # NOTE: default tuned to be less conservative than earlier drafts so the system actually
+        # uses organs with typical decider outputs (~0.4-0.7). Can be overridden via env.
+        self.th_websense = float(os.environ.get("BUNNY_TH_WEBSENSE", "0.45"))
+        self.th_daydream = float(os.environ.get("BUNNY_TH_DAYDREAM", "0.45"))
         self.idle_period_s = float(os.environ.get("BUNNY_IDLE_PERIOD", "6"))
         self.idle_cooldown_s = float(os.environ.get("BUNNY_IDLE_COOLDOWN", "30"))
         self._last_idle_action = 0.0
@@ -479,6 +482,24 @@ class Kernel:
 
             db_add_decision(self.db, "idle", last_user, decision)
             drives = decision.get("drives") if isinstance(decision.get("drives"), dict) else {}
+            actions = decision.get("actions") if isinstance(decision.get("actions"), dict) else {}
+            # Contract normalization: if the decider gives actions but omits the corresponding
+            # pressure deltas, promote actions into pressure drives (keeps logic AI-driven,
+            # avoids keyword heuristics, and prevents "no-op" decisions).
+            try:
+                ws_a = float(actions.get("websense", 0.0) or 0.0)
+            except Exception:
+                ws_a = 0.0
+            try:
+                dd_a = float(actions.get("daydream", 0.0) or 0.0)
+            except Exception:
+                dd_a = 0.0
+            if ws_a > 0.0:
+                prev = float(drives.get("pressure_websense", 0.0) or 0.0) if isinstance(drives, dict) else 0.0
+                drives["pressure_websense"] = max(prev, ws_a)
+            if dd_a > 0.0:
+                prev = float(drives.get("pressure_daydream", 0.0) or 0.0) if isinstance(drives, dict) else 0.0
+                drives["pressure_daydream"] = max(prev, dd_a)
             if drives:
                 self.hb.enqueue(Event("decision", {"drives": drives}).with_time())
                 self.hb.step()
@@ -505,6 +526,11 @@ class Kernel:
             # WebSense (idle) only if explicitly requested by decider with a non-empty query.
             if float(((decision.get("actions") or {}).get("websense") or 0.0)) >= self.th_websense:
                 q = (decision.get("web_query") or "").strip()
+                # normalize useless placeholders into a usable query (no heuristics: we reuse anchor context)
+                if q.lower() in ("search for user query", "direct_response_to_user_question"):
+                    q = ""
+                if not q:
+                    q = last_user.strip()
                 if q:
                     try:
                         results = search_ddg(q, k=4)
@@ -520,7 +546,7 @@ class Kernel:
                                 "domain": p.domain,
                                 "hash": p.hash,
                             }, ok=1)
-                        self.hb.enqueue(Event("websense", {"pages": len(pages), "domains": len(unique_domains), "ok": 1, "query": q}).with_time())
+                        self.hb.enqueue(Event("websense", {"pages": len(pages), "domains": len(unique_domains), "ok": int(ok_flag), "query": q}).with_time())
                         self.hb.step()
                         self.broker.publish("status", db_status(self.db))
                         self._last_idle_action = time.time()
@@ -593,6 +619,23 @@ class Kernel:
 
             db_add_decision(self.db, "user", text, decision)
             drives = decision.get("drives") if isinstance(decision.get("drives"), dict) else {}
+            actions = decision.get("actions") if isinstance(decision.get("actions"), dict) else {}
+            # Contract normalization (same rationale as in autonomous_tick): ensure the pressure axes
+            # are actually driven when the decider intends to use an organ.
+            try:
+                ws_a = float(actions.get("websense", 0.0) or 0.0)
+            except Exception:
+                ws_a = 0.0
+            try:
+                dd_a = float(actions.get("daydream", 0.0) or 0.0)
+            except Exception:
+                dd_a = 0.0
+            if ws_a > 0.0:
+                prev = float(drives.get("pressure_websense", 0.0) or 0.0) if isinstance(drives, dict) else 0.0
+                drives["pressure_websense"] = max(prev, ws_a)
+            if dd_a > 0.0:
+                prev = float(drives.get("pressure_daydream", 0.0) or 0.0) if isinstance(drives, dict) else 0.0
+                drives["pressure_daydream"] = max(prev, dd_a)
             if drives:
                 self.hb.enqueue(Event("decision", {"drives": drives}).with_time())
 
@@ -615,6 +658,8 @@ class Kernel:
             # Primary gate: pressure axis. Secondary: action score.
             want_web = (p_ws >= self.th_websense) or (float(((decision.get("actions") or {}).get("websense") or 0.0)) >= self.th_websense)
             query = (decision.get("web_query") or "").strip()
+            if query.lower() in ("search for user query", "direct_response_to_user_question"):
+                query = ""
             if not query:
                 # Generic fallback (not a heuristic; just a usable default).
                 query = text
@@ -624,6 +669,9 @@ class Kernel:
                     results = search_ddg(query, k=4)
                     seeds = [r.url for r in results[:2] if r.url]
                     pages = spider(seeds, SpiderBudget(max_pages=4, per_domain_max=2, max_links_per_page=10)) if seeds else []
+
+                    ok_flag = 1 if len(results) > 0 else 0
+                    err_reason = "" if ok_flag else "no_results"
 
                     # persist + build context (short, LLM-friendly)
                     unique_domains = {p.domain for p in pages if p.domain}
@@ -635,7 +683,7 @@ class Kernel:
                             "body": p.body,
                             "domain": p.domain,
                             "hash": p.hash,
-                        }, ok=1)
+                        }, ok=ok_flag)
 
                     ctx_lines = []
                     for i, p in enumerate(pages[:4], start=1):
@@ -647,13 +695,13 @@ class Kernel:
                     ws_payload = {
                         "pages": len(pages),
                         "domains": len(unique_domains),
-                        "ok": 1,
+                        "ok": int(ok_flag),
                         "query": query,
                     }
                     self.hb.enqueue(Event("websense", ws_payload).with_time())
 
                     # UI-visible trace (like main branch): show that WebSense actually ran.
-                    aid = db_add_message(self.db, "auto", f"[websense] query=\"{query}\" results={len(results)} pages={len(pages)} domains={len(unique_domains)} ok=1")
+                    aid = db_add_message(self.db, "auto", f"[websense] query=\"{query}\" results={len(results)} pages={len(pages)} domains={len(unique_domains)} ok={int(ok_flag)} reason={err_reason}")
                     self.broker.publish("message", self._ui_message(aid))
                 except Exception as e:
                     # record failure as event; do not break the main flow
