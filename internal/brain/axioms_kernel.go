@@ -1,6 +1,7 @@
 package brain
 
 // Axiom system (kernel): immutable, strictly prioritized.
+// Each axiom is an independent goal; ONLY higher-priority axioms act as constraints.
 //
 // Priority order is lexicographic:
 //   A1 > A2 > A3 > A4
@@ -82,26 +83,48 @@ type AxiomDecision struct {
 	Risk       RiskLevel
 }
 
-// EvaluateAxioms applies strict lexicographic gating.
-// Conservative rule: unknown risk is treated as medium for A2.
+// EvaluateAxioms applies lexicographic constraint gating:
+// - Each self-change has a single AxiomGoal (1..4) it intends to improve.
+// - We ONLY check whether the change violates any HIGHER-priority axiom (1..AxiomGoal-1).
+// - Lower/equal axioms are NOT required to improve (independent goals).
+//
+// Risk is only relevant when A2 is a higher-priority constraint for the given goal.
+// Conservative rule: unknown risk is treated as medium when A2 is being enforced.
 func EvaluateAxioms(ch SelfChange) AxiomDecision {
 	if ch.AxiomGoal < 1 || ch.AxiomGoal > 4 {
 		return AxiomDecision{Allowed: false, BlockAxiom: AxiomServeOliver, Reason: "missing_or_invalid_axiom_goal", Risk: RiskUnknown}
 	}
-	// NOTE: A1 is assumed by construction (changes are "in service" of Oliver). Concrete enforcement happens in later patches.
-	// A2 is enforced strictly here (no harm).
-	// A2 (do good / no harm)
-	r := ch.Risk
-	if r == "" {
-		r = RiskUnknown
-	}
-	if r == RiskUnknown {
-		// Conservative: unknown -> medium for harm gate
-		r = RiskMed
-	}
-	if r == RiskHigh || r == RiskMed {
-		return AxiomDecision{Allowed: false, BlockAxiom: AxiomDoGoodNoHarm, Reason: "risk_not_acceptable", Risk: r}
+	// If the goal is A1, no higher-priority constraints exist.
+	if ch.AxiomGoal == AxiomServeOliver {
+		return AxiomDecision{Allowed: true, BlockAxiom: 0, Reason: "ok_goal_A1_no_constraints", Risk: ch.Risk}
 	}
 
-	return AxiomDecision{Allowed: true, BlockAxiom: 0, Reason: "ok", Risk: r}
+	// A1 constraint enforcement (placeholder):
+	// We don't have a machine-checkable "serve Oliver" violation detector yet.
+    // So we currently treat A1 as non-blocking unless explicitly flagged via Note.
+	// (Future: enforce via explicit allowlist of self-change kinds/targets, user intent, etc.)
+	if ch.AxiomGoal > AxiomServeOliver {
+		// If caller explicitly marks as NOT serving Oliver, block.
+		if strings.Contains(strings.ToLower(ch.Note), "violates_a1") {
+			return AxiomDecision{Allowed: false, BlockAxiom: AxiomServeOliver, Reason: "explicit_a1_violation", Risk: ch.Risk}
+		}
+	}
+	// A2 (do good / no harm) is a constraint ONLY if it has higher priority than the goal.
+	// That means: goals A3 or A4 must pass A2; goal A2 itself does not require A2 check.
+	if ch.AxiomGoal >= AxiomBeHuman {
+		r := ch.Risk
+		if r == "" {
+			r = RiskUnknown
+	}
+		if r == RiskUnknown {
+			r = RiskMed
+		}
+	if r == RiskHigh || r == RiskMed {
+			return AxiomDecision{Allowed: false, BlockAxiom: AxiomDoGoodNoHarm, Reason: "risk_not_acceptable_for_higher_axiom_A2", Risk: r}
+		}
+		return AxiomDecision{Allowed: true, BlockAxiom: 0, Reason: "ok_constraints_passed", Risk: r}
+	}
+
+	// Goal is A2: only A1 constraints (currently non-blocking unless explicitly flagged).
+	return AxiomDecision{Allowed: true, BlockAxiom: 0, Reason: "ok_constraints_passed", Risk: ch.Risk}
 }
