@@ -26,6 +26,9 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 	if ok, out := handleEpiCommands(db, epiPath, eg, userText); ok {
 		return out, nil
 	}
+	if ok, out := handleAxiomCommands(db, userText); ok { 
+		return out, nil 
+	}
 	if ok, out := handleThoughtCommands(db, userText); ok {
 		return out, nil
 	}
@@ -90,6 +93,8 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		return "Hi 🙂 Willst du einfach reden oder soll ich ein Thema vorschlagen?", nil
 	}
 
+	kvIncInt(db, "metric:turns", 1)
+
 	// --- Survival gate (kernel truth) should be applied BEFORE routing/training ---
 	survival := 0.0
 	social := 0.0
@@ -104,6 +109,11 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 	intent := brain.DetectIntentHybrid(userText, eg, nb)
 	intentMode := brain.IntentToMode(intent)
 
+	// --- AxiomContext (teleological guidance) ---
+	// Keep it short: rules/metrics/definitions from axiom_interpretations.
+	if ws != nil {
+		ws.AxiomContext = brain.RenderAxiomContext(db, 1)
+	}
 	// --- Cortex sensor-gate: decide if WebSense is required ---
 	gateModel := eg.ModelFor("scout", eg.ModelFor("speaker", modelSpeaker))
 	rd := brain.DecideResearchCortex(db, oc, gateModel, userText, intent, ws, tr, dr, aff)
@@ -142,6 +152,8 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 	topic = brain.NormalizeTopic(topic)
 
 	ctxKey := brain.MakePolicyContext(intentMode, survival, social)
+	// Axiom-metrics as features for the policy bandit:
+	ctxKey = brain.AugmentPolicyContextWithAxiomMetrics(db, ctxKey)
 	choice := brain.ChoosePolicy(db, ctxKey)
 	if ws != nil {
 		ws.LastPolicyCtx = choice.ContextKey
@@ -161,7 +173,7 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		ws.LastPolicyAction = "direct_answer"
 		brain.PlanFromAction(ws, topic, "direct_answer")
 	}
-
+	kvIncInt(db, "metric:action:"+choice.Action, 1)
 	switch choice.Action {
 	case "ask_clarify":
 		if topic != "" {
@@ -173,14 +185,14 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		if ws != nil && !ws.AutonomyAllowed {
 			choice.Action = "direct_answer"
 			ws.LastPolicyAction = "direct_answer"
-			return say(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, userText)
+			return say(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, brain.ApplyAxiomContextToUserText(ws, userText))
 		}
 		if topic != "" {
 			return "Bevor ich weiterlaufe: soll ich beim Thema \"" + topic + "\" eher recherchieren, eine Haltung bilden, oder gemeinsam Optionen strukturieren?", nil
 		}
 		return "Soll ich dir gerade eher mit Fakten, einer Entscheidung oder einem Gedanken-Austausch helfen?", nil
 	case "stance_then_answer":
-		return answerWithStance(db, oc, modelStance, body, aff, ws, tr, eg, userText)
+		return answerWithStance(db, oc, modelStance, body, aff, ws, tr, eg, brain.ApplyAxiomContextToUserText(ws, userText))
 	case "research_then_answer":
 		if ws != nil && !ws.WebAllowed {
 			return "Ich würde dafür normalerweise kurz recherchieren, aber ich bin gerade im Ressourcen-Schonmodus. Gib mir bitte einen konkreten Aspekt oder eine Quelle, dann antworte ich kompakt.", nil
@@ -194,7 +206,7 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 		}
 		return answerWithEvidence(db, oc, modelSpeaker, body, aff, ws, tr, eg, q)
 	default:
-		out, err := say(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, userText)
+		out, err := say(db, epiPath, oc, modelSpeaker, modelStance, body, aff, ws, tr, dr, eg, brain.ApplyAxiomContextToUserText(ws, userText))
 		if err == nil && strings.TrimSpace(out) == "" {
 			return "Ich bin da. Sag mir kurz, was du von mir willst: Status, Meinung oder einfach reden?", nil
 		}
@@ -202,6 +214,50 @@ func ExecuteTurn(db *sql.DB, epiPath string, oc *ollama.Client, modelSpeaker, mo
 	}
 }
 
+func handleAxiomCommands(db *sql.DB, userText string) (bool, string) {
+	line := strings.TrimSpace(userText)
+	if !strings.HasPrefix(line, "/axiom") && !strings.HasPrefix(line, "/axioms") {
+		return false, ""
+	}
+	parts := strings.Fields(line)
+	if len(parts) == 1 {
+		return true, "Use: /axiom list | /axiom interp <1..4> | /axiom ctx | /axiom metrics | /axiom changes"
+	}
+	sub := strings.ToLower(strings.TrimSpace(parts[1]))
+	switch sub {
+	case "list":
+		var b strings.Builder
+		for _, a := range brain.KernelAxioms {
+			b.WriteString(fmt.Sprintf("A%d: %s\n", a.ID, a.Text))
+		}
+		return true, strings.TrimSpace(b.String())
+	case "interp":
+		if len(parts) < 3 { return true, "Use: /axiom interp <1..4>" }
+		id, _ := strconv.Atoi(strings.TrimSpace(parts[2]))
+		return true, brain.RenderAxiomInterpretations(db, id, 40)
+	case "ctx":
+		return true, brain.RenderAxiomContext(db, 2)
+	case "metrics":
+		return true, brain.RenderAxiomMetrics(db, 40)
+	case "changes":
+		return true, brain.RenderSelfChanges(db, "", 30)
+	default:
+		return true, "Use: /axiom list | /axiom interp <1..4> | /axiom ctx | /axiom metrics | /axiom changes"
+	}
+}
+
+func kvIncInt(db *sql.DB, key string, delta int) {
+	if db == nil { return }
+	key = strings.TrimSpace(key)
+	if key == "" { return }
+	now := time.Now().Format(time.RFC3339)
+	_, _ = db.Exec(
+		`INSERT INTO kv_state(key,value,updated_at) VALUES(?,?,?)
+		 ON CONFLICT(key) DO UPDATE SET value=CAST(kv_state.value AS INTEGER)+CAST(excluded.value AS INTEGER),
+		 updated_at=excluded.updated_at`,
+		key, fmt.Sprintf("%d", delta), now,
+	)
+}
 func handleCodeCommands(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, userText string) (bool, string) {
 	line := strings.TrimSpace(userText)
 	if !strings.HasPrefix(line, "/code") {
