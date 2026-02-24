@@ -87,6 +87,16 @@ func LoadOrInit(path string) (*Epigenome, error) {
 				"max_per_hour":     24,
 			}},
 
+			// Autonomous axiom learning: websense -> structured interpretations -> commit (energy cost)
+			"axiom_learning": {Type: "axiom_learning", Enabled: true, Params: map[string]any{
+				"interval_seconds":           900,
+				"min_energy":                15,
+				"min_curiosity":             0.35,
+				"max_results":               5,
+				"fetch_top_n":               2,
+				"min_interval_web_seconds":  900,
+			}},
+ 
 			// Cortex bus + human-like daydreaming (images + inner speech)
 			"cortex_bus": {Type: "cortex_bus", Enabled: true, Params: map[string]any{
 				"tick_ms": 500,
