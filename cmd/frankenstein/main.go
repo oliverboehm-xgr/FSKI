@@ -34,6 +34,19 @@ type BodyState struct {
 	AutoCooldownUntil time.Time // blocks ONLY autonomous speaking
 }
 
+// --- Energy interface for autonomous self-change metabolic costs ---
+// (CommitSelfChange uses epi.ExtractEnergy/InjectEnergy; provide explicit methods too.)
+func (b *BodyState) GetEnergy() float64 { return b.Energy }
+func (b *BodyState) SetEnergy(v float64) {
+	if v < 0 {
+		v = 0
+	}
+	if v > 100 {
+		v = 100
+	}
+	b.Energy = v
+}
+
 type SourceRecord struct {
 	URL       string `json:"url"`
 	Domain    string `json:"domain"`
@@ -688,7 +701,18 @@ Antworte NUR als JSON:
 				latEMA,
 			)
 		}
-
+		// --- Autonomous axiom learning (websense + scout) ---
+    	// This is "self-driving learning": Bunny enriches axiom_interpretations autonomously,
+		// but each commit costs energy via CommitSelfChange (metabolic brake).
+		if eg != nil && oc != nil && ws != nil {
+			if brain.ShouldRunAxiomLearning(db.DB, eg, ws, dr, aff) {
+				// Pick one axiom per run (rotating) and learn a few interpretations from web evidence.
+				ax := brain.PickNextKernelAxiom(db.DB)
+				if ax.ID > 0 {
+					_ = brain.RunAxiomLearningOnce(db.DB, oc, eg, &body, ws, ax)
+				}
+			}
+		}
 		// --- Cortex Bus Tick ---
 		bus := brain.NewBus(
 			brain.NewDaydreamArea(),
