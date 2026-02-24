@@ -174,37 +174,40 @@ func RunAxiomLearningOnce(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, body
 		q = q + " Definition Beispiele Regeln"
 	}
 
-	results, err := websense.Search(q, p.MaxResults)
-	if err != nil || len(results) == 0 {
-		return nil
-	}
+    results, err := websense.Search(q, p.MaxResults)
+    if err != nil || len(results) == 0 {
+        return nil
+    }
+    // fetch top N pages (domain-diverse + trust-ranked)
+    picked := PickEvidenceResults(db, results, p.FetchTopN)
 
-	// fetch top N pages for actual content
-	type ev struct {
-		Title   string `json:"title"`
-		URL     string `json:"url"`
-		Snippet string `json:"snippet"`
-		Body    string `json:"body"`
-	}
-	evs := make([]ev, 0, p.FetchTopN)
-	for i := 0; i < len(results) && i < p.FetchTopN; i++ {
-		u := strings.TrimSpace(results[i].URL)
-		txt := ""
-		if u != "" {
-			if b, ferr := websense.Fetch(u, 30*time.Second); ferr == nil {
-				txt = clipForContext(b.Text, 1200)
-			}
-		}
-		evs = append(evs, ev{
-			Title:   strings.TrimSpace(results[i].Title),
-			URL:     u,
-			Snippet: clipForContext(results[i].Snippet, 240),
-			Body:    txt,
-		})
-	}
-	evJSON, _ := json.MarshalIndent(evs, "", "  ")
+    type ev struct {
+       Title   string `json:"title"`
+        URL     string `json:"url"`
+        Snippet string `json:"snippet"`
+        Body    string `json:"body"`
+    }
 
-	// Use scout model to extract structured interpretations.
+    evs := make([]ev, 0, p.FetchTopN)
+    for i := 0; i < len(picked) && i < p.FetchTopN; i++ {
+        u := strings.TrimSpace(picked[i].URL)
+       txt := ""
+        if u != "" {
+            if b, ferr := websense.Fetch(u); ferr == nil {
+                txt = clipForContext(b.Text, 1200)
+            }
+        }
+
+        evs = append(evs, ev{
+            Title:   strings.TrimSpace(picked[i].Title),
+            URL:     u,
+            Snippet: clipForContext(picked[i].Snippet, 240),
+            Body:    txt,
+        })
+    }
+
+    evJSON, _ := json.MarshalIndent(evs, "", " ")
+    // Use scout model to extract structured interpretations.
 	scoutModel := eg.ModelFor("scout", eg.ModelFor("speaker", "llama3.1:8b"))
 	sys := `Du bist Bunny-Axiom-Extractor.
 Aufgabe: Aus EVIDENCE extrahiere 2-6 konkrete, operationalisierbare Interpretationen für das Axiom.
