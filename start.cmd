@@ -1,0 +1,1 @@
+python -m app.ui --db bunny.db --model llama3.1:8b --addr 127.0.0.1:8080

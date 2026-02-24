@@ -31,3 +31,14 @@ Run interactive Bunny:
 ```bash
 python -m app.bunny --db bunny.db --model llama3.3
 ```
+
+
+## Web UI (like old Go main)
+
+Run:
+
+```bash
+python -m app.ui --db bunny.db --model llama3.3 --addr 127.0.0.1:8080
+```
+
+Then open the printed URL in your browser.

@@ -15,6 +15,14 @@ DEFAULT_AXES = [
     ("social_need","social craving / interact urge"),
     ("urge_reply","reply pressure from incoming messages"),
     ("urge_share","share pressure from internal interests"),
+    ("purpose_a1","teleology: axiom A1 purpose field"),
+    ("purpose_a2","teleology: axiom A2 purpose field"),
+    ("purpose_a3","teleology: axiom A3 purpose field"),
+    ("purpose_a4","teleology: axiom A4 purpose field"),
+    ("tension_a1","teleology: axiom A1 tension"),
+    ("tension_a2","teleology: axiom A2 tension"),
+    ("tension_a3","teleology: axiom A3 tension"),
+    ("tension_a4","teleology: axiom A4 tension"),
 ]
 
 def ensure_axes(db: DB, axes: List[Tuple[str,str]] = None) -> Dict[str,int]:
