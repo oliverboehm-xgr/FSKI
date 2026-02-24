@@ -1,15 +1,11 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -242,26 +238,7 @@ func handleCodeCommands(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, userTe
 		if spec == "" {
 			return true, "Kein Inhalt vorhanden (notes+diff leer)."
 		}
-		// Optional external patch engine (wpnsxjetlit). If it fails, fall back to coder LLM.
-		engineOut := ""
-		if eg != nil {
-			if enabled, cmdLine, timeoutSec := eg.WpnsxjetlitParams(); enabled {
-				ctx := codeIndexContext(db, title, spec)
-				payload := map[string]any{
-					"title":              title,
-					"spec":               spec,
-					"code_index_context": ctx,
-					"constraints": map[string]any{
-						"format":         "unified_diff",
-						"allow_prefixes": []string{"cmd/", "internal/"},
-						"forbid":         []string{"go.mod", "go.sum"},
-					},
-				}
-				if out, err := runPatchEngine(cmdLine, payload, timeoutSec); err == nil {
-					engineOut = out
-				}
-			}
-		}
+
 		coder := selectCoderModel(oc, eg)
 		ctx := codeIndexContext(db, title, spec)
 		sys := "Du bist ein Go-Engineer. Gib NUR einen unified diff aus (git apply kompatibel). " +
@@ -292,33 +269,11 @@ func handleCodeCommands(db *sql.DB, oc *ollama.Client, eg *epi.Epigenome, userTe
 		}
 
 		// 1) sanitize / strip fences
-		out := ""
-		usedEngine := false
-		if strings.TrimSpace(engineOut) != "" {
-			out = stripCodeFences(strings.TrimSpace(engineOut))
-			usedEngine = true
-		} else {
-			o, err := draftLLM()
-			if err != nil {
-				return true, "LLM draft failed: " + err.Error()
-			}
-			out = o
+		out, err := draftLLM()
+		if err != nil {
+			return true, "LLM draft failed: " + err.Error()
 		}
-
-		// 1) sanitize / strip fences
-		out = stripCodeFences(strings.TrimSpace(out))
-
-		if retryPrompt := draftDiffRetryPrompt(out); strings.TrimSpace(retryPrompt) != "" {
-			fixOut, fixErr := oc.Chat(coder, []ollama.Message{
-				{Role: "system", Content: sys},
-				{Role: "user", Content: user},
-				{Role: "assistant", Content: out},
-				{Role: "user", Content: retryPrompt},
-			})
-			if fixErr == nil {
-				out = stripCodeFences(strings.TrimSpace(fixOut))
-			}
-		}
+		out = normalizeUnifiedDiffHunks(stripCodeFences(strings.TrimSpace(out)))
 
 		// 2) basic validation
 		out = normalizeUnifiedDiffHunks(out)
@@ -1799,52 +1754,4 @@ func handleThoughtCommands(db *sql.DB, userText string) (bool, string) {
 	default:
 		return true, "Use: /thought list | /thought show <id> | /thought materialize <id|all>"
 	}
-}
-
-// runPatchEngine calls an external patch generator (e.g. wpnsxjetlit) with a JSON payload on stdin.
-// The tool must output either a unified diff directly, or JSON {"diff":"..."}.
-func runPatchEngine(cmdLine string, payload map[string]any, timeoutSec int) (string, error) {
-	cmdLine = strings.TrimSpace(cmdLine)
-	if cmdLine == "" {
-		return "", fmt.Errorf("empty patch engine cmd")
-	}
-	if timeoutSec <= 0 {
-		timeoutSec = 25
-	}
-	b, _ := json.Marshal(payload)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
-	defer cancel()
-	var c *exec.Cmd
-	if runtime.GOOS == "windows" {
-		c = exec.CommandContext(ctx, "cmd", "/C", cmdLine)
-	} else {
-		c = exec.CommandContext(ctx, "bash", "-lc", cmdLine)
-	}
-	c.Env = os.Environ()
-	c.Stdin = bytes.NewReader(b)
-	out, err := c.CombinedOutput()
-	log := strings.TrimSpace(string(out))
-	if ctx.Err() == context.DeadlineExceeded {
-		if log == "" {
-			log = "timeout"
-		}
-		return log, fmt.Errorf("patch engine timeout")
-	}
-	if err != nil {
-		return log, err
-	}
-	if strings.Contains(log, "diff --git") {
-		return log, nil
-	}
-	// JSON envelope support
-	var obj map[string]any
-	if json.Unmarshal([]byte(log), &obj) == nil {
-		if v, ok := obj["diff"].(string); ok {
-			v = strings.TrimSpace(v)
-			if v != "" {
-				return v, nil
-			}
-		}
-	}
-	return log, nil
 }
