@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bunnycore"
+version = "0.1.0"
+description = "Frankenstein Bunny state-vector core (V1)"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools]
+packages = ["bunnycore", "bunnycore.core"]
