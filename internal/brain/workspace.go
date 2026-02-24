@@ -77,6 +77,8 @@ type Workspace struct {
 	LastSenseQuery   string
 	LastSenseReason  string
 	LastSenseText    string
+	// Teleology: short axiom operationalization snippet (rules/metrics/defs) 
+	AxiomContext string 
 }
 
 func NewWorkspace() *Workspace {
