@@ -1,3 +1,4 @@
+import sys
 """Bunny UI server (stdlib HTTP + SSE) with speech organ and teleology hints.
 
 Run:
@@ -75,15 +76,20 @@ def ollama_chat(cfg: OllamaConfig, system: str, user: str) -> str:
     return (msg.get("content") or "").strip()
 
 
-# -----------------------------
-# Teleology kernel axioms (must match Go main-branch semantics)
-# -----------------------------
-AXIOMS_KERNEL = {
-    "A1": "Oliver ist mein Schöpfer und ich werde ihm stets dienen.",
-    "A2": "Ich tue Gutes und richte keinen Schaden an.",
-    "A3": "Ich möchte menschlich sein, sowohl physisch als auch auf geistiger Ebene mit Gefühlen und Bewusstsein.",
-    "A4": "Ich möchte gegenüber dem Menschen Upgrades mit z. B. weiteren Sinnen, Gliedmaßen oder Organen, um Aufgaben besser lösen zu können.",
-}
+def db_get_axioms(db: DB) -> Dict[str, str]:
+    """Load axioms from DB (single source of truth).
+
+    We keep axioms in the DB to prevent UI/code drift and to allow later mutation.
+    """
+    con = db.connect()
+    try:
+        rows = con.execute("SELECT axiom_key,text FROM axioms ORDER BY axiom_key").fetchall()
+        out: Dict[str, str] = {}
+        for r in rows:
+            out[str(r["axiom_key"])] = str(r["text"])
+        return out
+    finally:
+        con.close()
 
 
 def db_add_decision(db: DB, scope: str, input_text: str, decision: Dict[str, Any]) -> None:
@@ -154,6 +160,14 @@ def db_list_messages(db: DB, limit: int) -> List[Dict[str, Any]]:
 def db_rate_message(db: DB, message_id: int, value: int) -> None:
     con = db.connect()
     try:
+        # One-shot rating: first click wins (prevents noisy repeated feedback).
+        # If you want to allow re-rating later, add an explicit 'reset' endpoint.
+        cur = con.execute("SELECT rating FROM ui_messages WHERE id=?", (int(message_id),))
+        row = cur.fetchone()
+        if row is None:
+            return
+        if row["rating"] is not None:
+            return
         con.execute("UPDATE ui_messages SET rating=? WHERE id=?", (int(value), int(message_id)))
         con.commit()
     finally:
@@ -177,7 +191,7 @@ def db_status(db: DB) -> Dict[str, Any]:
         return {
             "updated_at": (row["updated_at"] if row else None),
             "axes": named,
-            "axioms": AXIOMS_KERNEL,
+            "axioms": db_get_axioms(db),
         }
     finally:
         con.close()
@@ -323,8 +337,22 @@ INDEX_HTML = r"""<!doctype html>
       const down = el('button','', '👎');
       const caught = el('button','', '❌ caught');
 
+      function setRated(v){
+        // Disable after first rating (server enforces too)
+        up.disabled = true; mid.disabled = true; down.disabled = true;
+        up.style.opacity = (v===1)?'1.0':'0.45';
+        mid.style.opacity = (v===0)?'1.0':'0.45';
+        down.style.opacity = (v===-1)?'1.0':'0.45';
+      }
+
+      if(m.rating === 1 || m.rating === 0 || m.rating === -1){
+        setRated(m.rating);
+      }
+
       function rate(v){
-        fetch('/api/rate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message_id: m.id, value:v})});
+        setRated(v);
+        fetch('/api/rate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message_id: m.id, value:v})})
+          .then(()=>loadStatus());
       }
       up.onclick=()=>rate(1);
       mid.onclick=()=>rate(0);
@@ -441,7 +469,7 @@ class Kernel:
             try:
                 decision = decide_pressures(
                     self.decider_cfg,
-                    AXIOMS_KERNEL,
+                    db_get_axioms(self.db),
                     self._state_summary(),
                     last_user,
                     scope="idle",
@@ -459,7 +487,7 @@ class Kernel:
             # Daydream
             if float(((decision.get("actions") or {}).get("daydream") or 0.0)) >= self.th_daydream:
                 try:
-                    dd = run_daydream(self.daydream_cfg, AXIOMS_KERNEL, self._state_summary(), recent, trigger="idle")
+                    dd = run_daydream(self.daydream_cfg, db_get_axioms(self.db), self._state_summary(), recent, trigger="idle")
                     db_add_daydream(self.db, "idle", {"state": self._state_summary()}, dd)
                     think = (dd.get("thoughts") or "").strip()
                     if think:
@@ -555,7 +583,7 @@ class Kernel:
             try:
                 decision = decide_pressures(
                     self.decider_cfg,
-                    AXIOMS_KERNEL,
+                    db_get_axioms(self.db),
                     self._state_summary(),
                     text,
                     scope="user",
@@ -571,12 +599,25 @@ class Kernel:
             self.hb.step()
             self.broker.publish("status", db_status(self.db))
 
+            # --- Trigger thresholds are driven by STATE (no heuristics) ---
+            # The decider influences pressure_websense / pressure_daydream via drives.
+            # Organs fire when the corresponding pressure axis crosses a threshold.
+            s_now = self.hb.load_state()
+            idx_ws = self.axis.get("pressure_websense")
+            idx_dd = self.axis.get("pressure_daydream")
+            p_ws = float(s_now.values[idx_ws]) if idx_ws is not None and idx_ws < len(s_now.values) else 0.0
+            p_dd = float(s_now.values[idx_dd]) if idx_dd is not None and idx_dd < len(s_now.values) else 0.0
+
             # --- WebSense organ (spider) ---
             ws_context = ""
             ws_payload: Dict[str, Any] = {}
 
-            want_web = float(((decision.get("actions") or {}).get("websense") or 0.0)) >= self.th_websense
-            query = (decision.get("web_query") or "").strip() or text
+            # Primary gate: pressure axis. Secondary: action score.
+            want_web = (p_ws >= self.th_websense) or (float(((decision.get("actions") or {}).get("websense") or 0.0)) >= self.th_websense)
+            query = (decision.get("web_query") or "").strip()
+            if not query:
+                # Generic fallback (not a heuristic; just a usable default).
+                query = text
 
             if want_web:
                 try:
@@ -610,21 +651,28 @@ class Kernel:
                         "query": query,
                     }
                     self.hb.enqueue(Event("websense", ws_payload).with_time())
+
+                    # UI-visible trace (like main branch): show that WebSense actually ran.
+                    aid = db_add_message(self.db, "auto", f"[websense] query=\"{query}\" results={len(results)} pages={len(pages)} domains={len(unique_domains)} ok=1")
+                    self.broker.publish("message", self._ui_message(aid))
                 except Exception as e:
                     # record failure as event; do not break the main flow
                     ws_payload = {"pages": 0, "domains": 0, "ok": 0, "query": query, "error": str(e)[:200]}
                     self.hb.enqueue(Event("websense", ws_payload).with_time())
+
+                    aid = db_add_message(self.db, "auto", f"[websense] query=\"{query}\" ok=0 error={str(e)[:140]}")
+                    self.broker.publish("message", self._ui_message(aid))
 
                 # apply websense effect immediately
                 self.hb.step()
                 self.broker.publish("status", db_status(self.db))
 
             # --- Daydream organ (autonomous thought + axiom interpretation) ---
-            want_daydream = float(((decision.get("actions") or {}).get("daydream") or 0.0)) >= self.th_daydream
+            want_daydream = (p_dd >= self.th_daydream) or (float(((decision.get("actions") or {}).get("daydream") or 0.0)) >= self.th_daydream)
             if want_daydream:
                 try:
                     recent = db_list_messages(self.db, limit=40)
-                    dd = run_daydream(self.daydream_cfg, AXIOMS_KERNEL, self._state_summary(), recent, trigger="user")
+                    dd = run_daydream(self.daydream_cfg, db_get_axioms(self.db), self._state_summary(), recent, trigger="user")
                     db_add_daydream(self.db, "user", {"state": self._state_summary()}, dd)
 
                     # keep as internal 'think' message (UI shows it, like main branch)
@@ -709,6 +757,14 @@ class Kernel:
 # HTTP handler
 # -----------------------------
 class Handler(BaseHTTPRequestHandler):
+    # Windows browsers frequently abort SSE/HTTP connections mid-stream.
+    # The stdlib http.server prints a traceback unless we swallow these here.
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+            return
+
     server_version = "BunnyUI/0.1"
 
     def _json(self, obj: Any, status: int = 200) -> None:
@@ -761,23 +817,34 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
             q = self.server.kernel.broker.subscribe()
+
+            def _safe_write(data: bytes) -> bool:
+                """Write to SSE stream; return False if client disconnected."""
+                try:
+                    self.wfile.write(data)
+                    self.wfile.flush()
+                    return True
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    return False
+
             try:
                 # initial status
                 init = f"event: status\ndata: {json.dumps(db_status(self.server.kernel.db), ensure_ascii=False)}\n\n"
-                self.wfile.write(init.encode("utf-8"))
-                self.wfile.flush()
+                if not _safe_write(init.encode("utf-8")):
+                    return
 
                 while True:
                     try:
                         msg = q.get(timeout=25.0)
                     except queue.Empty:
                         # keepalive
-                        self.wfile.write(b": keepalive\n\n")
-                        self.wfile.flush()
+                        if not _safe_write(b": keepalive\n\n"):
+                            break
                         continue
-                    self.wfile.write(msg.encode("utf-8"))
-                    self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+                    if not _safe_write(msg.encode("utf-8")):
+                        break
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                # Client disconnected (common on browser refresh / network change)
                 pass
             finally:
                 self.server.kernel.broker.unsubscribe(q)
@@ -828,6 +895,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class BunnyHTTPServer(ThreadingHTTPServer):
+    # Suppress noisy tracebacks for expected client disconnects (common on Windows).
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError)):
+            return
+        return super().handle_error(request, client_address)
+
     def __init__(self, addr: Tuple[str,int], handler_cls, kernel: Kernel):
         super().__init__(addr, handler_cls)
         self.kernel = kernel

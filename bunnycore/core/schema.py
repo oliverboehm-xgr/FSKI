@@ -8,6 +8,12 @@ CREATE TABLE IF NOT EXISTS meta(
   value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS axioms(
+  axiom_key TEXT PRIMARY KEY, -- e.g. A1..A4
+  text TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS state_axes(
   axis_index INTEGER PRIMARY KEY,
   axis_name TEXT UNIQUE NOT NULL,
