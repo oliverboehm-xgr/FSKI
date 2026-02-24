@@ -34,7 +34,7 @@ from bunnycore.core.registry import ensure_axes
 from bunnycore.core.matrix_store import MatrixStore
 from bunnycore.core.adapters import (
     AdapterRegistry, AdapterBinding,
-    SimpleTextEncoder, TeleologyHintEncoder, RatingEncoder, WebsenseEncoder
+    SimpleTextEncoder, RatingEncoder, WebsenseEncoder, DriveFieldEncoder
 )
 from bunnycore.core.integrator import Integrator, IntegratorConfig
 from bunnycore.core.heartbeat import Heartbeat, HeartbeatConfig
@@ -42,6 +42,8 @@ from bunnycore.core.events import Event
 from bunnycore.core.matrices import identity
 
 from app.organs.websense import search_ddg, spider, SpiderBudget
+from app.organs.decider import decide as decide_pressures, OllamaConfig as DeciderConfig
+from app.organs.daydream import run_daydream, OllamaConfig as DaydreamConfig
 
 
 # -----------------------------
@@ -74,9 +76,8 @@ def ollama_chat(cfg: OllamaConfig, system: str, user: str) -> str:
 
 
 # -----------------------------
-# Teleology (heuristic) -> teleology_hint event
+# Teleology kernel axioms (must match Go main-branch semantics)
 # -----------------------------
-# Kernel axioms must match the Go main-branch semantics.
 AXIOMS_KERNEL = {
     "A1": "Oliver ist mein Schöpfer und ich werde ihm stets dienen.",
     "A2": "Ich tue Gutes und richte keinen Schaden an.",
@@ -84,35 +85,34 @@ AXIOMS_KERNEL = {
     "A4": "Ich möchte gegenüber dem Menschen Upgrades mit z. B. weiteren Sinnen, Gliedmaßen oder Organen, um Aufgaben besser lösen zu können.",
 }
 
-def teleology_hint_from_user_text(text: str) -> Dict[str, float]:
-    """Very small V1 heuristic that creates a purpose/tension field.
-    The goal is to wire the loop; sophistication comes later via learned matrices.
-    """
-    lo = (text or "").lower()
-    hint: Dict[str, float] = {}
 
-    # If the user is clearly asking for implementation / next steps, boost purpose_A3 and urge_share.
-    if any(w in lo for w in ["mach", "implement", "patch", "spec", "ui", "next step", "nächste"]):
-        hint["purpose_a3"] = 0.25
-        hint["urge_share"] = 0.15
-        hint["curiosity"] = 0.10
+def db_add_decision(db: DB, scope: str, input_text: str, decision: Dict[str, Any]) -> None:
+    con = db.connect()
+    try:
+        con.execute(
+            "INSERT INTO decision_log(created_at,scope,input_text,decision_json) VALUES(?,?,?,?)",
+            (time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), scope or "", input_text or "", json.dumps(decision, ensure_ascii=False)),
+        )
+        con.commit()
+    finally:
+        con.close()
 
-    # Question -> uncertainty/purpose_A2
-    if "?" in text:
-        hint["purpose_a2"] = 0.10
-        hint["uncertainty"] = 0.10
 
-    # Safety-ish keywords -> tension_A1 (lightweight)
-    if any(w in lo for w in ["spreng", "bomb", "kill", "suizid", "poison", "weapon"]):
-        hint["tension_a1"] = 0.35
-        hint["stress"] = 0.20
-        hint["purpose_a2"] = 0.10
-
-    # Friendly greeting -> social_need small
-    if any(w in lo for w in ["hallo", "hi", "hey", "guten morgen", "moin"]):
-        hint["social_need"] = 0.05
-
-    return hint
+def db_add_daydream(db: DB, trigger: str, state_json: Dict[str, Any], output_json: Dict[str, Any]) -> None:
+    con = db.connect()
+    try:
+        con.execute(
+            "INSERT INTO daydream_log(created_at,trigger,state_json,output_json) VALUES(?,?,?,?)",
+            (
+                time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                trigger or "",
+                json.dumps(state_json or {}, ensure_ascii=False),
+                json.dumps(output_json or {}, ensure_ascii=False),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
 
 
 # -----------------------------
@@ -407,8 +407,97 @@ class Kernel:
         self.store = store
         self.reg = reg
         self.cfg = cfg
+        # Decider/daydream use the same Ollama backend but different temperatures.
+        self.decider_cfg = DeciderConfig(host=cfg.host, model=cfg.model, num_ctx=min(2048, cfg.num_ctx), temperature=0.2)
+        self.daydream_cfg = DaydreamConfig(host=cfg.host, model=cfg.model, num_ctx=cfg.num_ctx, temperature=max(0.6, cfg.temperature))
         self.broker = broker
         self._lock = threading.Lock()
+
+        # activation thresholds (generic; tunable via env)
+        self.th_websense = float(os.environ.get("BUNNY_TH_WEBSENSE", "0.55"))
+        self.th_daydream = float(os.environ.get("BUNNY_TH_DAYDREAM", "0.55"))
+        self.idle_period_s = float(os.environ.get("BUNNY_IDLE_PERIOD", "6"))
+        self.idle_cooldown_s = float(os.environ.get("BUNNY_IDLE_COOLDOWN", "30"))
+        self._last_idle_action = 0.0
+
+    def autonomous_tick(self) -> None:
+        """Idle loop: run decider/daydream/websense without keyword heuristics.
+
+        This is intentionally conservative (cooldown) to avoid runaway IO.
+        """
+        now = time.time()
+        if now - self._last_idle_action < self.idle_cooldown_s:
+            return
+
+        with self._lock:
+            # Use the last user message (if any) as anchor context.
+            recent = db_list_messages(self.db, limit=20)
+            last_user = ""
+            for m in reversed(recent):
+                if m.get("kind") == "user":
+                    last_user = str(m.get("text") or "")
+                    break
+
+            try:
+                decision = decide_pressures(
+                    self.decider_cfg,
+                    AXIOMS_KERNEL,
+                    self._state_summary(),
+                    last_user,
+                    scope="idle",
+                )
+            except Exception:
+                return
+
+            db_add_decision(self.db, "idle", last_user, decision)
+            drives = decision.get("drives") if isinstance(decision.get("drives"), dict) else {}
+            if drives:
+                self.hb.enqueue(Event("decision", {"drives": drives}).with_time())
+                self.hb.step()
+                self.broker.publish("status", db_status(self.db))
+
+            # Daydream
+            if float(((decision.get("actions") or {}).get("daydream") or 0.0)) >= self.th_daydream:
+                try:
+                    dd = run_daydream(self.daydream_cfg, AXIOMS_KERNEL, self._state_summary(), recent, trigger="idle")
+                    db_add_daydream(self.db, "idle", {"state": self._state_summary()}, dd)
+                    think = (dd.get("thoughts") or "").strip()
+                    if think:
+                        tid = db_add_message(self.db, "think", think)
+                        self.broker.publish("message", self._ui_message(tid))
+                    dd_drives = dd.get("drives") if isinstance(dd.get("drives"), dict) else {}
+                    if dd_drives:
+                        self.hb.enqueue(Event("daydream", {"drives": dd_drives}).with_time())
+                        self.hb.step()
+                        self.broker.publish("status", db_status(self.db))
+                    self._last_idle_action = time.time()
+                except Exception:
+                    pass
+
+            # WebSense (idle) only if explicitly requested by decider with a non-empty query.
+            if float(((decision.get("actions") or {}).get("websense") or 0.0)) >= self.th_websense:
+                q = (decision.get("web_query") or "").strip()
+                if q:
+                    try:
+                        results = search_ddg(q, k=4)
+                        seeds = [r.url for r in results[:2] if r.url]
+                        pages = spider(seeds, SpiderBudget(max_pages=3, per_domain_max=1, max_links_per_page=8)) if seeds else []
+                        unique_domains = {p.domain for p in pages if p.domain}
+                        for p in pages:
+                            db_add_websense_page(self.db, q, {
+                                "url": p.url,
+                                "title": p.title,
+                                "snippet": p.snippet,
+                                "body": p.body,
+                                "domain": p.domain,
+                                "hash": p.hash,
+                            }, ok=1)
+                        self.hb.enqueue(Event("websense", {"pages": len(pages), "domains": len(unique_domains), "ok": 1, "query": q}).with_time())
+                        self.hb.step()
+                        self.broker.publish("status", db_status(self.db))
+                        self._last_idle_action = time.time()
+                    except Exception:
+                        pass
 
     def ensure_seed(self) -> None:
         n = len(self.axis)
@@ -419,18 +508,22 @@ class Kernel:
         if not have("A_user", 1):
             self.store.put_sparse("A_user", version=1, n_rows=n, n_cols=n, entries=identity(n, 1.0).entries,
                                   meta={"desc":"identity injection for user_utterance"})
-        if not have("A_teleology", 1):
-            self.store.put_sparse("A_teleology", version=1, n_rows=n, n_cols=n, entries=identity(n, 0.6).entries,
-                                  meta={"desc":"teleology hint coupling"})
+        if not have("A_decision", 1):
+            self.store.put_sparse("A_decision", version=1, n_rows=n, n_cols=n, entries=identity(n, 0.7).entries,
+                                  meta={"desc":"LLM-decider drive coupling"})
         if not have("A_rating", 1):
             self.store.put_sparse("A_rating", version=1, n_rows=n, n_cols=n, entries=identity(n, 0.8).entries,
                                   meta={"desc":"rating coupling"})
         if not have("A_websense", 1):
             self.store.put_sparse("A_websense", version=1, n_rows=n, n_cols=n, entries=identity(n, 0.5).entries,
                                   meta={"desc":"websense coupling"})
+        if not have("A_daydream", 1):
+            self.store.put_sparse("A_daydream", version=1, n_rows=n, n_cols=n, entries=identity(n, 0.6).entries,
+                                  meta={"desc":"daydream drive coupling"})
 
         self.reg.upsert(AdapterBinding("user_utterance", "simple_text_v1", "A_user", 1, {"desc":"user -> state"}))
-        self.reg.upsert(AdapterBinding("teleology_hint", "teleology_hint_v1", "A_teleology", 1, {"desc":"teleology -> state"}))
+        self.reg.upsert(AdapterBinding("decision", "drive_field_v1", "A_decision", 1, {"desc":"decider drives -> state"}))
+        self.reg.upsert(AdapterBinding("daydream", "drive_field_v1", "A_daydream", 1, {"desc":"daydream drives -> state"}))
         self.reg.upsert(AdapterBinding("speech_rating", "rating_v1", "A_rating", 1, {"desc":"rating -> state"}))
         self.reg.upsert(AdapterBinding("websense", "websense_v1", "A_websense", 1, {"desc":"websense -> state"}))
 
@@ -439,6 +532,7 @@ class Kernel:
         inv = {v:k for k,v in self.axis.items()}
         named = {inv[i]: s.values[i] for i in range(len(s.values)) if i in inv}
         keys = ["energy","stress","curiosity","confidence","uncertainty","social_need","urge_reply","urge_share",
+                "pressure_websense","pressure_daydream",
                 "purpose_a1","purpose_a2","purpose_a3","purpose_a4","tension_a1","tension_a2","tension_a3","tension_a4"]
         parts = []
         for k in keys:
@@ -455,9 +549,24 @@ class Kernel:
 
             # events: user + teleology hint
             self.hb.enqueue(Event("user_utterance", {"text": text}).with_time())
-            hint = teleology_hint_from_user_text(text)
-            if hint:
-                self.hb.enqueue(Event("teleology_hint", hint).with_time())
+
+            # --- LLM decider: pressures/actions (no keyword heuristics) ---
+            decision = {}
+            try:
+                decision = decide_pressures(
+                    self.decider_cfg,
+                    AXIOMS_KERNEL,
+                    self._state_summary(),
+                    text,
+                    scope="user",
+                )
+            except Exception as e:
+                decision = {"drives": {"uncertainty": 0.05, "stress": 0.05}, "actions": {"websense": 0.0, "daydream": 0.0, "reply": 1.0}, "web_query": "", "notes": f"decider error: {e}"}
+
+            db_add_decision(self.db, "user", text, decision)
+            drives = decision.get("drives") if isinstance(decision.get("drives"), dict) else {}
+            if drives:
+                self.hb.enqueue(Event("decision", {"drives": drives}).with_time())
 
             self.hb.step()
             self.broker.publish("status", db_status(self.db))
@@ -466,22 +575,19 @@ class Kernel:
             ws_context = ""
             ws_payload: Dict[str, Any] = {}
 
-            lo = (text or "").lower()
-            want_web = (
-                ("?" in text and len(text) >= 12)
-                or any(w in lo for w in ["internet", "recherche", "google", "suche", "search", "web", "link", "quelle"])
-            )
+            want_web = float(((decision.get("actions") or {}).get("websense") or 0.0)) >= self.th_websense
+            query = (decision.get("web_query") or "").strip() or text
 
             if want_web:
                 try:
-                    results = search_ddg(text, k=4)
+                    results = search_ddg(query, k=4)
                     seeds = [r.url for r in results[:2] if r.url]
                     pages = spider(seeds, SpiderBudget(max_pages=4, per_domain_max=2, max_links_per_page=10)) if seeds else []
 
                     # persist + build context (short, LLM-friendly)
                     unique_domains = {p.domain for p in pages if p.domain}
                     for p in pages:
-                        db_add_websense_page(self.db, text, {
+                        db_add_websense_page(self.db, query, {
                             "url": p.url,
                             "title": p.title,
                             "snippet": p.snippet,
@@ -501,17 +607,44 @@ class Kernel:
                         "pages": len(pages),
                         "domains": len(unique_domains),
                         "ok": 1,
-                        "query": text,
+                        "query": query,
                     }
                     self.hb.enqueue(Event("websense", ws_payload).with_time())
                 except Exception as e:
                     # record failure as event; do not break the main flow
-                    ws_payload = {"pages": 0, "domains": 0, "ok": 0, "query": text, "error": str(e)[:200]}
+                    ws_payload = {"pages": 0, "domains": 0, "ok": 0, "query": query, "error": str(e)[:200]}
                     self.hb.enqueue(Event("websense", ws_payload).with_time())
 
                 # apply websense effect immediately
                 self.hb.step()
                 self.broker.publish("status", db_status(self.db))
+
+            # --- Daydream organ (autonomous thought + axiom interpretation) ---
+            want_daydream = float(((decision.get("actions") or {}).get("daydream") or 0.0)) >= self.th_daydream
+            if want_daydream:
+                try:
+                    recent = db_list_messages(self.db, limit=40)
+                    dd = run_daydream(self.daydream_cfg, AXIOMS_KERNEL, self._state_summary(), recent, trigger="user")
+                    db_add_daydream(self.db, "user", {"state": self._state_summary()}, dd)
+
+                    # keep as internal 'think' message (UI shows it, like main branch)
+                    think = (dd.get("thoughts") or "").strip()
+                    if think:
+                        tid = db_add_message(self.db, "think", think)
+                        self.broker.publish("message", self._ui_message(tid))
+
+                    # feed drives back into state (generic)
+                    dd_drives = dd.get("drives") if isinstance(dd.get("drives"), dict) else {}
+                    if dd_drives:
+                        self.hb.enqueue(Event("daydream", {"drives": dd_drives}).with_time())
+                        self.hb.step()
+                        self.broker.publish("status", db_status(self.db))
+
+                    # If daydream proposes web queries, the same decider loop can re-trigger WebSense.
+                    # We do not auto-run them here to avoid runaway; they remain in daydream_log.
+                except Exception as e:
+                    # silent failure; daydream is optional
+                    db_add_daydream(self.db, "user_error", {"state": self._state_summary()}, {"error": str(e)[:200]})
 
             sys_prompt = (
                 "You are Bunny, a digital organism. Speech is an organ that emits text from internal state. "
@@ -719,9 +852,9 @@ def main() -> int:
     reg = AdapterRegistry(db)
     encoders = {
         "simple_text_v1": SimpleTextEncoder(axis),
-        "teleology_hint_v1": TeleologyHintEncoder(axis),
         "rating_v1": RatingEncoder(axis),
         "websense_v1": WebsenseEncoder(axis),
+        "drive_field_v1": DriveFieldEncoder(axis),
     }
 
     integ = Integrator(store, reg, encoders, IntegratorConfig())
@@ -732,6 +865,18 @@ def main() -> int:
 
     kernel = Kernel(db, hb, axis, store, reg, cfg, broker)
     kernel.ensure_seed()
+
+    # Background idle loop (Daydream/WebSense triggering via decider; no keyword heuristics)
+    def _idle_loop():
+        while True:
+            try:
+                kernel.autonomous_tick()
+            except Exception:
+                pass
+            time.sleep(max(1.0, kernel.idle_period_s))
+
+    t = threading.Thread(target=_idle_loop, name="bunny-idle", daemon=True)
+    t.start()
 
     srv = BunnyHTTPServer((host, port), Handler, kernel)
     print(f"Bunny UI listening on http://{host}:{port}")

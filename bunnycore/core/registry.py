@@ -15,6 +15,8 @@ DEFAULT_AXES = [
     ("social_need","social craving / interact urge"),
     ("urge_reply","reply pressure from incoming messages"),
     ("urge_share","share pressure from internal interests"),
+    ("pressure_websense","drive to fetch external information via WebSense"),
+    ("pressure_daydream","drive to run autonomous daydream/interpretation loops"),
     ("purpose_a1","teleology: axiom A1 purpose field"),
     ("purpose_a2","teleology: axiom A2 purpose field"),
     ("purpose_a3","teleology: axiom A3 purpose field"),

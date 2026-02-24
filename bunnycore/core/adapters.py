@@ -125,6 +125,37 @@ class WebsenseEncoder:
         return x, [Why(source="websense", note="websense_v1", data=p)]
 
 
+class DriveFieldEncoder:
+    """Generic encoder: event payload contains a dict of axis->delta.
+
+    This is used for LLM-based decision models (no hard-coded keyword triggers).
+    Payload schema:
+      {"drives": {"uncertainty": 0.1, "pressure_websense": 0.6, ...}}
+    """
+    name = "drive_field_v1"
+    def __init__(self, axis_index_by_name: Dict[str,int]):
+        self.axis = axis_index_by_name
+
+    def encode(self, state_dim: int, event: Event):
+        x = [0.0] * state_dim
+        p = event.payload or {}
+        drives = p.get("drives") if isinstance(p.get("drives"), dict) else (p if isinstance(p, dict) else {})
+        out: Dict[str, float] = {}
+        for k, v in (drives or {}).items():
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            idx = self.axis.get(str(k))
+            if idx is None or idx >= state_dim:
+                continue
+            # clamp to sane range; matrix can scale later.
+            fv = max(-1.0, min(1.0, fv))
+            x[idx] += fv
+            out[str(k)] = fv
+        return x, [Why(source="decider", note="drive_field_v1", data=out)]
+
+
 @dataclass
 class AdapterBinding:
     event_type: str

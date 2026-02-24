@@ -89,4 +89,20 @@ CREATE TABLE IF NOT EXISTS websense_pages(
   hash TEXT NOT NULL DEFAULT '',
   ok INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE TABLE IF NOT EXISTS decision_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT '', -- user|idle|daydream
+  input_text TEXT NOT NULL DEFAULT '',
+  decision_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daydream_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  trigger TEXT NOT NULL DEFAULT '',
+  state_json TEXT NOT NULL DEFAULT '{}',
+  output_json TEXT NOT NULL
+);
 '''
