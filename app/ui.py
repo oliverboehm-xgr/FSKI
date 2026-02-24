@@ -128,10 +128,18 @@ def db_add_daydream(db: DB, trigger: str, state_json: Dict[str, Any], output_jso
 def db_add_message(db: DB, kind: str, text: str) -> int:
     con = db.connect()
     try:
+        now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         cur = con.execute(
             "INSERT INTO ui_messages(created_at,kind,text) VALUES(?,?,?)",
-            (time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), kind, text),
+            (now, kind, text),
         )
+        # Short-term memory stream (like main: keep raw dialogue; summarization can be a separate organ).
+        if kind in ("user","reply"):
+            role = "user" if kind == "user" else "assistant"
+            con.execute(
+                "INSERT INTO memory_short(role,content,created_at) VALUES(?,?,?)",
+                (role, text, now),
+            )
         con.commit()
         return int(cur.lastrowid)
     finally:
@@ -747,11 +755,16 @@ class Kernel:
                 "Be natural and precise. No canned assistant phrases. "
                 "Be honest about uncertainty. If you don't have evidence, say so."
             )
-            user_prompt = (
-                f"INTERNAL_STATE: {self._state_summary()}\n\n"
-                f"USER: {text}{ws_context}\n\n"
-                "Reply as Bunny (German is ok if the user writes German)."
-            )
+            
+mem_items = db_get_memory_short(self.db, limit=14)
+mem_ctx = render_memory_context(mem_items)
+mem_block = f"\n\nMEMORY_SHORT:\n{mem_ctx}" if mem_ctx else ""
+
+user_prompt = (
+    f"INTERNAL_STATE: {self._state_summary()}{mem_block}\n\n"
+    f"USER: {text}{ws_context}\n\n"
+    "Reply as Bunny (German is ok if the user writes German)."
+)
 
             try:
                 out = ollama_chat(self.cfg, sys_prompt, user_prompt)
@@ -1009,4 +1022,33 @@ def main() -> int:
     return 0
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main()def db_get_memory_short(db: DB, limit: int = 12) -> List[Dict[str, Any]]:
+    con = db.connect()
+    try:
+        rows = con.execute(
+            "SELECT role,content,created_at FROM memory_short ORDER BY id DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        out = [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in rows]
+        out.reverse()
+        return out
+    finally:
+        con.close()
+
+def render_memory_context(items: List[Dict[str, Any]]) -> str:
+    # Keep deterministic formatting; no heuristics, only context window.
+    if not items:
+        return ""
+    lines = []
+    for it in items:
+        role = it.get("role","")
+        if role == "assistant":
+            prefix = "ASSISTANT"
+        else:
+            prefix = "USER"
+        c = (it.get("content") or "").strip()
+        if c:
+            lines.append(f"{prefix}: {c}")
+    return "\n".join(lines)
+
+)

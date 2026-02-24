@@ -118,12 +118,13 @@ def search_ddg(query: str, k: int = 6, timeout_s: float = 12.0) -> List[SearchRe
     k = max(1, int(k or 6))
     # Two endpoints; the html.duckduckgo.com host often works when duckduckgo.com/html is blocked.
     endpoints = [
-        "https://duckduckgo.com/html/?q=" + quote_plus(query),
-        "https://html.duckduckgo.com/html/?q=" + quote_plus(query),
+        ("html", "https://duckduckgo.com/html/?q=" + quote_plus(query)),
+        ("html2", "https://html.duckduckgo.com/html/?q=" + quote_plus(query)),
+        ("lite", "https://lite.duckduckgo.com/lite/?q=" + quote_plus(query)),
     ]
 
     last_err: Optional[str] = None
-    for u in endpoints:
+    for kind, u in endpoints:
         try:
             r = requests.get(u, headers=DEFAULT_HEADERS, timeout=timeout_s, allow_redirects=True)
             r.raise_for_status()
@@ -134,7 +135,7 @@ def search_ddg(query: str, k: int = 6, timeout_s: float = 12.0) -> List[SearchRe
             if "captcha" in low or "unusual traffic" in low or "verify you are a human" in low:
                 raise RuntimeError("ddg_block_or_captcha")
 
-            out = _ddg_parse_html(page, k)
+            out = _ddg_parse_lite(page, k) if kind=='lite' else _ddg_parse_html(page, k)
             if out:
                 return out
 

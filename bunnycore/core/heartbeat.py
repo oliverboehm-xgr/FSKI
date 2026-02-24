@@ -52,7 +52,19 @@ class Heartbeat:
                             (s.to_json(), now_iso()))
                 con.commit()
                 return s
-            return StateVector.from_json(row["vec_json"])
+            
+s = StateVector.from_json(row["vec_json"])
+dim = self._axis_dim()
+if s.dim() != dim:
+    # Schema evolves by adding axes; pad/truncate deterministically.
+    if s.dim() < dim:
+        s.values = list(s.values) + [0.0] * (dim - s.dim())
+    else:
+        s.values = list(s.values)[:dim]
+    con.execute("UPDATE state_current SET vec_json=?, updated_at=? WHERE id=1",
+                (s.to_json(), now_iso()))
+    con.commit()
+return s
         finally:
             con.close()
 

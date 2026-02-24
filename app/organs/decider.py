@@ -74,7 +74,7 @@ def decide(
     system = (
         "You are a tiny decision model inside a digital organism. "
         "Your job: map INTERNAL_STATE + INPUT into numeric drives and action scores. "
-        "Return ONLY valid JSON. No prose."
+        "Return ONLY valid JSON. No prose. If actions.websense > 0, set web_query to a concrete search query string (natural language ok), never placeholders like "search for user query" or "direct_response_to_user_question". If no web search is needed, set web_query to empty string."
     )
 
     # Strict JSON schema to keep parsing robust.
