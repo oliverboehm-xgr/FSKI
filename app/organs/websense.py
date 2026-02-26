@@ -111,6 +111,37 @@ def _ddg_parse_html(page: str, k: int) -> List[SearchResult]:
     return out
 
 
+def _ddg_parse_lite(page: str, k: int) -> List[SearchResult]:
+    """Parse DuckDuckGo lite HTML.
+
+    Lite pages are much simpler but vary a bit; we support a couple common patterns.
+    """
+    # Typical: <a rel="nofollow" class="result-link" href="...">Title</a>
+    re_a1 = re.compile(r'(?is)<a[^>]*class="[^"]*result-link[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>')
+    a = re_a1.findall(page)
+    if not a:
+        # Fallback: any link inside a result row.
+        re_a2 = re.compile(r'(?is)<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>')
+        a = re_a2.findall(page)
+
+    # Snippets in lite are often in <td class="result-snippet"> or plain <td>.
+    re_s1 = re.compile(r'(?is)<td[^>]*class="[^"]*result-snippet[^"]*"[^>]*>(.*?)</td>')
+    snippets = [_strip_html(x) for x in re_s1.findall(page)[:k]]
+    if not snippets:
+        re_s2 = re.compile(r'(?is)<td[^>]*>(.*?)</td>')
+        snippets = [_strip_html(x) for x in re_s2.findall(page)[:k]]
+
+    out: List[SearchResult] = []
+    for i, (href, title_html) in enumerate(a[:k]):
+        url = _normalize_result_url(href)
+        title = _strip_html(title_html)
+        snip = snippets[i] if i < len(snippets) else ""
+        if not url or not title:
+            continue
+        out.append(SearchResult(title=title, url=url, snippet=snip))
+    return out
+
+
 def search_ddg(query: str, k: int = 6, timeout_s: float = 12.0) -> List[SearchResult]:
     """DuckDuckGo HTML search (no API key). Tries multiple DDG HTML endpoints and parses several variants.
 
@@ -118,10 +149,12 @@ def search_ddg(query: str, k: int = 6, timeout_s: float = 12.0) -> List[SearchRe
     """
     k = max(1, int(k or 6))
     # Two endpoints; the html.duckduckgo.com host often works when duckduckgo.com/html is blocked.
+    # kl=de-de nudges DDG to German locale; improves results for German queries.
+    q = quote_plus(query)
     endpoints = [
-        ("html", "https://duckduckgo.com/html/?q=" + quote_plus(query)),
-        ("html2", "https://html.duckduckgo.com/html/?q=" + quote_plus(query)),
-        ("lite", "https://lite.duckduckgo.com/lite/?q=" + quote_plus(query)),
+        ("html", f"https://duckduckgo.com/html/?q={q}&kl=de-de"),
+        ("html2", f"https://html.duckduckgo.com/html/?q={q}&kl=de-de"),
+        ("lite", f"https://lite.duckduckgo.com/lite/?q={q}&kl=de-de"),
     ]
 
     last_err: Optional[str] = None

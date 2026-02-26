@@ -17,7 +17,7 @@ class StateVector:
     def copy(self) -> "StateVector":
         return StateVector(self.values.copy())
 
-    def clip(self, lo: float = -1.0, hi: float = 1.0) -> "StateVector":
+    def clip(self, lo: float = 0.0, hi: float = 1.0) -> "StateVector":
         self.values = [min(hi, max(lo, float(v))) for v in self.values]
         return self
 

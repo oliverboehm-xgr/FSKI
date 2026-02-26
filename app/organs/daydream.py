@@ -11,7 +11,8 @@ from app.net import http_post_json
 
 @dataclass
 class OllamaConfig:
-    host: str = "http://localhost:11434"
+    # Prefer IPv4 loopback to avoid Windows/MSYS IPv6 localhost quirks.
+    host: str = "http://127.0.0.1:11434"
     model: str = "llama3.3"
     temperature: float = 0.7
     num_ctx: int = 4096
@@ -92,6 +93,9 @@ def run_daydream(
             "learning_targets": ["list of things to learn / clarify"],
             "web_queries": ["0-5 concise search queries"],
             "questions_for_user": ["0-3 crisp questions"],
+            "needs": [{"need":"string","reason":"string","priority":"0..1","capability":"string|optional"}],
+            "wishes": [{"wish":"string","reason":"string","priority":"0..1","target_capability":"string|optional","axioms":["A1|A2|A3|A4"]}],
+            "proposals": [{"type":"capability_request|pipeline_change|resource_request","payload":{}}],
             "drives": {
                 "pressure_daydream": "-1..1",
                 "pressure_websense": "-1..1",

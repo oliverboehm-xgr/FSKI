@@ -8,7 +8,14 @@ from .adapters import AdapterRegistry, Encoder
 
 @dataclass
 class IntegratorConfig:
-    clip_lo: float = -1.0
+    # Indices of state axes that must not be influenced by learnable matrices.
+    protect_indices: List[int] = None
+    # Event types allowed to directly influence protected axes (besides decay).
+    protect_allow_event_types: List[str] = None
+
+    # V1 invariant: state axes live in [0,1]. Signed deltas are allowed in event encodings,
+    # but the persisted organism state is always bounded.
+    clip_lo: float = 0.0
     clip_hi: float = 1.0
     decay: float = 0.995  # scalar decay (V1). Replace with diagonal or sparse matrix later.
 
@@ -24,6 +31,10 @@ class Integrator:
         dim = state.dim()
         why: List[Why] = []
         s2 = state.copy().mul_scalar_inplace(self.cfg.decay)
+        protect = list(self.cfg.protect_indices or [])
+        allow = set(str(x) for x in (self.cfg.protect_allow_event_types or ['reward_signal']))
+        # baseline values after decay (protected axes can still decay)
+        protect_base = {i: s2.values[i] for i in protect if i < dim}
         why.append(Why(source="core", note="decay", data={"decay": self.cfg.decay}))
 
         for ev in events:
@@ -36,11 +47,28 @@ class Integrator:
                 continue
             x, wh = enc.encode(dim, ev)
             why.extend(wh)
+            # Invariant reward channel: apply encoded deltas directly without any learnable matrix.
+            # This prevents "high hacking" via matrix training.
+            if str(ev.event_type) == "reward_signal":
+                n = min(dim, len(x))
+                for i in range(n):
+                    s2.values[i] += x[i]
+                why.append(Why(source="core", note="reward_signal (direct)", data={"event_type": ev.event_type}))
+                # update baseline for protected axes because reward_signal is trusted
+                for i in protect:
+                    if i < dim:
+                        protect_base[i] = s2.values[i]
+                continue
             A = self.store.get_sparse(binding.matrix_name, binding.matrix_version)
             y = A.apply(x)
             n = min(dim, len(y))
             for i in range(n):
                 s2.values[i] += y[i]
+            # enforce protected axes invariants for any trainable channel
+            if protect and str(ev.event_type) not in allow:
+                for pi, pv in protect_base.items():
+                    if pi < dim:
+                        s2.values[pi] = pv
             why.append(Why(source="core", note="adapter", data={"event_type": ev.event_type, "matrix": f"{binding.matrix_name}@{binding.matrix_version}"}))
 
         s2.clip(self.cfg.clip_lo, self.cfg.clip_hi)

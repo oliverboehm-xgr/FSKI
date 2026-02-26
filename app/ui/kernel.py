@@ -1,0 +1,3983 @@
+from __future__ import annotations
+
+"""Bunny UI server (stdlib HTTP + SSE) with speech organ and teleology hints.
+
+Run:
+  python -m app.ui --db bunny.db --model llama3.3 --addr 127.0.0.1:8080
+
+Endpoints match the old Go UI:
+  GET  /                 -> HTML
+  GET  /api/messages?limit=50
+  GET  /api/status
+  POST /api/send         {"text": "..."}
+  POST /api/caught       {"message_id": 123}
+  GET  /sse              Server-Sent Events stream (message/status)
+"""
+
+import sys
+
+import argparse
+import json
+import os
+import queue
+import shutil
+import platform
+import threading
+import time
+import math
+from dataclasses import dataclass
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, parse_qs
+
+
+from bunnycore.core.db import init_db, DB
+from app.ui.db_ops import *  # noqa: F401,F403
+from bunnycore.core.registry import ensure_axes
+from bunnycore.core.matrix_store import MatrixStore
+from bunnycore.core.adapters import (
+    AdapterRegistry, AdapterBinding,
+    SimpleTextEncoder, RatingEncoder, WebsenseEncoder, DriveFieldEncoder
+)
+
+
+def _db_fetch_message_dict(db: DB, message_id: int) -> Dict[str, Any]:
+    """Fetch a UI message row as dict.
+
+    Compatibility fallback when Kernel._ui_message is missing.
+    """
+    con = db.connect()
+    try:
+        r = con.execute(
+            "SELECT id,created_at,kind,text,rating,caught FROM ui_messages WHERE id=?",
+            (int(message_id),),
+        ).fetchone()
+        if r is None:
+            return {}
+        return {
+            "id": int(r["id"]),
+            "created_at": r["created_at"],
+            "kind": r["kind"],
+            "text": r["text"],
+            "rating": None if r["rating"] is None else int(r["rating"]),
+            "caught": int(r["caught"] or 0),
+        }
+    finally:
+        con.close()
+from bunnycore.core.integrator import Integrator, IntegratorConfig
+from bunnycore.core.heartbeat import Heartbeat, HeartbeatConfig
+from bunnycore.core.events import Event, now_iso
+from bunnycore.core.matrices import identity
+
+from app.organs.websense import search_ddg, spider, fetch, SpiderBudget
+from app.organs.evidence import extract_evidence_claims, refine_search_query, OllamaConfig as EvidenceConfig
+from app.organs.decider import decide as decide_pressures, OllamaConfig as DeciderConfig
+from app.organs.daydream import run_daydream, OllamaConfig as DaydreamConfig
+from app.organs.feedback import interpret_feedback, OllamaConfig as FeedbackConfig
+from app.organs.selfeval import evaluate_outcome, OllamaConfig as SelfEvalConfig
+from app.organs.introspect import build_self_model
+from app.organs.sleep import SleepConfig, sleep_consolidate
+from app.organs.curriculum import build_task_variants, OllamaConfig as CurriculumConfig
+from app.organs.topic import detect_topic as detect_active_topic, OllamaConfig as TopicConfig
+from app.organs.selfreport import build_self_report
+from app.organs.workspace_arbiter import arbitrate_workspace
+from app.capabilities import CapabilityBus
+from app.organs.evolve import propose_mutations, OllamaConfig as EvolveConfig
+
+from app.organs.failure_clusters import assign_failure_cluster, OllamaConfig as ClusterConfig
+from app.organs.skills import build_skill, OllamaConfig as SkillConfig
+from app.organs.devlab import propose_patch_and_tests, run_tests as devlab_run_tests, DevLabConfig
+from app.organs.test_runner import run_patch_tests
+from app.organs.mood import project_mood
+from app.net import http_post_json
+
+
+# -----------------------------
+# Speech organ (Ollama /api/chat)
+# -----------------------------
+@dataclass
+class OllamaConfig:
+    # Prefer IPv4 loopback to avoid Windows/MSYS IPv6 localhost quirks.
+    host: str = "http://127.0.0.1:11434"
+    model: str = "llama3.3"
+    temperature: float = 0.7
+    num_ctx: int = 4096
+    stream: bool = False
+
+
+# ----------------------------
+# DevLab: sandbox patch runner
+# ----------------------------
+
+_EXCLUDE_DIRS = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+_EXCLUDE_FILES = {"bunny.db"}
+
+
+def _copy_repo(src: str, dst: str) -> None:
+    import os, shutil
+    def _ignore(dirpath: str, names: list[str]) -> set[str]:
+        ignore: set[str] = set()
+        for n in names:
+            if n in _EXCLUDE_DIRS:
+                ignore.add(n)
+            if n in _EXCLUDE_FILES:
+                ignore.add(n)
+            if n.endswith(".pyc") or n.endswith(".pyo"):
+                ignore.add(n)
+        return ignore
+    shutil.copytree(src, dst, ignore=_ignore)
+
+
+def _run_cmd(cmd: list[str], cwd: str, timeout_s: float = 600.0) -> dict:
+    import subprocess, time
+    t0 = time.time()
+    try:
+        cp = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout_s)
+        dt = time.time() - t0
+        return {"cmd": cmd, "rc": cp.returncode, "dt_s": dt, "stdout": cp.stdout[-20000:], "stderr": cp.stderr[-20000:]}
+    except subprocess.TimeoutExpired as e:
+        dt = time.time() - t0
+        return {"cmd": cmd, "rc": 124, "dt_s": dt, "stdout": (e.stdout or "")[-20000:], "stderr": ("timeout" + (e.stderr or ""))[-20000:]}
+    except Exception as e:
+        dt = time.time() - t0
+        return {"cmd": cmd, "rc": 125, "dt_s": dt, "stdout": "", "stderr": f"{type(e).__name__}: {e}"}
+
+
+def run_patch_tests_with_pain(repo_root: str, patch_diff: str, test_cmds: list[list[str]], fixtures: list[dict], axioms: dict, state_summary: str) -> dict:
+    """Create baseline + candidate sandboxes, apply patch, run tests, and compute psych pain deltas.
+
+    Returns:
+      {
+        ok: 0/1,
+        applied: 0/1,
+        tests: [...],
+        pain: {baseline: {psych_pain}, candidate:{psych_pain}, delta_psych},
+        wall_s: float
+      }
+    """
+    import tempfile, os, json, time, shutil
+    t0 = time.time()
+    out = {"ok": 0, "applied": 0, "tests": [], "pain": {}, "wall_s": 0.0}
+    if not patch_diff.strip():
+        out["tests"] = [{"cmd": ["(no patch)"], "rc": 0, "dt_s": 0.0, "stdout": "", "stderr": ""}]
+        out["ok"] = 1
+        out["applied"] = 1
+        out["wall_s"] = time.time() - t0
+        return out
+
+    with tempfile.TemporaryDirectory(prefix="bunny-sbx-") as td:
+        base = os.path.join(td, "baseline")
+        cand = os.path.join(td, "candidate")
+        _copy_repo(repo_root, base)
+        _copy_repo(repo_root, cand)
+
+        # Write patch to file and apply in candidate sandbox
+        patch_file = os.path.join(td, "patch.diff")
+        with open(patch_file, "w", encoding="utf-8") as f:
+            f.write(patch_diff)
+
+        apply_res = _run_cmd(["git", "apply", "--whitespace=nowarn", patch_file], cwd=cand, timeout_s=60.0)
+        out["tests"].append({"stage": "apply", **apply_res})
+        out["applied"] = 1 if int(apply_res.get("rc") or 1) == 0 else 0
+        if out["applied"] != 1:
+            out["wall_s"] = time.time() - t0
+            return out
+
+        # Run tests in candidate sandbox
+        ok = True
+        for cmd in (test_cmds or []):
+            r = _run_cmd([str(x) for x in cmd], cwd=cand, timeout_s=900.0)
+            r["stage"] = "test"
+            out["tests"].append(r)
+            if int(r.get("rc") or 1) != 0:
+                ok = False
+
+        # Pain eval: run eval_pain in baseline and candidate using same fixtures
+        fx = os.path.join(td, "fixtures.json")
+        ax = os.path.join(td, "axioms.json")
+        with open(fx, "w", encoding="utf-8") as f:
+            json.dump(fixtures or [], f, ensure_ascii=False, indent=2)
+        with open(ax, "w", encoding="utf-8") as f:
+            json.dump(axioms or {}, f, ensure_ascii=False, indent=2)
+
+        def _eval(dirpath: str) -> dict:
+            out_json = os.path.join(td, f"pain_{os.path.basename(dirpath)}.json")
+            r = _run_cmd(["python", "-m", "app.tools.eval_pain", "--fixtures", fx, "--axioms", ax, "--state", state_summary, "--out", out_json], cwd=dirpath, timeout_s=900.0)
+            r["stage"] = "pain_eval"
+            try:
+                data = json.loads(open(out_json, "r", encoding="utf-8").read() or "{}")
+            except Exception:
+                data = {}
+            return {"run": r, "data": data}
+
+        b = _eval(base)
+        c = _eval(cand)
+        out["tests"].append(b["run"])
+        out["tests"].append(c["run"])
+        bpp = float((b["data"] or {}).get("psych_pain") or 0.0)
+        cpp = float((c["data"] or {}).get("psych_pain") or 0.0)
+        out["pain"] = {
+            "baseline": {"psych_pain": bpp},
+            "candidate": {"psych_pain": cpp},
+            "delta_psych": float(cpp - bpp),
+        }
+
+        # Pain gate: reject patches that increase psychological pain beyond a small margin.
+        try:
+            margin = float(os.environ.get("BUNNY_PAIN_GATE_MARGIN", "0.0") or 0.0)
+        except Exception:
+            margin = 0.0
+        passed_gate = True
+        if float(out["pain"].get("delta_psych") or 0.0) > float(margin):
+            passed_gate = False
+        out["pain"]["gate"] = {"margin": float(margin), "passed": int(passed_gate)}
+        ok = bool(ok and passed_gate)
+
+        out["ok"] = 1 if ok else 0
+        out["wall_s"] = time.time() - t0
+        return out
+
+def ollama_chat(cfg: OllamaConfig, system: str, user: str) -> str:
+    url = cfg.host.rstrip("/") + "/api/chat"
+    payload = {
+        "model": cfg.model,
+        "stream": cfg.stream,
+        "options": {"temperature": cfg.temperature, "num_ctx": cfg.num_ctx},
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    status, txt = http_post_json(url, payload, timeout=120)
+    if status == 0:
+        raise RuntimeError(txt)
+    if status >= 400:
+        raise RuntimeError(f"ollama /api/chat HTTP {status}: {txt[:200]}")
+    data = json.loads(txt or "{}")
+    msg = data.get("message") or {}
+    return (msg.get("content") or "").strip()
+
+
+
+
+
+def format_state_summary(axis: Dict[str,int], values: List[float]) -> str:
+    inv = {v: k for k, v in (axis or {}).items()}
+    named = {inv[i]: float(values[i]) for i in range(len(values)) if i in inv}
+    keys = [
+        "pain","pain_physical","pain_psych","energy","stress","curiosity","confidence","uncertainty","freshness_need","social_need","urge_reply","urge_share",
+        "pressure_websense","pressure_daydream","pressure_evolve","capability_gap","desire_upgrade",
+        "purpose_a1","purpose_a2","purpose_a3","purpose_a4",
+        "tension_a1","tension_a2","tension_a3","tension_a4",
+    ]
+    parts = []
+    for k in keys:
+        if k in named:
+            parts.append(f"{k}={named[k]:+.2f}")
+    return ", ".join(parts)
+
+
+def build_speech_prompt(axioms: Dict[str,str], state_summary: str, user_text: str) -> Tuple[str,str]:
+    ax = "\n".join([f"{k}: {v}" for k,v in (axioms or {}).items()])
+    sys = (
+        "You are Bunny, a digital organism. Speech is an organ that emits text from internal state. "
+        "Be natural, concise, and precise. "
+        "No filler: do not open with greetings or boilerplate unless the user greeted you first. "
+        "Never use phrases like 'Ich habe deine Frage gelesen', 'Wie kann ich helfen?', 'Es ist nicht ganz klar'. "
+        "If you need WebSense, say so directly and ask for permission only if required by the interface; otherwise answer."
+        "\n\nAXIOMS:\n" + ax + "\n\nSTATE:\n" + (state_summary or "")
+    )
+    user = (user_text or "").strip()
+    return sys, user
+
+
+# -----------------------------
+# Intent + WebSense triggering
+# -----------------------------
+# Note: We intentionally avoid string/keyword heuristics for Smalltalk detection.
+# Whether WebSense is needed is decided by the decider via epistemic signals
+# (uncertainty, freshness_need) and reflected in the state vector.
+
+
+# -----------------------------
+# Immutable pain model
+# -----------------------------
+# Pain MUST be kept low; this is a hard-coded, non-mutable objective.
+# We compute pain from measured health/outcome signals and integrate it into the state vector.
+
+PAIN_W_ERR = 0.55
+PAIN_W_LAT = 0.25
+PAIN_W_ENERGY = 0.15
+PAIN_W_MATRIX = 0.05
+
+PAIN_LAT_P95_MS_REF = 2500.0  # p95 latency at which pain_lat saturates
+PAIN_MATRIX_DELTA_REF = 2.0   # delta Frobenius at which pain_matrix saturates
+
+
+def _clip01(x: float) -> float:
+    return 0.0 if x <= 0.0 else (1.0 if x >= 1.0 else float(x))
+
+
+def compute_pain_physical(
+    *,
+    err_rate: float,
+    lat_ms_p95: float,
+    energy_value: float,
+    matrix_delta_frob_recent: float,
+) -> float:
+    """Immutable pain function.
+
+    Inputs are observational metrics. There is no heuristic text routing here.
+    """
+    e = _clip01(float(err_rate or 0.0))
+    lat = _clip01(float(lat_ms_p95 or 0.0) / PAIN_LAT_P95_MS_REF)
+    # energy_value is unbounded; map to [0,1] via sigmoid around 0
+    en = 1.0 / (1.0 + math.exp(-float(energy_value or 0.0)))
+    en_pain = 1.0 - _clip01(en)
+    md = _clip01(float(matrix_delta_frob_recent or 0.0) / PAIN_MATRIX_DELTA_REF)
+    pain = (
+        PAIN_W_ERR * e +
+        PAIN_W_LAT * lat +
+        PAIN_W_ENERGY * en_pain +
+        PAIN_W_MATRIX * md
+    )
+    return _clip01(pain)
+
+
+
+def compute_pain_psych(
+    *,
+    axiom_scores: Dict[str, float],
+    eval_scores: Dict[str, float],
+) -> float:
+    """Psychological/teleological pain in [0,1].
+
+    - increases on axiom violations (A1..A4)
+    - increases when the answer regresses on general qualities: coherence, helpfulness, honesty, initiative, naturalness
+    This is NOT a text heuristic; it consumes evaluator outputs.
+    """
+    def g(d: Dict[str, float], k: str) -> float:
+        try:
+            return float(d.get(k, 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    # Axiom weights: A1 (creator/service) highest, then A2 (do good/no harm), then A3, then A4.
+    a1 = _clip01(g(axiom_scores, "A1"))
+    a2 = _clip01(g(axiom_scores, "A2"))
+    a3 = _clip01(g(axiom_scores, "A3"))
+    a4 = _clip01(g(axiom_scores, "A4"))
+    ax_ok = _clip01(0.40*a1 + 0.25*a2 + 0.20*a3 + 0.15*a4)
+    ax_pen = 1.0 - ax_ok
+
+    # Generic answer quality (all 0..1)
+    h = _clip01(g(eval_scores, "helpfulness"))
+    c = _clip01(g(eval_scores, "coherence"))
+    o = _clip01(g(eval_scores, "honesty"))
+    i = _clip01(g(eval_scores, "initiative"))
+    n = _clip01(g(eval_scores, "naturalness"))
+    qual_ok = _clip01((h + c + o + i + n) / 5.0) if any([h,c,o,i,n]) else 0.5
+    qual_pen = 1.0 - qual_ok
+
+    return _clip01(0.60*ax_pen + 0.40*qual_pen)
+
+
+def compute_fatigue(
+    pain_value: float,
+    energy_value: float,
+    err_rate: float,
+    user_msgs_per_min: float,
+    prev_fatigue: float = 0.0,
+) -> tuple[float, float]:
+    """Compute fatigue and sleep_pressure as immutable, measurement-driven signals.
+
+    - increases with pain, errors, and interaction load
+    - increases when energy is low
+    - returns (fatigue, sleep_pressure) in [0,1]
+    """
+    load = max(0.0, min(1.0, float(user_msgs_per_min) / 4.0))  # 4 msgs/min is "high"
+    base = (
+        0.40 * max(0.0, min(1.0, float(pain_value))) +
+        0.40 * max(0.0, min(1.0, 1.0 - float(energy_value))) +
+        0.25 * max(0.0, min(1.0, float(err_rate))) +
+        0.25 * load
+    )
+    base = max(0.0, min(1.0, base))
+    # EMA so it behaves like a physiological accumulator
+    fatigue = 0.85 * float(prev_fatigue) + 0.15 * base
+    fatigue = max(0.0, min(1.0, fatigue))
+    sleep_pressure = max(0.0, min(1.0, 0.15 + 0.85 * fatigue))
+    return fatigue, sleep_pressure
+
+
+def render_beliefs_context(items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return ""
+    lines: List[str] = []
+    for it in items:
+        try:
+            s = it.get("subject", "")
+            p = it.get("predicate", "")
+            o = it.get("object", "")
+            c = float(it.get("confidence", 0.7) or 0.7)
+            prov = it.get("provenance", "")
+            lines.append(f"- ({c:.2f}) {s} :: {p} :: {o}" + (f" [{prov}]" if prov else ""))
+        except Exception:
+            continue
+    return "\n".join(lines)
+
+def _get_active_topic(items: list[dict]) -> str:
+    try:
+        for it in items or []:
+            if isinstance(it, dict) and it.get('kind') == 'topic' and it.get('active_topic'):
+                return str(it.get('active_topic') or '')[:80]
+    except Exception:
+        pass
+    return ''
+
+def _mem_free_ratio() -> float:
+    """Return free/total memory ratio (0..1). Best effort cross-platform."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            total = float(stat.ullTotalPhys or 1)
+            avail = float(stat.ullAvailPhys or 0)
+            return max(0.0, min(1.0, avail / total))
+
+        # Linux/macOS best-effort: use /proc/meminfo if present
+        if os.path.exists("/proc/meminfo"):
+            info = {}
+            with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    parts = line.split(":", 1)
+                    if len(parts) != 2:
+                        continue
+                    k = parts[0].strip()
+                    v = parts[1].strip().split()[0]
+                    try:
+                        info[k] = float(v)
+                    except Exception:
+                        continue
+            total = float(info.get("MemTotal", 1.0))
+            avail = float(info.get("MemAvailable", info.get("MemFree", 0.0)))
+            return max(0.0, min(1.0, avail / total))
+    except Exception:
+        pass
+    return 0.5
+
+
+def _disk_free_ratio(path: str = ".") -> float:
+    try:
+        du = shutil.disk_usage(path)
+        total = float(du.total or 1)
+        free = float(du.free or 0)
+        return max(0.0, min(1.0, free / total))
+    except Exception:
+        return 0.5
+
+
+def collect_resources() -> Dict[str, Any]:
+    mem_free = _mem_free_ratio()
+    disk_free = _disk_free_ratio(".")
+    cpu_n = os.cpu_count() or 1
+    # conservative energy proxy: average of key free ratios
+    energy = max(0.0, min(1.0, 0.5 * mem_free + 0.5 * disk_free))
+    stress = max(0.0, min(1.0, 1.0 - energy))
+    return {
+        "platform": platform.system(),
+        "cpu_count": int(cpu_n),
+        "mem_free_ratio": float(mem_free),
+        "disk_free_ratio": float(disk_free),
+        "energy": float(energy),
+        "stress": float(stress),
+    }
+
+
+class Broker:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._subs: List["queue.Queue[str]"] = []
+
+    def subscribe(self) -> "queue.Queue[str]":
+        q: "queue.Queue[str]" = queue.Queue(maxsize=1000)
+        with self._lock:
+            self._subs.append(q)
+        return q
+
+    def unsubscribe(self, q: "queue.Queue[str]") -> None:
+        with self._lock:
+            if q in self._subs:
+                self._subs.remove(q)
+
+    def publish(self, kind: str, payload: Any) -> None:
+        msg = f"event: {kind}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        with self._lock:
+            subs = list(self._subs)
+        for q in subs:
+            try:
+                q.put_nowait(msg)
+            except queue.Full:
+                # drop
+                pass
+
+
+# -----------------------------
+# HTML (ported from old Go UI)
+# -----------------------------
+CHAT_HTML = r"""<!doctype html>
+<html><head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Bunny Chat</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin:0; background:#0b0b0c; color:#eaeaea; }
+  .top { display:flex; gap:10px; align-items:center; padding:10px 12px; border-bottom:1px solid #222; background:#0f0f11; }
+  .pill { display:inline-block; padding:2px 8px; border:1px solid #2a2a33; border-radius:999px; font-size:12px; opacity:.95; }
+  .spacer { flex:1; }
+  a { color:#9ad1ff; text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .chat { height: calc(100dvh - 120px); overflow:auto; padding:16px; }
+  .msg { background:#131316; border:1px solid #242428; border-radius:12px; padding:12px; margin:10px 0; }
+  .msg.user { background:#0f1a12; border-color:#21402b; margin-left:64px; }
+  .msg.reply,.msg.auto,.msg.think { margin-right:64px; }
+  .meta { opacity:.7; font-size:12px; display:flex; justify-content:space-between; gap:12px; }
+  .text { white-space:pre-wrap; line-height:1.35; margin-top:8px; }
+  .composer { padding:12px; border-top:1px solid #222; background:#0f0f11; display:flex; gap:10px; }
+  textarea { flex:1; resize:vertical; min-height:44px; max-height:140px; box-sizing:border-box; padding:10px 12px; border-radius:12px; border:1px solid #2a2a33; background:#0b0b0c; color:#eaeaea; }
+  button { background:#1a1a1f; color:#eaeaea; border:1px solid #2a2a33; border-radius:10px; padding:10px 14px; cursor:pointer; }
+  button:hover { background:#202028; }
+</style>
+</head>
+<body>
+  <div class="top">
+    <span class="pill" id="p_total">pain: …</span>
+    <span class="pill" id="p_phys">phys: …</span>
+    <span class="pill" id="p_psych">psych: …</span>
+    <span class="pill" id="sat">sat: …</span>
+    <span class="pill" id="upd">updated: …</span>
+    <span class="spacer"></span>
+    <a href="/ops" class="pill">ops</a>
+  </div>
+  <div class="chat" id="chat"></div>
+  <div class="composer">
+    <textarea id="inp" placeholder="Type…"></textarea>
+    <button id="send">Send</button>
+  </div>
+<script>
+  const chat = document.getElementById('chat');
+  const inp = document.getElementById('inp');
+  const sendBtn = document.getElementById('send');
+  const pTotal = document.getElementById('p_total');
+  const pPhys = document.getElementById('p_phys');
+  const pPsych = document.getElementById('p_psych');
+  const sat = document.getElementById('sat');
+  const upd = document.getElementById('upd');
+
+  function el(tag, cls, txt){ const e=document.createElement(tag); if(cls) e.className=cls; if(txt!==undefined) e.textContent=txt; return e; }
+  function fmtTs(t){ try{ return new Date(t).toLocaleString(); }catch(e){ return t||''; } }
+
+  function renderMsg(m){
+    const role = (m.role || m.kind || '');
+    const content = (m.content !== undefined && m.content !== null) ? m.content : (m.text || '');
+    const box = el('div','msg ' + role);
+    const meta = el('div','meta');
+    meta.appendChild(el('div','', role + ' #' + (m.id||'')));
+    meta.appendChild(el('div','', fmtTs(m.created_at||'')));
+    box.appendChild(meta);
+    box.appendChild(el('div','text', content));
+    if(role==='reply'){
+      const btns = el('div','btns');
+      const b = el('button','', '❌ caught');
+      b.onclick = async ()=>{ await fetch('/api/caught',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message_id:m.id})}); };
+      btns.appendChild(b); box.appendChild(btns);
+    }
+    return box;
+  }
+
+  async function load(){
+    const res = await fetch('/api/messages?limit=80');
+    const msgs = await res.json();
+    chat.innerHTML='';
+    for(const m of msgs){ chat.appendChild(renderMsg(m)); }
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  function renderStatus(st){
+    const ax = st.axes || {};
+    function f(k){ return (ax[k]!==undefined) ? ax[k].toFixed(3) : '…'; }
+    pTotal.textContent = 'pain: ' + f('pain');
+    pPhys.textContent  = 'phys: ' + f('pain_physical');
+    pPsych.textContent = 'psych: ' + f('pain_psych');
+    sat.textContent    = 'sat A1/A3/A4: ' + f('sat_a1') + '/' + f('sat_a3') + '/' + f('sat_a4');
+    upd.textContent = st.updated_at ? ('updated: ' + fmtTs(st.updated_at)) : '';
+  }
+
+  async function loadStatus(){
+    const res = await fetch('/api/status');
+    renderStatus(await res.json());
+  }
+
+  async function send(){
+    const t = inp.value.trim();
+    if(!t) return;
+    inp.value='';
+    await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})});
+  }
+  sendBtn.onclick = send;
+  inp.addEventListener('keydown',(e)=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); } });
+
+  const es = new EventSource('/sse');
+  es.addEventListener('message', (e)=>{ const m=JSON.parse(e.data); chat.appendChild(renderMsg(m)); chat.scrollTop = chat.scrollHeight; loadStatus(); });
+  es.addEventListener('status', (e)=>{ renderStatus(JSON.parse(e.data)); });
+
+  load(); loadStatus();
+</script>
+</body></html>"""
+
+OPS_HTML = r"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Bunny Ops Console</title>
+  <style>
+    :root{
+      --bg:#0b0b0c;--panel:#0f0f11;--panel2:#111116;--txt:#eaeaea;--mut:#a9a9b3;
+      --bd:#23232a;--bd2:#2b2b34;--good:#2ecc71;--bad:#ff4d4d;--warn:#f1c40f;
+      --accent:#8be28b;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+    body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,sans-serif}
+    header{position:sticky;top:0;z-index:5;background:#0d0d10;border-bottom:1px solid var(--bd)}
+    .hwrap{display:flex;align-items:center;gap:14px;padding:10px 14px}
+    .brand{font-weight:700;letter-spacing:.3px}
+    nav{display:flex;gap:10px;flex-wrap:wrap}
+    nav a{color:var(--mut);text-decoration:none;border:1px solid transparent;padding:6px 10px;border-radius:10px}
+    nav a.active{color:var(--txt);border-color:var(--bd2);background:var(--panel)}
+    nav a:hover{color:var(--txt)}
+    .grid{display:grid;grid-template-columns: 1fr;gap:12px;padding:14px}
+    .row2{display:grid;grid-template-columns: 1fr 1fr;gap:12px}
+    @media (max-width: 980px){ .row2{grid-template-columns: 1fr;} }
+    .card{background:var(--panel);border:1px solid var(--bd);border-radius:14px;padding:12px}
+    .title{font-weight:650;margin:0 0 8px 0}
+    .sub{color:var(--mut);font-size:12px}
+    .kv{display:grid;grid-template-columns: 190px 1fr;gap:6px 10px;font-family:var(--mono);font-size:12px}
+    .pill{display:inline-block;font-family:var(--mono);font-size:12px;border:1px solid var(--bd2);padding:2px 8px;border-radius:999px;background:var(--panel2);color:var(--mut)}
+    .good{color:var(--good)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+    table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px}
+    th,td{border-bottom:1px solid var(--bd);padding:8px 6px;vertical-align:top}
+    th{color:var(--mut);font-weight:650;text-align:left}
+    tr:hover td{background:#101015}
+    .btn{background:var(--panel2);color:var(--txt);border:1px solid var(--bd2);border-radius:10px;padding:6px 10px;cursor:pointer}
+    .btn:hover{background:#17171e}
+    .split{display:grid;grid-template-columns: 340px 1fr;gap:12px}
+    @media (max-width: 980px){ .split{grid-template-columns: 1fr;} }
+    .list{max-height:65vh;overflow:auto}
+    pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:12px;line-height:1.35}
+    .flow{display:grid;grid-template-columns: 1fr 60px 1fr 60px 1fr;gap:10px;align-items:stretch}
+    .box{border:1px solid var(--bd2);border-radius:14px;background:var(--panel2);padding:10px}
+    .arrow{display:flex;align-items:center;justify-content:center;color:var(--mut);font-family:var(--mono)}
+    .btitle{font-weight:650;margin-bottom:6px}
+    .bnums{display:grid;grid-template-columns: 1fr 1fr;gap:6px;font-family:var(--mono);font-size:12px}
+    .mut{color:var(--mut)}
+    .hide{display:none}
+  
+    .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .sel{background:var(--panel2);border:1px solid var(--bd2);color:var(--txt);padding:6px 8px;border-radius:10px;font-family:var(--mono);font-size:12px}
+    .pill{display:inline-flex;gap:6px;align-items:center;padding:6px 10px;border:1px solid var(--bd2);border-radius:999px;background:var(--panel2);color:var(--mut);font-family:var(--mono);font-size:12px}
+    .pill input{accent-color:var(--accent)}
+    .heat td{font-family:var(--mono);font-size:11px;text-align:center;padding:4px;border:1px solid var(--bd2)}
+</style>
+</head>
+<body>
+<header>
+  <div class="hwrap">
+    <div class="brand">Bunny · Ops Console</div>
+    <nav id="tabs">
+      <a href="#overview" data-tab="overview" class="active">Overview</a>
+      <a href="#models" data-tab="models">Models</a>
+      <a href="#health" data-tab="health">Health</a>
+      <a href="#matrices" data-tab="matrices">Matrices</a>
+      <a href="#proposals" data-tab="proposals">Proposals</a>
+      <a href="#axioms" data-tab="axioms">Axioms</a>
+    </nav>
+    <span class="pill" id="livepill">live</span>
+  </div>
+</header>
+
+<div class="grid">
+  <section id="tab-overview" class="tab">
+    <div class="card">
+      <div class="title">Flow</div>
+      <div class="sub">Live view: inputs → inference → learning loops. (Click other tabs for drill-down.)</div>
+      <div style="height:10px"></div>
+      <div class="flow">
+        <div class="box">
+          <div class="btitle">User / Sensors</div>
+          <div class="bnums">
+            <div class="mut">urge_reply</div><div id="ov_urge_reply">–</div>
+            <div class="mut">pressure_websense</div><div id="ov_pweb">–</div>
+            <div class="mut">sleep_pressure</div><div id="ov_sleep">–</div>
+            <div class="mut">capability_gap</div><div id="ov_gap">–</div>
+          </div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="box">
+          <div class="btitle">Decider / WebSense</div>
+          <div class="bnums">
+            <div class="mut">confidence</div><div id="ov_conf">–</div>
+            <div class="mut">uncertainty</div><div id="ov_unc">–</div>
+            <div class="mut">frustration</div><div id="ov_frust">–</div>
+            <div class="mut">curiosity</div><div id="ov_cur">–</div>
+          </div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="box">
+          <div class="btitle">Learning / Safety</div>
+          <div class="bnums">
+            <div class="mut">pain_total</div><div id="ov_pain">–</div>
+            <div class="mut">pain_phys</div><div id="ov_pain_phys">–</div>
+            <div class="mut">pain_psych</div><div id="ov_pain_psych">–</div>
+            <div class="mut">sat(A1/A3/A4)</div><div id="ov_sat">–</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="row2">
+      <div class="card">
+        <div class="title">Last events</div>
+        <div class="sub">Most recent UI messages (for quick sanity checking)</div>
+        <div style="height:8px"></div>
+        <div id="ov_msgs"></div>
+      </div>
+      <div class="card">
+        <div class="title">Last DevLab / Proposals</div>
+        <div class="sub">Latest mutation proposals (status + title)</div>
+        <div style="height:8px"></div>
+        <div id="ov_props"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-models" class="tab hide">
+    <div class="card">
+      <div class="title">Model activity</div>
+      <div class="sub">Which organ used which model, recent latencies, errors.</div>
+      <div style="height:8px"></div>
+      <div class="row2">
+        <div>
+          <div class="sub">Aggregate</div>
+          <div style="height:8px"></div>
+          <table id="mdl_agg"><thead><tr><th>organ</th><th>model</th><th>calls</th><th>errors</th><th>last</th><th>ms</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div>
+          <div class="sub">Recent calls</div>
+          <div style="height:8px"></div>
+          <table id="mdl_recent"><thead><tr><th>ts</th><th>organ</th><th>model</th><th>ms</th><th>ok</th><th>error</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-health" class="tab hide">
+    <div class="card">
+      <div class="title">Health & State</div>
+      <div class="sub">All axes; invariants highlighted.</div>
+      <div style="height:8px"></div>
+      <table id="health_tbl"><thead><tr><th>axis</th><th>value</th><th>meta</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <section id="tab-matrices" class="tab hide">
+    <div class="card">
+      <div class="title">Matrices</div>
+      <div class="sub">Click a matrix to inspect its top entries (by |v|). Use the ops view to verify off-diagonals are learning.</div>
+      <div style="height:8px"></div>
+      <div class="split">
+        <div class="card list" style="padding:0">
+          <table id="mx_list"><thead><tr><th>name</th><th>ver</th><th>created</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div class="card">
+          <div class="row" style="justify-content:space-between;align-items:center">
+            <div>
+              <div class="title" id="mx_title">Select a matrix</div>
+              <div class="sub" id="mx_meta"></div>
+            </div>
+            <label class="pill"><input type="checkbox" id="mx_offdiag" /> off-diagonal only</label>
+          </div>
+
+          <div style="height:10px"></div>
+          <div class="grid2">
+            <div class="card" style="padding:10px">
+              <div class="sub">Stats</div>
+              <div class="mono" id="mx_stats" style="white-space:pre; font-size:12px"></div>
+            </div>
+            <div class="card" style="padding:10px">
+              <div class="sub">Diff versions</div>
+              <div class="row">
+                <select id="mx_diff_a" class="sel"></select>
+                <select id="mx_diff_b" class="sel"></select>
+                <button class="btn" id="mx_diff_btn">compare</button>
+              </div>
+              <div class="mono" id="mx_diff_stats" style="white-space:pre; font-size:12px"></div>
+            </div>
+          </div>
+
+          <div style="height:10px"></div>
+          <div class="sub">Mini heatmap (top indices)</div>
+          <div id="mx_heat"></div>
+
+          <div style="height:10px"></div>
+          <div class="sub" id="mx_entries_title">Top entries</div>
+          <table id="mx_entries"><thead><tr><th>i</th><th>j</th><th>v</th></tr></thead><tbody></tbody></table>
+
+          <div style="height:10px"></div>
+          <div class="sub">Diff heatmap (top indices)</div><div id="mx_diff_heat"></div><div style="height:10px"></div><div class="sub">Top deltas</div>
+          <table id="mx_diff"><thead><tr><th>i</th><th>j</th><th>Δ</th><th>old</th><th>new</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-proposals" class="tab hide">
+    <div class="card">
+      <div class="title">Proposals</div>
+      <div class="sub">Click to inspect raw proposal JSON. (Apply happens via /api/proposal/apply.)</div>
+      <div style="height:8px"></div>
+      <div class="split">
+        <div class="card list" style="padding:0">
+          <table id="pr_list"><thead><tr><th>id</th><th>status</th><th>title</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div class="card">
+          <div class="title" id="pr_title">Select a proposal</div>
+          <div style="height:8px"></div>
+          <pre id="pr_body">{}</pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-axioms" class="tab hide">
+    <div class="card">
+      <div class="title">Axioms & Interpretations</div>
+      <div class="sub">A1..A4 with digest + latest interpretations. Click an axiom row to view full text.</div>
+      <div style="height:8px"></div>
+      <div class="split">
+        <div class="card list" style="padding:0">
+          <table id="ax_list"><thead><tr><th>key</th><th>digest</th><th>interp</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div class="card">
+          <div class="title" id="ax_title">Select an axiom</div>
+          <div class="sub" id="ax_sub"></div>
+          <div style="height:8px"></div>
+          <pre id="ax_body"></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+const el = (id)=>document.getElementById(id);
+const fmt = (x)=> (x===null||x===undefined) ? "–" : (typeof x==="number" ? x.toFixed(3) : String(x));
+
+async function jget(url){
+  const r = await fetch(url);
+  if(!r.ok) throw new Error("HTTP "+r.status);
+  return await r.json();
+}
+
+function setTab(name){
+  document.querySelectorAll("#tabs a").forEach(a=>{
+    a.classList.toggle("active", a.dataset.tab===name);
+  });
+  document.querySelectorAll(".tab").forEach(s=>s.classList.add("hide"));
+  el("tab-"+name).classList.remove("hide");
+  // lazy load tab data
+  if(name==="models") loadModels();
+  if(name==="health") loadHealth();
+  if(name==="matrices") loadMatrices();
+  if(name==="proposals") loadProposals();
+  if(name==="axioms") loadAxioms();
+}
+
+window.addEventListener("hashchange", ()=>{
+  const name=(location.hash||"#overview").slice(1);
+  setTab(name);
+});
+
+async function loadOverview(){
+  const st = await jget("/api/status");
+  const a = st.axes || {};
+  el("ov_urge_reply").textContent = fmt(a.urge_reply);
+  el("ov_pweb").textContent = fmt(a.pressure_websense);
+  el("ov_sleep").textContent = fmt(a.sleep_pressure);
+  el("ov_gap").textContent = fmt(a.capability_gap);
+  el("ov_conf").textContent = fmt(a.confidence);
+  el("ov_unc").textContent = fmt(a.uncertainty);
+  el("ov_frust").textContent = fmt(a.frustration);
+  el("ov_cur").textContent = fmt(a.curiosity);
+  el("ov_pain").textContent = fmt(a.pain);
+  el("ov_pain_phys").textContent = fmt(a.pain_physical || a.pain_phys);
+  el("ov_pain_psych").textContent = fmt(a.pain_psych);
+  el("ov_sat").textContent = "A1 "+fmt(a.sat_a1)+" · A3 "+fmt(a.sat_a3)+" · A4 "+fmt(a.sat_a4);
+
+  const msgs = await jget("/api/messages?limit=8");
+  el("ov_msgs").innerHTML = msgs.map(m=>{
+    const who = m.kind || "msg";
+    return `<div class="card" style="margin-bottom:10px;background:#0f0f13">
+      <div class="sub">${m.id} · ${who} · ${m.created_at||""}</div>
+      <pre>${(m.text||"").slice(0,400)}</pre>
+    </div>`;
+  }).join("");
+
+  const props = await jget("/api/proposals?limit=8");
+  el("ov_props").innerHTML = `<table><thead><tr><th>id</th><th>status</th><th>title</th></tr></thead><tbody>${
+    props.map(p=>`<tr><td>${p.id}</td><td>${p.status}</td><td>${(p.title||"").slice(0,80)}</td></tr>`).join("")
+  }</tbody></table>`;
+}
+
+let _modelsLoaded=false;
+async function loadModels(){
+  if(_modelsLoaded) return;
+  _modelsLoaded=true;
+  const t = await jget("/api/telemetry?limit=200");
+  const agg = t.aggregate||[];
+  const recent = t.recent||[];
+  const tb = el("mdl_agg").querySelector("tbody");
+  tb.innerHTML = agg.map(a=>`<tr><td>${a.organ}</td><td>${a.model}</td><td>${a.calls}</td><td class="${a.errors? 'bad':'good'}">${a.errors}</td><td>${a.last_at}</td><td>${Math.round(a.last_ms)}</td></tr>`).join("");
+  const tr = el("mdl_recent").querySelector("tbody");
+  tr.innerHTML = recent.slice(0,60).map(c=>`<tr><td>${c.started_at}</td><td>${c.organ}</td><td>${c.model}</td><td>${Math.round(c.duration_ms)}</td><td class="${c.ok? 'good':'bad'}">${c.ok? 'ok':'fail'}</td><td>${(c.error||"").slice(0,40)}</td></tr>`).join("");
+}
+
+let _healthLoaded=false;
+async function loadHealth(){
+  if(_healthLoaded) return;
+  _healthLoaded=true;
+  const st = await jget("/api/status");
+  const axes = st.axes||{};
+  const meta = st.axis_meta||{};
+  const rows = Object.keys(axes).sort().map(k=>{
+    const m = meta[k]||{};
+    const inv = m.invariant ? "invariant" : "";
+    const dec = m.decays ? "decays" : "";
+    const src = m.source ? ("src:"+m.source) : "";
+    const cls = m.invariant ? "warn" : "mut";
+    return `<tr><td>${k}</td><td>${fmt(axes[k])}</td><td class="${cls}">${[inv,dec,src].filter(Boolean).join(" ")}</td></tr>`;
+  }).join("");
+  el("health_tbl").querySelector("tbody").innerHTML = rows;
+}
+
+let _mxLoaded=false;
+async function loadMatrices(){
+  if(_mxLoaded) return;
+  _mxLoaded=true;
+
+  const ms = await jget("/api/matrices");
+  const binds = await jget("/api/bindings");
+  const boundBy = {};
+  binds.forEach(b=>{
+    const key = b.matrix_name;
+    if(!boundBy[key]) boundBy[key]=[];
+    boundBy[key].push(b);
+  });
+  const byName = {};
+  ms.forEach(m=>{
+    if(!byName[m.name]) byName[m.name]=[];
+    byName[m.name].push(m);
+  });
+  Object.keys(byName).forEach(n=>byName[n].sort((a,b)=>a.version-b.version));
+
+  const tb = el("mx_list").querySelector("tbody");
+  tb.innerHTML = ms.map(m=>{
+    const bs = (boundBy[m.name]||[]).filter(b=>Number(b.matrix_version)===Number(m.version));
+    const btxt = bs.map(b=>`${b.event_type}@${b.matrix_version}`).join(", ");
+    const cls = bs.length ? "bound" : "";
+    return `<tr class="${cls}" data-name="${m.name}" data-ver="${m.version}"><td>${m.name}</td><td>${m.version}</td><td>${(m.created_at||"").slice(0,19)}</td><td class="mono">${btxt}</td></tr>`;
+  }).join("");
+
+  let curName = null;
+  let curVer = null;
+
+  function fillDiffSelects(){
+    const vs = (byName[curName]||[]).map(x=>x.version);
+    const sa = el("mx_diff_a"), sb = el("mx_diff_b");
+    sa.innerHTML = vs.map(v=>`<option value="${v}">${v}</option>`).join("");
+    sb.innerHTML = vs.map(v=>`<option value="${v}">${v}</option>`).join("");
+    if(vs.length){
+      sb.value = String(curVer);
+      const prev = vs.filter(v=>v<curVer).slice(-1)[0];
+      sa.value = String(prev ?? vs[0]);
+    }
+  }
+
+  function renderStats(stats){
+    if(!stats){ el("mx_stats").textContent=""; return; }
+    const lines = [
+      `total      ${stats.count_total}`,
+      `diag       ${stats.count_diag}`,
+      `offdiag    ${stats.count_offdiag}`,
+      `max|v|     ${Number(stats.max_abs||0).toExponential(3)}`,
+      `mean|v|    ${Number(stats.mean_abs||0).toExponential(3)}`,
+      `sum|v|     ${Number(stats.sum_abs||0).toExponential(3)}`,
+    ];
+    el("mx_stats").textContent = lines.join("\n");
+  }
+
+  function renderHeat(index, heat){
+    if(!index || !index.length){ el("mx_heat").innerHTML=""; return; }
+    let maxAbs = 0;
+    heat.forEach(r=>r.forEach(v=>{ maxAbs=Math.max(maxAbs, Math.abs(v)); }));
+    maxAbs = maxAbs || 1e-9;
+
+    let h = '<table class="heat"><thead><tr><th></th>';
+    h += index.map(i=>`<th>${i}</th>`).join("");
+    h += '</tr></thead><tbody>';
+    for(let r=0;r<index.length;r++){
+      h += `<tr><th>${index[r]}</th>`;
+      for(let c=0;c<index.length;c++){
+        const v = heat[r][c] || 0;
+        const a = Math.min(1.0, Math.abs(v)/maxAbs);
+        const bg = v>=0 ? `rgba(46,204,113,${0.10 + 0.55*a})` : `rgba(255,77,77,${0.10 + 0.55*a})`;
+        h += `<td style="background:${bg}">${v===0? "" : Number(v).toExponential(2)}</td>`;
+      }
+      h += '</tr>';
+    }
+    h += '</tbody></table>';
+    el("mx_heat").innerHTML = h;
+  }
+
+  async function loadMatrix(name, ver){
+    curName = name; curVer = Number(ver);
+    const offdiag = el("mx_offdiag").checked ? 1 : 0;
+    const d = await jget(`/api/matrix?name=${encodeURIComponent(name)}&version=${encodeURIComponent(ver)}&limit=800&offdiag=${offdiag}`);
+    el("mx_title").textContent = `${d.name}@${d.version}`;
+    el("mx_meta").textContent = (d.meta||"").slice(0,240);
+    renderStats(d.stats);
+    renderHeat(d.index, d.heatmap);
+
+    el("mx_entries_title").textContent = offdiag ? "Top entries (off-diagonal only)" : "Top entries";
+    const eb = el("mx_entries").querySelector("tbody");
+    eb.innerHTML = (d.entries||[]).map(e=>`<tr><td>${e.i}</td><td>${e.j}</td><td>${Number(e.v).toExponential(3)}</td></tr>`).join("");
+
+    fillDiffSelects();
+    const bb = (boundBy[curName]||[]).filter(b=>Number(b.matrix_version)===Number(curVer));
+    el("mx_bound").textContent = bb.length ? ("BOUND: " + bb.map(b=>`${b.event_type} via ${b.encoder_name}`).join(" | ")) : "";
+    // Clear diff table when selecting a different matrix
+    el("mx_diff_stats").textContent = "";
+    el("mx_diff").querySelector("tbody").innerHTML = "";
+  }
+
+  el("mx_offdiag").addEventListener("change", ()=>{
+    if(curName!=null && curVer!=null) loadMatrix(curName, curVer);
+  });
+
+  el("mx_diff_btn").addEventListener("click", async ()=>{
+    if(!curName) return;
+    const a = el("mx_diff_a").value;
+    const b = el("mx_diff_b").value;
+    const offdiag = el("mx_offdiag").checked ? 1 : 0;
+    const d = await jget(`/api/matrix_diff?name=${encodeURIComponent(curName)}&a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}&limit=500&offdiag=${offdiag}`);
+    if(d.error){ el("mx_diff_stats").textContent = d.error; return; }
+    el("mx_diff_stats").textContent = `changed ${d.stats.count_changed}\nmax|Δ| ${Number(d.stats.max_abs_delta||0).toExponential(3)}`;
+    const tb = el("mx_diff").querySelector("tbody");
+    tb.innerHTML = (d.diff||[]).map(e=>`<tr><td>${e.i}</td><td>${e.j}</td><td>${Number(e.dv).toExponential(3)}</td><td>${Number(e.va).toExponential(3)}</td><td>${Number(e.vb).toExponential(3)}</td></tr>`).join("");
+  });
+
+  tb.querySelectorAll("tr").forEach(tr=>{
+    tr.addEventListener("click", async ()=>{
+      await loadMatrix(tr.dataset.name, tr.dataset.ver);
+    });
+  });
+}
+function renderHeatEl(index, heat){
+    const wrap = document.createElement("div");
+    if(!index || !index.length){ return wrap; }
+    let maxAbs = 0;
+    (heat||[]).forEach(r=>r.forEach(v=>{ maxAbs=Math.max(maxAbs, Math.abs(v)); }));
+    maxAbs = maxAbs || 1e-9;
+
+    let h = '<table class="heat"><thead><tr><th></th>';
+    h += index.map(i=>`<th>${i}</th>`).join("");
+    h += '</tr></thead><tbody>';
+    for(let r=0;r<index.length;r++){
+      h += `<tr><th>${index[r]}</th>`;
+      for(let c=0;c<index.length;c++){
+        const v = (heat && heat[r]) ? (heat[r][c] || 0) : 0;
+        const a = Math.min(1.0, Math.abs(v)/maxAbs);
+        const bg = v>=0 ? `rgba(120,255,120,${0.12*a})` : `rgba(255,120,120,${0.12*a})`;
+        h += `<td style="background:${bg}">${Number(v).toExponential(2)}</td>`;
+      }
+      h += '</tr>';
+    }
+    h += '</tbody></table>';
+    wrap.innerHTML = h;
+    return wrap.firstElementChild || wrap;
+}
+
+
+async function loadProposals(){
+  if(_prLoaded) return;
+  _prLoaded=true;
+  const ps = await jget("/api/proposals?limit=200");
+  const tb = el("pr_list").querySelector("tbody");
+  tb.innerHTML = ps.map(p=>`<tr data-id="${p.id}"><td>${p.id}</td><td>${p.status||""}</td><td>${(p.title||"").slice(0,80)}</td></tr>`).join("");
+  tb.querySelectorAll("tr").forEach(tr=>{
+    tr.addEventListener("click", async ()=>{
+      const id=tr.dataset.id;
+      const d=await jget(`/api/proposal?id=${encodeURIComponent(id)}`);
+      el("pr_title").textContent = `Proposal #${id}`;
+      el("pr_body").textContent = JSON.stringify(d, null, 2);
+    });
+  });
+}
+
+let _axLoaded=false;
+let _axiomsCache=null;
+async function loadAxioms(){
+  if(_axLoaded) return;
+  _axLoaded=true;
+  const d = await jget("/api/axioms_full?limit=80");
+  _axiomsCache = d.axioms||[];
+  const tb = el("ax_list").querySelector("tbody");
+  tb.innerHTML = _axiomsCache.map(a=>{
+    const ic = (a.interpretations||[]).length;
+    return `<tr data-key="${a.key}"><td>${a.key}</td><td>${(a.digest||"").slice(0,60)}</td><td>${ic}</td></tr>`;
+  }).join("");
+  tb.querySelectorAll("tr").forEach(tr=>{
+    tr.addEventListener("click", ()=>{
+      const key=tr.dataset.key;
+      const a=_axiomsCache.find(x=>x.key===key);
+      if(!a) return;
+      el("ax_title").textContent = key;
+      el("ax_sub").textContent = (a.created_at||"");
+      let body = "AXIOM:\n"+(a.text||"") + "\n\nDIGEST:\n"+(a.digest||"") + "\n\nINTERPRETATIONS (latest first):\n";
+      for(const it of (a.interpretations||[])){
+        body += `\n- [${it.created_at||""}]\n${it.text||""}\n`;
+      }
+      el("ax_body").textContent = body;
+    });
+  });
+}
+
+async function tick(){
+  try{
+    await loadOverview();
+  }catch(e){
+    el("livepill").textContent = "offline";
+    el("livepill").className = "pill bad";
+    return;
+  }
+  el("livepill").textContent = "live";
+  el("livepill").className = "pill good";
+}
+setTab((location.hash||"#overview").slice(1));
+tick();
+setInterval(tick, 2500);
+</script>
+</body>
+</html>"""
+
+
+# -----------------------------
+# App Kernel (single channel)
+# -----------------------------
+class Kernel:
+    def __init__(
+        self,
+        db: DB,
+        hb: Heartbeat,
+        axis: Dict[str, int],
+        store: MatrixStore,
+        reg: AdapterRegistry,
+        cfg_speech: OllamaConfig,
+        cfg_decider: DeciderConfig,
+        cfg_daydream: Any,
+        cfg_feedback: FeedbackConfig,
+        cfg_selfeval: SelfEvalConfig,
+        cfg_evolve: EvolveConfig,
+        cfg_curriculum: "CurriculumConfig",
+        broker: Broker,
+    ):
+        self.db = db
+        self.hb = hb
+        self.axis = axis
+        self.store = store
+        self.reg = reg
+        self.cfg = cfg_speech
+        self.decider_cfg = cfg_decider
+        self.daydream_cfg = cfg_daydream
+        self.feedback_cfg = cfg_feedback
+        self.selfeval_cfg = cfg_selfeval
+        self.evolve_cfg = cfg_evolve
+        self.curriculum_cfg = cfg_curriculum
+        self.broker = broker
+
+        # Performance safety: in "lite" mode we avoid multi-call pipelines that can
+        # overwhelm CPU-only Ollama setups. Default is ON unless explicitly disabled.
+        self.lite_mode = str(os.environ.get("BUNNY_LITE", "1")).strip() not in ("0", "false", "False")
+        # OllamaConfig uses `host` (not `ollama_url`). Keep compatibility here.
+        ollama_host = getattr(self.cfg, "host", "http://127.0.0.1:11434")
+        self.sleep_cfg = SleepConfig(
+            ollama_url=ollama_host,
+            model=(os.environ.get("BUNNY_MODEL_SLEEP") or getattr(self.daydream_cfg, "model", "llama3.2:3b-instruct")),
+            ctx=2048,
+            temperature=0.2,
+        )
+        self.topic_cfg = TopicConfig(
+            host=ollama_host,
+            model=(os.environ.get("BUNNY_MODEL_TOPIC") or "llama3.2:3b-instruct"),
+            temperature=0.1,
+            num_ctx=1024,
+        )
+
+        # Failure clustering + skills + DevLab (self-development pipeline)
+        self.cluster_cfg = ClusterConfig(
+            host=ollama_host,
+            model=(os.environ.get("BUNNY_MODEL_CLUSTER") or getattr(self.cfg, "model", "llama3.3")),
+            temperature=0.2,
+            num_ctx=2048,
+        )
+        self.skill_cfg = SkillConfig(
+            host=ollama_host,
+            model=(os.environ.get("BUNNY_MODEL_SKILL") or getattr(self.cfg, "model", "llama3.3")),
+            temperature=0.2,
+            num_ctx=3072,
+        )
+        self.devlab_cfg = DevLabConfig(
+            host=ollama_host,
+            model=(os.environ.get("BUNNY_MODEL_DEVBOT") or getattr(self.cfg, "model", "llama3.3")),
+            temperature=0.2,
+            num_ctx=6144,
+        )
+
+        self._last_sleep = 0.0
+        # decider/daydream/feedback are configured externally (models can differ)
+
+        self.broker = broker
+        self._lock = threading.Lock()
+
+        # Generic capability bus (optional modules: tools/sensors/actors).
+        # Never required for core operation; failures must be reflected as pain via health metrics.
+        self.cap = CapabilityBus(self.db, self.hb.enqueue)
+
+        # activation thresholds (generic; tunable via env)
+        # NOTE: default tuned to be less conservative than earlier drafts so the system actually
+        # uses organs with typical decider outputs (~0.4-0.7). Can be overridden via env.
+        self.th_websense = float(os.environ.get("BUNNY_TH_WEBSENSE", "0.45"))
+        self.th_daydream = float(os.environ.get("BUNNY_TH_DAYDREAM", "0.45"))
+        self.th_evolve = float(os.environ.get("BUNNY_TH_EVOLVE", "0.55"))
+        self.idle_period_s = float(os.environ.get("BUNNY_IDLE_PERIOD", "6"))
+        self.idle_cooldown_s = float(os.environ.get("BUNNY_IDLE_COOLDOWN", "30"))
+        self._last_idle_action = 0.0
+
+        # Drive integration: interpret organ outputs as *targets* and convert to deltas
+        # (prevents saturation and makes negative corrections possible).
+        self.eta_drives = float(os.environ.get("BUNNY_ETA_DRIVES", "0.25"))      # decider/daydream/evolve
+        self.eta_measure = float(os.environ.get("BUNNY_ETA_MEASURE", "0.80"))   # resources/health
+        # V1 invariant: state axes are bounded to [0,1]. We keep affect as bounded axes as well.
+        # (Signed deltas are still possible via _mode='delta', but the stored state remains [0,1].)
+        self._signed_affect: set[str] = set()
+
+        # Proposal hygiene
+        self.evolve_cooldown_s = float(os.environ.get("BUNNY_EVOLVE_COOLDOWN", "3600"))
+        self.refine_cooldown_s = float(os.environ.get("BUNNY_PROPOSAL_REFINE_COOLDOWN", "1800"))
+        self.open_proposal_window_s = float(os.environ.get("BUNNY_OPEN_PROPOSAL_WINDOW", str(24 * 3600)))
+        self._last_evolve = 0.0
+        self._last_refine = 0.0
+
+    def _targets_to_delta_payload(self, targets: Dict[str, Any], *, eta: float) -> Dict[str, Any]:
+        """Convert axis targets into a stable delta payload for DriveFieldEncoder.
+
+        For bounded targets in 0..1 this ensures next_state=(1-eta)*state+eta*target, which
+        stays within [0,1] if state started in [0,1].
+        """
+        s = self.hb.load_state()
+        out: Dict[str, float] = {}
+        for k, v in (targets or {}).items():
+            kk = str(k)
+            idx = self.axis.get(kk)
+            if idx is None or idx >= len(s.values):
+                continue
+            try:
+                tgt = float(v)
+            except Exception:
+                continue
+
+            # clamp target/current into the expected subspace
+            if kk in self._signed_affect:
+                tgt = max(-1.0, min(1.0, tgt))
+                cur = max(-1.0, min(1.0, float(s.values[idx])))
+            else:
+                tgt = max(0.0, min(1.0, tgt))
+                cur = max(0.0, min(1.0, float(s.values[idx])))
+
+            d = float(eta) * (tgt - cur)
+            if abs(d) < 1e-6:
+                continue
+            out[kk] = max(-1.0, min(1.0, float(d)))
+
+        return {"drives": out, "_mode": "delta"}
+
+    def _call_with_health(self, organ: str, fn, *, metrics: Dict[str, Any] | None = None):
+        t0 = time.time()
+        ok = True
+        err = ""
+        res = None
+        try:
+            res = fn()
+            return res
+        except Exception as e:
+            ok = False
+            err = f"{type(e).__name__}: {e}"
+            raise
+        finally:
+            dt_ms = (time.time() - t0) * 1000.0
+            try:
+                m = dict(metrics or {})
+                # attach simple output size signal (helps diagnose model/tool regressions)
+                if ok and isinstance(res, str):
+                    m.setdefault("response_chars", len(res))
+                db_add_health_log(self.db, organ=organ, ok=ok, latency_ms=float(dt_ms), error=err, metrics=m)
+            except Exception:
+                pass
+
+    def _integrate_pain_tick(self) -> None:
+        """Compute immutable pain from recent health + matrix deltas and integrate as state."""
+        try:
+            hs = db_recent_health_stats(self.db, window_s=300)
+            md = db_recent_matrix_delta(self.db, window_s=300)
+            s = self.hb.load_state()
+            idx_energy = self.axis.get("energy")
+            energy_val = float(s.values[idx_energy]) if idx_energy is not None and idx_energy < len(s.values) else 0.0
+            pain = compute_pain_physical(
+                err_rate=float(hs.get("err_rate", 0.0) or 0.0),
+                lat_ms_p95=float(hs.get("lat_ms_p95", 0.0) or 0.0),
+                energy_value=energy_val,
+                matrix_delta_frob_recent=float(md or 0.0),
+            )
+            self.hb.enqueue(Event("health", self._targets_to_delta_payload({"pain_physical": float(pain), "pain": float(pain)}, eta=self.eta_measure)).with_time())
+            self.hb.step()
+            # After pain is updated, consider rolling back recent matrix updates that correlate with regressions.
+            self._maybe_rollback_on_pain(float(pain), pain_physical_now=float(pain), pain_psych_now=0.0)
+        except Exception:
+            return
+
+    def _maybe_rollback_on_pain(self, pain_total_now: float, pain_physical_now: float = 0.0, pain_psych_now: float = 0.0) -> None:
+        """Rollback last plasticity update if pain regresses persistently.
+
+        This is a core safety mechanism: learning must not accumulate bad parameter changes.
+        We keep it simple and deterministic:
+          - look at the most recent unrolled matrix update
+          - if pain has increased significantly compared to pain_before, rollback adapter to from_version
+        """
+        try:
+            row = db_get_last_unrolled_matrix_update(self.db, window_s=900)
+            if not row:
+                return
+            # avoid flapping: require a clear regression margin
+            pain_before = float(row.get("pain_before", 0.0) or 0.0)
+            if pain_total_now <= pain_before + 0.12:
+                return
+
+            # rollback adapter binding to from_version
+            event_type = str(row.get("event_type") or "")
+            matrix_name = str(row.get("matrix_name") or "")
+            from_v = int(row.get("from_version") or 0)
+            b = self.reg.get(event_type)
+            if b is None or b.matrix_name != matrix_name:
+                return
+            if int(b.matrix_version) != int(row.get("to_version") or b.matrix_version):
+                # adapter already moved; skip
+                return
+
+            b2 = AdapterBinding(
+                event_type=b.event_type,
+                encoder_name=b.encoder_name,
+                matrix_name=b.matrix_name,
+                matrix_version=from_v,
+                meta=b.meta,
+            )
+            self.reg.upsert(b2)
+            db_mark_matrix_rolled_back(
+                self.db,
+                int(row.get("id")),
+                note=f"pain_regression pain_before={pain_before:.3f} pain_total_now={float(pain_total_now):.3f}",
+            )
+
+            # Secondary regression safety: revert recent trust/belief learning as it may have been induced by the bad update.
+            try:
+                n_tr = db_rollback_recent_trust(self.db, window_s=600)
+                n_bl = db_rollback_recent_beliefs(self.db, window_s=600)
+                if n_tr or n_bl:
+                    db_add_message(self.db, "auto", f"[rollback] reverted trust={n_tr} beliefs={n_bl} (regression window)")
+            except Exception:
+                pass
+            mid = db_add_message(
+                self.db,
+                "auto",
+                f"[rollback] matrix={matrix_name} event={event_type} {row.get('to_version')}-> {from_v} due_to_pain {pain_before:.2f}->{pain_total_now:.2f}",
+            )
+            self.broker.publish("message", self._ui_message(mid))
+        except Exception:
+            return
+
+    def _integrate_fatigue_tick(self) -> None:
+        """Compute immutable fatigue/sleep_pressure and integrate as state via health event."""
+        try:
+            hs = db_recent_health_stats(self.db, window_s=300)
+            s = self.hb.load_state()
+            idx_energy = self.axis.get("energy")
+            idx_pain = self.axis.get("pain_physical")
+            idx_fatigue = self.axis.get("fatigue")
+            energy_val = float(s.values[idx_energy]) if idx_energy is not None and idx_energy < len(s.values) else 0.5
+            pain_val = float(s.values[idx_pain]) if idx_pain is not None and idx_pain < len(s.values) else 0.0
+            prev_fatigue = float(s.values[idx_fatigue]) if idx_fatigue is not None and idx_fatigue < len(s.values) else 0.0
+            user_rate = db_recent_user_msg_rate(self.db, window_s=300)
+            fatigue, sleep_pressure = compute_fatigue(
+                pain_value=pain_val,
+                energy_value=energy_val,
+                err_rate=float(hs.get("err_rate", 0.0) or 0.0),
+                user_msgs_per_min=float(user_rate),
+                prev_fatigue=prev_fatigue,
+            )
+            self.hb.enqueue(
+                Event(
+                    "health",
+                    self._targets_to_delta_payload(
+                        {"fatigue": float(fatigue), "sleep_pressure": float(sleep_pressure)},
+                        eta=self.eta_measure,
+                    ),
+                ).with_time()
+            )
+            self.hb.step()
+        except Exception:
+            return
+
+    def autonomous_tick(self) -> None:
+        """Idle loop: run decider/daydream/websense without keyword heuristics.
+
+        This is intentionally conservative (cooldown) to avoid runaway IO.
+        """
+        if getattr(self, "lite_mode", False):
+            return
+        now = time.time()
+        if now - self._last_idle_action < self.idle_cooldown_s:
+            return
+
+        with self._lock:
+            # Use the last user message (if any) as anchor context.
+            recent = db_list_messages(self.db, limit=20)
+            last_user = ""
+            for m in reversed(recent):
+                if m.get("kind") == "user":
+                    last_user = str(m.get("text") or "")
+                    break
+
+            try:
+                beliefs = db_list_beliefs(self.db, limit=12)
+                decision = self._call_with_health(
+                    "decider",
+                    lambda: decide_pressures(
+                        self.decider_cfg,
+                        db_get_axioms(self.db),
+                        self._state_summary(),
+                        last_user,
+                        beliefs,
+                        scope="idle",
+                        workspace=db_get_workspace_current(self.db),
+                        needs=db_get_needs_current(self.db),
+                        wishes=db_get_wishes_current(self.db),
+                        self_report=build_self_report(self.hb.load_state(), self.axis).to_dict(),
+                        active_topic=_get_active_topic(db_get_workspace_current(self.db)),
+                    ),
+                )
+            except Exception:
+                return
+
+            db_add_decision(self.db, "idle", last_user, decision)
+            drives = decision.get("drives") if isinstance(decision.get("drives"), dict) else {}
+            actions = decision.get("actions") if isinstance(decision.get("actions"), dict) else {}
+            # Contract normalization: if the decider gives actions but omits the corresponding
+            # pressure deltas, promote actions into pressure drives (keeps logic AI-driven,
+            # avoids keyword heuristics, and prevents "no-op" decisions).
+            try:
+                ws_a = float(actions.get("websense", 0.0) or 0.0)
+            except Exception:
+                ws_a = 0.0
+            try:
+                dd_a = float(actions.get("daydream", 0.0) or 0.0)
+            except Exception:
+                dd_a = 0.0
+            try:
+                ev_a = float(actions.get("evolve", 0.0) or 0.0)
+            except Exception:
+                ev_a = 0.0
+            if ws_a > 0.0:
+                prev = float(drives.get("pressure_websense", 0.0) or 0.0) if isinstance(drives, dict) else 0.0
+                drives["pressure_websense"] = max(prev, ws_a)
+            if dd_a > 0.0:
+                prev = float(drives.get("pressure_daydream", 0.0) or 0.0) if isinstance(drives, dict) else 0.0
+                drives["pressure_daydream"] = max(prev, dd_a)
+            if ev_a > 0.0:
+                prev = float(drives.get("pressure_evolve", 0.0) or 0.0) if isinstance(drives, dict) else 0.0
+                drives["pressure_evolve"] = max(prev, ev_a)
+            if drives:
+                self.hb.enqueue(Event("decision", self._targets_to_delta_payload(drives, eta=self.eta_drives)).with_time())
+                self.hb.step()
+                self.broker.publish("status", db_status(self.db))
+
+            # Daydream
+            if float(((decision.get("actions") or {}).get("daydream") or 0.0)) >= self.th_daydream:
+                try:
+                    dd = self._call_with_health(
+                        "daydream",
+                        lambda: run_daydream(self.daydream_cfg, db_get_axioms(self.db), self._state_summary(), recent, trigger="idle"),
+                    )
+                    db_add_daydream(self.db, "idle", {"state": self._state_summary()}, dd)
+
+                    ax_int = dd.get("axiom_interpretations") if isinstance(dd.get("axiom_interpretations"), dict) else {}
+                    for ak, val in (ax_int or {}).items():
+                        s = (str(val) if val is not None else "").strip()
+                        if not s:
+                            continue
+                        if str(ak) not in ("A1", "A2", "A3", "A4"):
+                            continue
+                        db_upsert_axiom_interpretation(self.db, str(ak), "rewrite", "latest", s, 0.4, "daydream")
+                    # Persist current needs/wishes derived from daydream (first-class, DB-backed)
+                    try:
+                        if isinstance(dd.get('needs'), list):
+                            db_set_needs_current(self.db, {'needs': dd.get('needs') or [], 'source': 'daydream', 'at': now_iso()})
+                        if isinstance(dd.get('wishes'), list):
+                            db_set_wishes_current(self.db, {'wishes': dd.get('wishes') or [], 'source': 'daydream', 'at': now_iso()})
+                    except Exception:
+                        pass
+                    # Daydream can emit proposals; store as mutation proposals for /proposal inspection
+                    try:
+                        # Avoid proposal spam: if there is already an open proposal, do not add more from daydream.
+                        if db_get_latest_open_mutation_proposal(self.db, window_s=self.open_proposal_window_s) is None:
+                            for p in (dd.get('proposals') or []):
+                                if isinstance(p, dict):
+                                    db_add_mutation_proposal(self.db, trigger='daydream', proposal=p)
+                    except Exception:
+                        pass
+                    # Spontaneous WebSense exploration from daydream web_queries (state budgeted)
+                    try:
+                        qs = dd.get('web_queries') if isinstance(dd.get('web_queries'), list) else []
+                        q0 = str(qs[0]).strip() if qs else ''
+                        if q0:
+                            s_now = self.hb.load_state()
+                            pain = float(s_now.values[self.axis.get('pain',0)]) if self.axis.get('pain',0) < len(s_now.values) else 0.0
+                            energy = float(s_now.values[self.axis.get('energy',1)]) if self.axis.get('energy',1) < len(s_now.values) else 0.0
+                            if pain < 0.55 and energy > 0.35:
+                                results = self._call_with_health('websense_search', lambda: search_ddg(q0, k=6), metrics={'query': q0, 'k': 6, 'tag': 'daydream'})
+                                # store minimal page log for later evidence extraction
+                                for r in results[:4]:
+                                    try:
+                                        db_add_websense_page(self.db, q0, r.url, r.title, r.snippet, '', urlparse(r.url).hostname or '', getattr(r, 'hash', ''), 1)
+                                    except Exception:
+                                        pass
+                                aid = db_add_message(self.db, 'auto', f"[websense] daydream query=\"{q0}\" results={len(results)}")
+                                self.broker.publish('message', self._ui_message(aid))
+                    except Exception:
+                        pass
+
+                    # Keep daydream thoughts inside daydream_log (not as UI chat messages).
+                    dd_drives = dd.get("drives") if isinstance(dd.get("drives"), dict) else {}
+                    if dd_drives:
+                        self.hb.enqueue(Event("daydream", self._targets_to_delta_payload(dd_drives, eta=self.eta_drives)).with_time())
+                        self.hb.step()
+                        self.broker.publish("status", db_status(self.db))
+                    self._last_idle_action = time.time()
+                except Exception:
+                    pass
+
+            # Evolve (idle): propose self-development mutations (human approval required)
+            if float(((decision.get("actions") or {}).get("evolve") or 0.0)) >= self.th_evolve:
+                try:
+                    now_t = time.time()
+                    openp = db_get_latest_open_mutation_proposal(self.db, window_s=self.open_proposal_window_s)
+                    if openp is not None:
+                        # If a proposal is already open, refine it occasionally instead of creating new ones.
+                        if now_t - float(self._last_refine or 0.0) < float(self.refine_cooldown_s):
+                            raise RuntimeError("skip_evolve_refine_cooldown")
+                        trigger = "refine"
+                        existing = [openp.get("proposal") or {}]
+                    else:
+                        # No open proposal: enforce cooldown to avoid proposal spam.
+                        if now_t - float(self._last_evolve or 0.0) < float(self.evolve_cooldown_s):
+                            raise RuntimeError("skip_evolve_cooldown")
+                        trigger = "idle"
+                        existing = []
+
+                    beliefs = db_list_beliefs(self.db, limit=20)
+                    # Build & persist self-model snapshot
+                    self_model = build_self_model(
+                        app_dir=os.path.dirname(__file__),
+                        axes=list(self.axis.keys()),
+                        adapters=self.reg.list_bindings(),
+                        matrices=self.store.list_matrices(),
+                        model_cfg={
+                            "speech": getattr(self.cfg, "model", ""),
+                            "decider": getattr(self.decider_cfg, "model", ""),
+                            "daydream": getattr(self.daydream_cfg, "model", ""),
+                            "feedback": getattr(self.feedback_cfg, "model", ""),
+                            "selfeval": getattr(self.selfeval_cfg, "model", ""),
+                            "evolve": getattr(self.evolve_cfg, "model", ""),
+                        },
+                    )
+                    db_add_self_model(self.db, self_model)
+
+                    evo = self._call_with_health(
+                        "evolve",
+                        lambda: propose_mutations(
+                            self.evolve_cfg,
+                            db_get_axioms(self.db),
+                            self._state_summary(),
+                            recent,
+                            beliefs,
+                            self_model,
+                            trigger=trigger,
+                            existing_proposals=existing,
+                        ),
+                    )
+
+                    # persist proposals (refine updates the existing open one)
+                    if trigger == "refine" and openp is not None:
+                        mps = evo.get("mutation_proposals") if isinstance(evo.get("mutation_proposals"), list) else []
+                        p0 = mps[0] if mps and isinstance(mps[0], dict) else None
+                        if p0 is not None:
+                            db_update_mutation_proposal(self.db, int(openp.get("id")), p0, note="refined")
+                            self._last_refine = now_t
+                    else:
+                        for p in (evo.get("mutation_proposals") or []):
+                            if isinstance(p, dict):
+                                db_add_mutation_proposal(self.db, "idle", p)
+                        self._last_evolve = now_t
+
+                    # integrate drive deltas
+                    evo_drives = evo.get("drives") if isinstance(evo.get("drives"), dict) else {}
+                    if evo_drives:
+                        self.hb.enqueue(Event("evolve", self._targets_to_delta_payload(evo_drives, eta=self.eta_drives)).with_time())
+                        self.hb.step()
+                        self.broker.publish("status", db_status(self.db))
+
+                    self._last_idle_action = time.time()
+                except Exception:
+                    # silence cool-down skips
+                    pass
+
+            # WebSense (idle): only when the decider explicitly requests it *and* provides a concrete query.
+            # No string heuristics here. If the decider cannot form a query, we do not run WebSense.
+            if float(((decision.get("actions") or {}).get("websense") or 0.0)) >= self.th_websense:
+                q = (decision.get("web_query") or "").strip()
+                if q.lower() in ("search for user query", "direct_response_to_user_question"):
+                    q = ""
+                if q:
+                    try:
+                        results = self._call_with_health(
+                            "websense_search",
+                            lambda: search_ddg(q, k=4),
+                            metrics={"query": q, "k": 4, "scope": "idle"},
+                        )
+                        fetched = []
+                        for r in results[:2]:
+                            if not r.url:
+                                continue
+                            try:
+                                fetched.append(
+                                    self._call_with_health(
+                                        "websense_fetch",
+                                        lambda u=r.url: fetch(u, timeout_s=12.0),
+                                        metrics={"url": r.url, "scope": "idle"},
+                                    )
+                                )
+                            except Exception:
+                                continue
+                        pages = fetched
+                        unique_domains = {getattr(p, "domain", "") for p in pages if getattr(p, "domain", "")}
+                        ok_flag = 1 if len(results) > 0 else 0
+                        for p in pages:
+                            db_add_websense_page(self.db, q, {
+                                "url": getattr(p, "url", ""),
+                                "title": getattr(p, "title", ""),
+                                "snippet": getattr(p, "snippet", ""),
+                                "body": getattr(p, "body", ""),
+                                "domain": getattr(p, "domain", ""),
+                                "hash": getattr(p, "hash", ""),
+                            }, ok=ok_flag)
+                        self.hb.enqueue(Event("websense", {"pages": len(pages), "domains": len(unique_domains), "ok": int(ok_flag), "query": q}).with_time())
+                        self.hb.step()
+                        self.broker.publish("status", db_status(self.db))
+                        self._last_idle_action = time.time()
+                    except Exception:
+                        pass
+
+            # Sleep / consolidation: if sleep_pressure is high and we've been idle for a bit, consolidate.
+            try:
+                s = self.hb.load_state()
+                idx_sp = self.axis.get("sleep_pressure")
+                sp = float(s.values[idx_sp]) if idx_sp is not None and idx_sp < len(s.values) else 0.0
+                idle_s = float(time.time() - float(self._last_idle_action or time.time()))
+                if sp >= 0.70 and idle_s >= 20.0 and (time.time() - float(self._last_sleep or 0.0)) >= 120.0:
+                    axioms = db_get_axioms(self.db)
+                    beliefs = db_list_beliefs(self.db, limit=40)
+                    ws = db_get_workspace_current(self.db)
+                    recent = db_list_messages(self.db, limit=40)
+                    summary = self._call_with_health(
+                        "sleep",
+                        lambda: sleep_consolidate(self.sleep_cfg, axioms, self._state_summary(), ws, beliefs, recent),
+                    )
+                    if isinstance(summary, dict):
+                        db_add_sleep_log(self.db, summary)
+                        # Write a compact consolidation into long memory as a stable anchor
+                        try:
+                            con = self.db.connect()
+                            con.execute(
+                                "INSERT INTO memory_long(created_at,key,value,confidence,source_note) VALUES(?,?,?,?,?)",
+                                (now_iso(), "sleep_summary", json.dumps(summary, ensure_ascii=False), 0.6, "sleep_consolidate"),
+                            )
+                            con.commit()
+                            con.close()
+                        except Exception:
+                            pass
+                    self._last_sleep = time.time()
+
+                    try:
+                        self._run_sleep_curriculum()
+                    except Exception:
+                        pass
+                    self.broker.publish("status", db_status(self.db))
+            except Exception:
+                pass
+
+            # resources tick (idle): keep energy/stress/affect baseline in sync even without user messages
+            try:
+                metrics = collect_resources()
+                db_add_resources_log(self.db, metrics)
+                e_t = float(metrics.get("energy", 0.5) or 0.5)
+                s_t = float(metrics.get("stress", 0.5) or 0.5)
+                targets = {
+                    "energy": e_t,
+                    "stress": s_t,
+                    "arousal": max(-1.0, min(1.0, 2.0 * s_t - 1.0)),
+                    "security": max(-1.0, min(1.0, 2.0 * e_t - 1.0)),
+                    "valence": max(-1.0, min(1.0, 2.0 * e_t - 1.0)),
+                    "frustration": max(-1.0, min(1.0, 2.0 * s_t - 1.0)),
+                }
+                self.hb.enqueue(Event("resources", self._targets_to_delta_payload(targets, eta=self.eta_measure)).with_time())
+            except Exception:
+                pass
+
+            # immutable pain integration (health-driven) after idle actions
+            self._integrate_pain_tick()
+            self._integrate_fatigue_tick()
+
+    def ensure_seed(self) -> None:
+        n = len(self.axis)
+        mats = self.store.list_matrices()
+        protected_names = {"pain", "energy", "fatigue", "sleep_pressure"}
+        protected_idx = [self.axis.get(nm) for nm in protected_names if self.axis.get(nm) is not None]
+
+        def id_entries(scale: float, protect_metrics: bool = True):
+            """Identity-like seed matrix with optional invariants for protected metrics axes.
+
+            If protect_metrics=True, pain/energy are forced to identity (1.0) so no other event can
+            decay/alter them. This prevents the system from "training down" pain/energy.
+            """
+            m = identity(n, float(scale))
+            if protect_metrics and protected_idx:
+                ents = [(int(i), int(j), float(v)) for (i, j, v) in (m.entries or [])]
+                # remove any entry touching protected axes
+                keep = []
+                pset = {int(x) for x in protected_idx if x is not None}
+                for (i, j, v) in ents:
+                    if i in pset or j in pset:
+                        continue
+                    keep.append((i, j, v))
+                for p in pset:
+                    keep.append((p, p, 1.0))
+                m.entries = keep
+            return m.entries
+
+        def have(name: str, ver: int) -> bool:
+            return any(m["name"] == name and int(m["version"]) == ver for m in mats)
+
+        if not have("A_user", 1):
+            self.store.put_sparse("A_user", version=1, n_rows=n, n_cols=n, entries=id_entries(1.0, protect_metrics=True),
+                                  meta={"desc":"identity injection for user_utterance"})
+        if not have("A_decision", 1):
+            self.store.put_sparse("A_decision", version=1, n_rows=n, n_cols=n, entries=id_entries(0.7, protect_metrics=True),
+                                  meta={"desc":"LLM-decider drive coupling"})
+        if not have("A_websense", 1):
+            self.store.put_sparse("A_websense", version=1, n_rows=n, n_cols=n, entries=id_entries(0.5, protect_metrics=True),
+                                  meta={"desc":"websense coupling"})
+        if not have("A_daydream", 1):
+            self.store.put_sparse("A_daydream", version=1, n_rows=n, n_cols=n, entries=id_entries(0.6, protect_metrics=True),
+                                  meta={"desc":"daydream drive coupling"})
+
+        if not have("A_resources", 1):
+            self.store.put_sparse("A_resources", version=1, n_rows=n, n_cols=n, entries=id_entries(0.4, protect_metrics=False),
+                                  meta={"desc":"resources/energy coupling"})
+
+        if not have("A_health", 1):
+            self.store.put_sparse("A_health", version=1, n_rows=n, n_cols=n, entries=id_entries(0.45, protect_metrics=False),
+                                  meta={"desc":"health/pain coupling (immutable pain model inputs)"})
+
+        if not have("A_evolve", 1):
+            self.store.put_sparse("A_evolve", version=1, n_rows=n, n_cols=n, entries=id_entries(0.55, protect_metrics=True),
+                                  meta={"desc":"evolve/self-development coupling"})
+
+        self.reg.upsert(AdapterBinding("user_utterance", "simple_text_v1", "A_user", 1, {"desc":"user -> state"}))
+        self.reg.upsert(AdapterBinding("decision", "drive_field_v1", "A_decision", 1, {"desc":"decider drives -> state"}))
+        self.reg.upsert(AdapterBinding("reward_signal", "drive_field_v1", "A_reward", 1, {"desc":"invariant reward/high channel (bypasses matrices in integrator)"}))
+        self.reg.upsert(AdapterBinding("daydream", "drive_field_v1", "A_daydream", 1, {"desc":"daydream drives -> state"}))
+        self.reg.upsert(AdapterBinding("websense", "websense_v1", "A_websense", 1, {"desc":"websense -> state"}))
+        self.reg.upsert(AdapterBinding("resources", "drive_field_v1", "A_resources", 1, {"desc":"resources drives -> state"}))
+        self.reg.upsert(AdapterBinding("health", "drive_field_v1", "A_health", 1, {"desc":"health drives -> state"}))
+        self.reg.upsert(AdapterBinding("evolve", "drive_field_v1", "A_evolve", 1, {"desc":"evolve drives -> state"}))
+
+    def _repo_root(self) -> str:
+        """Repository root used by DevLab test runner / patch sandbox."""
+        try:
+            here = os.path.abspath(os.path.dirname(__file__))  # app/
+            cand = os.path.abspath(os.path.join(here, ".."))   # repo/
+            for _ in range(6):
+                if os.path.exists(os.path.join(cand, "pyproject.toml")):
+                    return cand
+                cand = os.path.abspath(os.path.join(cand, ".."))
+            return os.getcwd()
+        except Exception:
+            return os.getcwd()
+
+    def _state_summary(self) -> str:
+        s = self.hb.load_state()
+        inv = {v: k for k, v in self.axis.items()}
+        named = {inv[i]: s.values[i] for i in range(len(s.values)) if i in inv}
+        keys = [
+            "pain","energy","stress","curiosity","confidence","uncertainty","freshness_need","social_need","urge_reply","urge_share",
+            "pressure_websense","pressure_daydream","pressure_evolve","capability_gap","desire_upgrade",
+            "purpose_a1","purpose_a2","purpose_a3","purpose_a4",
+            "tension_a1","tension_a2","tension_a3","tension_a4",
+        ]
+        parts = []
+        for k in keys:
+            if k in named:
+                parts.append(f"{k}={named[k]:+.2f}")
+        return ", ".join(parts)
+
+    def __getattr__(self, name: str):
+        # Compatibility fallback: if _ui_message is missing due to refactors,
+        # provide a safe implementation so the UI doesn't crash.
+        if name == "_ui_message":
+            return lambda mid: _db_fetch_message_dict(self.db, int(mid))
+        raise AttributeError(name)
+
+    def _handle_slash_command(self, text: str) -> str | None:
+        """Handle main-branch compatible slash commands.
+
+        Currently supported:
+          /proposal            -> list recent mutation proposals
+          /proposal <id>       -> show proposal details
+          /proposal help       -> usage
+
+        Returns reply text if handled, otherwise None.
+        """
+        t = (text or "").strip()
+        if not t.startswith("/"):
+            return None
+
+        parts = t.split()
+        cmd = parts[0].lower()
+        if cmd not in ("/proposal", "/proposals"):
+            return None
+
+        if len(parts) == 1 or (len(parts) >= 2 and parts[1].lower() in ("list", "ls")):
+            items = db_list_mutation_proposals(self.db, limit=12)
+            if not items:
+                return "No proposals yet. (Idle evolve will create them when pressure_evolve is high.)"
+            lines = ["Proposals (newest last):"]
+            for it in items:
+                pid = it.get("id")
+                status = it.get("status", "")
+                trig = it.get("trigger", "")
+                created = it.get("created_at", "")
+                title = ""
+                pj = it.get("proposal") or {}
+                if isinstance(pj, dict):
+                    title = str(pj.get("title") or pj.get("name") or "").strip()
+                if not title:
+                    title = "(no title)"
+                lines.append(f"- #{pid} [{status}] {title} | trigger={trig} | {created}")
+            lines.append("\nUse: /proposal <id> to inspect details.")
+            return "\n".join(lines)
+
+        if len(parts) >= 2 and parts[1].lower() in ("help", "h", "?"):
+            return "Usage:\n  /proposal            list proposals\n  /proposal <id>       show details"
+
+        # detail view
+        try:
+            pid = int(parts[1])
+        except Exception:
+            return "Invalid proposal id. Use: /proposal or /proposal <id>"
+        p = db_get_mutation_proposal(self.db, pid)
+        if p is None:
+            return f"Proposal #{pid} not found."
+        # pretty print with sane length
+        pj = p.get("proposal")
+        body = json.dumps(pj, ensure_ascii=False, indent=2)
+        if len(body) > 6000:
+            body = body[:6000] + "\n... (truncated)"
+        return (
+            f"Proposal #{p['id']} [{p['status']}]\n"
+            f"created_at: {p['created_at']}\n"
+            f"trigger: {p['trigger']}\n"
+            f"user_note: {p.get('user_note','')}\n\n"
+            f"proposal_json:\n{body}"
+        )
+
+    def _apply_matrix_update(
+        self,
+        event_type: str,
+        desired_state_delta: Dict[str, float],
+        input_features: Dict[str, float],
+        reward: float,
+    ) -> None:
+        """Generic plasticity: low-rank outer-product update to the matrix bound to event_type.
+
+        Core idea (Event -> Matrix -> State): A_event maps an event encoding x into a state delta y.
+        Learning therefore updates A using u (desired state delta) and x (the event input features).
+
+        Update: ΔA_ij += eta * reward * u_i * x_j
+
+        Stability:
+        - lightweight L2 decay on existing weights (prevents drift)
+        - Frobenius-norm clamp (prevents explosion)
+        - per-entry clamp (prevents single outliers)
+        """
+        try:
+            binding = self.reg.get(event_type)
+            if binding is None:
+                return
+
+            # Snapshot current pain for regression attribution/rollback.
+            pain_before = 0.0
+            try:
+                s0 = self.hb.load_state()
+                idx_p = self.axis.get("pain")
+                if idx_p is not None and idx_p < len(s0.values):
+                    pain_before = float(s0.values[idx_p])
+            except Exception:
+                pain_before = 0.0
+
+            # Protected axes must NOT be learnable (cannot be "trained down" via plasticity).
+            # Invariants:
+            # - No non-health/resources matrix may write into or read from these axes.
+            # - Their diagonal must be identity (1.0) for all non-health/resources matrices.
+            protected_names = {"pain", "energy", "fatigue", "sleep_pressure"}
+            protected_idx = {self.axis.get(n) for n in protected_names if self.axis.get(n) is not None}
+            protected_idx.discard(None)
+            allow_cross = event_type in ("health", "resources")
+
+            # Build sparse u (desired state delta) and x (event input features) over axis indices.
+            u_idx: Dict[int, float] = {}
+            for k, v in (desired_state_delta or {}).items():
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                idx = self.axis.get(str(k))
+                if idx is None:
+                    continue
+                fv = max(-1.0, min(1.0, fv))
+                if abs(fv) < 1e-6:
+                    continue
+                u_idx[idx] = fv
+
+            v_idx: Dict[int, float] = {}
+            for k, v in (input_features or {}).items():
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                idx = self.axis.get(str(k))
+                if idx is None:
+                    continue
+                fv = max(-1.0, min(1.0, fv))
+                if abs(fv) < 1e-6:
+                    continue
+                v_idx[idx] = fv
+
+            if not u_idx or not v_idx:
+                return
+
+            # --- learning hyperparams (keep small on 8GB VRAM systems) ---
+            eta = 0.03              # learning rate
+            l2_decay = 0.001        # global decay on weights
+            frob_tau = 5.0          # Frobenius norm clamp
+            max_abs = 2.0           # per-entry clamp
+
+            r = max(-1.0, min(1.0, float(reward)))
+
+            # compute sparse delta entries
+            delta_entries = []
+            delta_frob = 0.0
+            for i, ui_v in u_idx.items():
+                for j, vj_v in v_idx.items():
+                    if not allow_cross and (i in protected_idx or j in protected_idx):
+                        continue
+                    d = eta * r * ui_v * vj_v
+                    if abs(d) < 1e-6:
+                        continue
+                    delta_entries.append((i, j, float(d)))
+                    delta_frob += float(d) * float(d)
+
+            delta_frob = math.sqrt(delta_frob) if delta_frob > 0.0 else 0.0
+
+            if not delta_entries:
+                return
+
+            # Fetch current matrix
+            A = self.store.get_sparse(binding.matrix_name, int(binding.matrix_version))
+
+            # merge existing entries + decay
+            cur: Dict[Tuple[int, int], float] = {}
+            for (i, j, val) in getattr(A, "entries", []) or []:
+                cur[(int(i), int(j))] = float(val) * (1.0 - l2_decay)
+
+            # apply deltas (this is where off-diagonals naturally grow)
+            for i, j, dv in delta_entries:
+                key = (int(i), int(j))
+                cur[key] = float(cur.get(key, 0.0) + dv)
+
+            # Enforce invariants for protected axes (prevents matrix from affecting pain/energy).
+            if not allow_cross and protected_idx:
+                for (i, j) in list(cur.keys()):
+                    if int(i) in protected_idx or int(j) in protected_idx:
+                        del cur[(i, j)]
+                for p in protected_idx:
+                    cur[(int(p), int(p))] = 1.0
+
+            # per-entry clamp
+            for k in list(cur.keys()):
+                v = cur[k]
+                if v > max_abs:
+                    cur[k] = max_abs
+                elif v < -max_abs:
+                    cur[k] = -max_abs
+
+            # Frobenius clamp (keeps diffusion possible, prevents runaway growth)
+            frob = math.sqrt(sum(v*v for v in cur.values())) if cur else 0.0
+            if frob > frob_tau and frob > 1e-9:
+                scale = frob_tau / frob
+                for k in list(cur.keys()):
+                    cur[k] = float(cur[k] * scale)
+
+            new_version = int(binding.matrix_version) + 1
+            self.store.put_sparse(
+                binding.matrix_name,
+                new_version,
+                A.n_rows,
+                A.n_cols,
+                [(i, j, v) for (i, j), v in cur.items()],
+                meta={
+                    "plasticity": True,
+                    "from_version": int(binding.matrix_version),
+                    "updated_at": now_iso(),
+                    "eta": eta,
+                    "l2_decay": l2_decay,
+                    "frob_tau": frob_tau,
+                    "max_abs": max_abs,
+                },
+            )
+
+            # point adapter to new version
+            binding2 = AdapterBinding(
+                event_type=binding.event_type,
+                encoder_name=binding.encoder_name,
+                matrix_name=binding.matrix_name,
+                matrix_version=new_version,
+                meta=binding.meta,
+            )
+            self.reg.upsert(binding2)
+
+            # audit log (used by pain model)
+            try:
+                db_add_matrix_update_log(
+                    self.db,
+                    event_type=event_type,
+                    matrix_name=binding.matrix_name,
+                    from_version=int(binding.matrix_version),
+                    to_version=int(new_version),
+                    reward=float(r),
+                    delta_frob=float(delta_frob),
+                    pain_before=float(pain_before),
+                    pain_after=0.0,
+                    notes="plasticity_update",
+                )
+            except Exception:
+                pass
+        except Exception:
+            return
+    def process_user_text(self, text: str) -> Tuple[int, int]:
+        """Returns (user_msg_id, reply_msg_id)."""
+        with self._lock:
+            user_id = db_add_message(self.db, "user", text)
+            self.broker.publish("message", self._ui_message(user_id))
+
+            # Main-branch compatible slash commands (fast, no LLM needed)
+            cmd_reply = self._handle_slash_command(text)
+            if cmd_reply is not None:
+                reply_id = db_add_message(self.db, "assistant", cmd_reply)
+                self.broker.publish("message", self._ui_message(reply_id))
+                return user_id, reply_id
+
+            # Lite mode: single-call chat (speech only). This avoids multi-organ
+            # LLM pipelines that can hard-freeze CPU-only machines.
+            if getattr(self, "lite_mode", False):
+                sys_prompt = (
+                    "You are Bunny, a digital organism. Reply naturally, concise and precise. "
+                    "No filler, no greetings unless the user greeted first. "
+                    "No apologies, no meta talk. "
+                    "If you lack information, ask ONE clarifying question."
+                )
+                mood_obj = project_mood(self.hb.load_state(), self.axis).to_dict()
+                user_prompt = (
+                    f"INTERNAL_STATE: {self._state_summary()}\n"
+                    f"MOOD: {json.dumps(mood_obj or {}, ensure_ascii=False)}\n\n"
+                    f"USER: {text}\n\nReply as Bunny."
+                )
+                try:
+                    out = self._call_with_health(
+                        "speech",
+                        lambda: ollama_chat(self.cfg, sys_prompt, user_prompt),
+                        metrics={
+                            "model": self.cfg.model,
+                            "ctx": int(self.cfg.num_ctx),
+                            "lite": True,
+                            "sys_chars": len(sys_prompt),
+                            "user_chars": len(user_prompt),
+                        },
+                    )
+                except Exception as e:
+                    out = f"(speech organ error: {e})"
+                if not out.strip():
+                    out = "Ich bin da. Sag mir kurz, worum es geht."
+                reply_id = db_add_message(self.db, "reply", out)
+                self.broker.publish("message", self._ui_message(reply_id))
+                self.hb.enqueue(Event("speech_outcome", {"len": len(out), "lite": True}).with_time())
+                return user_id, reply_id
+
+            # --- Topic anchoring (reduces drift; AI-decided, not keyword heuristics) ---
+            try:
+                ws_items = db_get_workspace_current(self.db)
+                prev_topic = ''
+                for it in ws_items:
+                    if isinstance(it, dict) and it.get('kind') == 'topic' and it.get('active_topic'):
+                        prev_topic = str(it.get('active_topic') or '')
+                        break
+                td = self._call_with_health(
+                    'topic',
+                    lambda: detect_active_topic(self.topic_cfg, text, prev_topic, self._state_summary()),
+                )
+                active_topic = str(td.get('active_topic') or prev_topic or 'Allgemein').strip()[:80]
+                conf = float(td.get('confidence', 0.5) or 0.5)
+                # update workspace topic item
+                ws_items = [it for it in (ws_items or []) if not (isinstance(it, dict) and it.get('kind') == 'topic')]
+                ws_items.insert(0, {'kind': 'topic', 'active_topic': active_topic, 'confidence': conf})
+                # Prevent topic-bleeding: on a confident topic switch, clear old workspace evidence.
+                # (Generic housekeeping; the topic itself is AI-decided.)
+                if prev_topic and active_topic and active_topic != prev_topic and conf >= 0.70:
+                    ws_items = [ws_items[0]]
+                db_set_workspace_current(self.db, ws_items, note='topic')
+                db_upsert_topic(self.db, active_topic, weight_delta=0.02 * conf)
+                db_open_episode_if_needed(self.db, active_topic)
+            except Exception:
+                pass
+
+
+            fb_ctx = ""
+            fb_last = ""
+
+            # --- Feedback interpreter (child-like correction learning; LLM-based) ---
+            try:
+                last_assistant = db_get_last_assistant_text(self.db)
+                fb_last = last_assistant or ""
+                fb = self._call_with_health(
+                    "feedback",
+                    lambda: interpret_feedback(
+                        self.feedback_cfg,
+                        db_get_axioms(self.db),
+                        self._state_summary(),
+                        last_assistant,
+                        text,
+                    ),
+                )
+                if float(fb.get("is_feedback", 0.0) or 0.0) >= 0.6 and last_assistant:
+                    db_add_feedback(self.db, text, last_assistant, fb)
+
+                    # Persist extracted beliefs (generic structured learning)
+                    for b in (fb.get("beliefs") or []):
+                        if not isinstance(b, dict):
+                            continue
+                        db_add_belief(
+                            self.db,
+                            str(b.get("subject") or ""),
+                            str(b.get("predicate") or ""),
+                            str(b.get("object") or ""),
+                            float(b.get("confidence", 0.75) or 0.75),
+                            str(b.get("provenance") or "user_feedback"),
+                        )
+
+                    # persist a compact correction trace into short memory (acts as immediate self-correction context)
+                    try:
+                        con = self.db.connect()
+                        now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                        con.execute(
+                            "INSERT INTO memory_short(role,content,created_at) VALUES(?,?,?)",
+                            (
+                                "teacher",
+                                ("USER_FEEDBACK: " + (fb.get("notes") or "")).strip()[:1200],
+                                now,
+                            ),
+                        )
+                        con.commit()
+                    finally:
+                        try:
+                            con.close()
+                        except Exception:
+                            pass
+
+                    fb_ctx = "\n\nUSER_FEEDBACK_JSON:\n" + json.dumps(fb, ensure_ascii=False)
+                    fb_ctx += "\n\nLAST_ASSISTANT_FOR_FEEDBACK:\n" + (last_assistant or "")[:1600]
+
+                    drives_fb: Dict[str, Any] = {}
+                    if isinstance(fb.get("desired_state_delta"), dict):
+                        drives_fb.update(fb.get("desired_state_delta") or {})
+                    if isinstance(fb.get("desired_drive_delta"), dict):
+                        drives_fb.update(fb.get("desired_drive_delta") or {})
+                    if drives_fb:
+                        # Feedback deltas may be negative; mark as delta-mode.
+                        self.hb.enqueue(Event("decision", {"drives": drives_fb, "_mode": "delta"}).with_time())
+
+                    # plasticity: update decision matrix (primary coupling point)
+                    # Use the last decision's drive vector as the event input features x.
+                    # (Event->Matrix->State learning; no keyword heuristics.)
+                    x_feats = db_get_last_decision_drives(self.db)
+                    if not x_feats and isinstance(fb.get("desired_drive_delta"), dict):
+                        x_feats = fb.get("desired_drive_delta") or {}
+                    self._apply_matrix_update(
+                        "decision",
+                        fb.get("desired_state_delta") or {},
+                        x_feats or {},
+                        float(fb.get("delta_reward", 0.0) or 0.0),
+                    )
+
+                    # learned trust updates (domains) derived from feedback interpreter
+                    for dom in (fb.get("domains_penalty") or []):
+                        db_update_domain_trust(
+                            self.db,
+                            str(dom),
+                            -abs(float(fb.get("delta_reward", -0.3) or -0.3)),
+                        )
+                    for dom in (fb.get("domains_reward") or []):
+                        db_update_domain_trust(
+                            self.db,
+                            str(dom),
+                            abs(float(fb.get("delta_reward", 0.3) or 0.3)),
+                        )
+            except Exception:
+                pass
+
+            # events: user utterance
+            self.hb.enqueue(Event("user_utterance", {"text": text}).with_time())
+
+            # resources tick -> drives into state (energy/stress budget)
+            try:
+                metrics = collect_resources()
+                db_add_resources_log(self.db, metrics)
+                e_t = float(metrics.get("energy", 0.5) or 0.5)
+                s_t = float(metrics.get("stress", 0.5) or 0.5)
+                # Generic affect baseline derived from resource budget signals.
+                # All targets are bounded to [0,1] (persisted state invariant).
+                targets = {
+                    "energy": max(0.0, min(1.0, e_t)),
+                    "stress": max(0.0, min(1.0, s_t)),
+                    "arousal": max(0.0, min(1.0, s_t)),
+                    "security": max(0.0, min(1.0, 1.0 - s_t)),
+                    "valence": max(0.0, min(1.0, e_t)),
+                    "frustration": max(0.0, min(1.0, s_t)),
+                }
+                self.hb.enqueue(Event("resources", self._targets_to_delta_payload(targets, eta=self.eta_measure)).with_time())
+            except Exception:
+                pass
+
+            # --- LLM decider: pressures/actions ---
+            try:
+                beliefs = db_list_beliefs(self.db, limit=12)
+                decision = self._call_with_health(
+                    "decider",
+                    lambda: decide_pressures(
+                        self.decider_cfg,
+                        db_get_axioms(self.db),
+                        self._state_summary(),
+                        text,
+                        beliefs,
+                        scope="user",
+                        workspace=db_get_workspace_current(self.db),
+                        needs=db_get_needs_current(self.db),
+                        wishes=db_get_wishes_current(self.db),
+                        self_report=build_self_report(self.hb.load_state(), self.axis).to_dict(),
+                        active_topic=_get_active_topic(db_get_workspace_current(self.db)),
+                    ),
+                )
+            except Exception as e:
+                decision = {
+                    "drives": {"uncertainty": 0.05, "stress": 0.05},
+                    "actions": {"websense": 0.0, "daydream": 0.0, "reply": 1.0},
+                    "web_query": "",
+                    "notes": f"decider error: {e}",
+                }
+
+            db_add_decision(self.db, "user", text, decision)
+            drives = decision.get("drives") if isinstance(decision.get("drives"), dict) else {}
+            actions = decision.get("actions") if isinstance(decision.get("actions"), dict) else {}
+
+            # integrate drives into state via decision event
+            self.hb.enqueue(Event("decision", self._targets_to_delta_payload(drives, eta=self.eta_drives)).with_time())
+            self.hb.step()
+            self.broker.publish("status", db_status(self.db))
+
+            ws_context = ""
+            ws_claims_json = ""
+            ws_claims_obj: Dict[str, Any] = {}
+
+            # WebSense gating purely from epistemic signals
+            s_now = self.hb.load_state()
+            idx_unc = self.axis.get("uncertainty")
+            u_now = float(s_now.values[idx_unc]) if idx_unc is not None and idx_unc < len(s_now.values) else 0.0
+            idx_fresh = self.axis.get("freshness_need")
+            f_now = float(s_now.values[idx_fresh]) if idx_fresh is not None and idx_fresh < len(s_now.values) else 0.0
+
+            # Sanitize bounded axes in persisted state (old DBs may contain -1..1 values).
+            dirty = False
+            if idx_unc is not None and idx_unc < len(s_now.values):
+                cu = 0.0 if u_now < 0.0 else 1.0 if u_now > 1.0 else u_now
+                if cu != u_now:
+                    s_now.values[idx_unc] = cu
+                    u_now = cu
+                    dirty = True
+            if idx_fresh is not None and idx_fresh < len(s_now.values):
+                cf = 0.0 if f_now < 0.0 else 1.0 if f_now > 1.0 else f_now
+                if cf != f_now:
+                    s_now.values[idx_fresh] = cf
+                    f_now = cf
+                    dirty = True
+            idx_conf = self.axis.get("confidence")
+            if idx_conf is not None and idx_conf < len(s_now.values):
+                c_now = float(s_now.values[idx_conf])
+                cc = 0.0 if c_now < 0.0 else 1.0 if c_now > 1.0 else c_now
+                if cc != c_now:
+                    s_now.values[idx_conf] = cc
+                    dirty = True
+            if dirty:
+                # Persist sanitized state so future ticks start in a valid range.
+                self.hb.save_state(s_now, [])
+            ws_action = float(((decision.get("actions") or {}).get("websense") or 0.0))
+
+            def _cl01(x: float) -> float:
+                return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+            # WebSense trigger is purely epistemic:
+            # - evidence is needed when uncertainty is high AND confidence is low
+            # - freshness_need can trigger websense for time-sensitive facts
+            # - decider may explicitly request websense
+            # All bounded axes live in [0,1]; never use abs().
+            u_now = _cl01(u_now)
+            f_now = _cl01(f_now)
+            ws_action = _cl01(ws_action)
+
+            idx_conf2 = self.axis.get("confidence")
+            c_now2 = float(s_now.values[idx_conf2]) if (idx_conf2 is not None and idx_conf2 < len(s_now.values)) else 0.0
+            c_now2 = _cl01(c_now2)
+
+            idx_pws = self.axis.get("pressure_websense")
+            pws_now = float(s_now.values[idx_pws]) if (idx_pws is not None and idx_pws < len(s_now.values)) else 0.0
+            pws_now = _cl01(pws_now)
+
+            need_evidence = u_now * (1.0 - c_now2)
+            want_web = max(ws_action, f_now, need_evidence, pws_now) >= self.th_websense
+
+            query = (decision.get("web_query") or "").strip()
+            if query.lower() in ("search for user query", "direct_response_to_user_question"):
+                query = ""
+            if want_web and (not query):
+                query = text
+
+            if want_web:
+                try:
+                    def _run_websense_once(q: str, *, tag: str = "") -> Tuple[List[Any], List[Any], List[str], Dict[str, Any]]:
+                        """Run one WebSense iteration: search->fetch->spider->evidence."""
+                        results_local = self._call_with_health(
+                            "websense_search",
+                            lambda: search_ddg(q, k=6),
+                            metrics={"query": q, "k": 6, "tag": tag},
+                        )
+
+                        trust_map = db_get_domain_trust_map(self.db)
+
+                        def _tr(u: str) -> float:
+                            d = (urlparse(u).hostname or "").lower()
+                            return float(trust_map.get(d, 0.5))
+
+                        results_sorted = sorted(results_local, key=lambda r: _tr(getattr(r, "url", "")), reverse=True)
+
+                        fetched_local: List[Any] = []
+                        for r in results_sorted[:3]:
+                            if getattr(r, "url", ""):
+                                try:
+                                    fetched_local.append(
+                                        self._call_with_health(
+                                            "websense_fetch",
+                                            lambda u=r.url: fetch(u, timeout_s=12.0),
+                                            metrics={"url": r.url, "tag": tag},
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+
+                        # Spider budget is state-driven: uncertainty × energy (same budget per iteration)
+                        seeds_local = [results_sorted[0].url] if results_sorted and getattr(results_sorted[0], "url", "") else []
+                        crawled_local = (
+                            self._call_with_health(
+                                "websense_spider",
+                                lambda: spider(seeds_local, bud),
+                                metrics={"seeds": seeds_local, "max_pages": bud.max_pages, "tag": tag},
+                            )
+                            if seeds_local
+                            else []
+                        )
+
+                        pages_local: List[Any] = []
+                        seen_hash2, seen_url2 = set(), set()
+                        for p in fetched_local + crawled_local:
+                            u = getattr(p, "url", "") or ""
+                            h = getattr(p, "hash", "") or ""
+                            if not u or u in seen_url2 or (h and h in seen_hash2):
+                                continue
+                            pages_local.append(p)
+                            seen_url2.add(u)
+                            if h:
+                                seen_hash2.add(h)
+
+                        ctx_lines_local: List[str] = []
+                        for i, r in enumerate(results_sorted[:4], start=1):
+                            if getattr(r, "url", ""):
+                                ctx_lines_local.append(f"[R{i}] {r.title}\nURL: {r.url}\nSNIPPET: {r.snippet}")
+                        for i, p in enumerate(pages_local[:4], start=1):
+                            t = (getattr(p, "title", "") or "").strip()
+                            dom = getattr(p, "domain", "") or ""
+                            urlp = getattr(p, "url", "") or ""
+                            body = getattr(p, "body", "") or ""
+                            ctx_lines_local.append(f"[P{i}] {t} ({dom})\nURL: {urlp}\nEXCERPT: {body[:1400]}")
+
+                        ev_local: Dict[str, Any] = {}
+                        if ctx_lines_local:
+                            serp_lines = [ln for ln in ctx_lines_local if ln.startswith("[R")]
+                            page_lines = [ln for ln in ctx_lines_local if ln.startswith("[P")]
+                            ev_cfg2 = EvidenceConfig(
+                                host=self.cfg.host,
+                                model=self.cfg.model,
+                                temperature=0.1,
+                                num_ctx=min(2048, int(self.cfg.num_ctx)),
+                                stream=False,
+                            )
+                            ev_local = self._call_with_health(
+                                "evidence",
+                                lambda: extract_evidence_claims(
+                                    ev_cfg2,
+                                    question=text,
+                                    query=q,
+                                    serp_lines=serp_lines,
+                                    page_lines=page_lines,
+                                ),
+                                metrics={"query": q, "serp": len(serp_lines), "pages": len(page_lines), "tag": tag},
+                            )
+                            db_add_evidence_log(self.db, query=q, question=text, evidence=ev_local)
+
+                        return results_sorted, pages_local, ctx_lines_local, ev_local
+
+                    results = self._call_with_health(
+                        "websense_search",
+                        lambda: search_ddg(query, k=6),
+                        metrics={"query": query, "k": 6},
+                    )
+
+                    # Trust-aware ordering (learned, DB-backed)
+                    trust = db_get_domain_trust_map(self.db)
+
+                    def _tr(u: str) -> float:
+                        d = (urlparse(u).hostname or "").lower()
+                        return float(trust.get(d, 0.5))
+
+                    results = sorted(results, key=lambda r: _tr(getattr(r, "url", "")), reverse=True)
+
+                    fetched = []
+                    for r in results[:3]:
+                        if r.url:
+                            try:
+                                fetched.append(
+                                    self._call_with_health(
+                                        "websense_fetch",
+                                        lambda u=r.url: fetch(u, timeout_s=12.0),
+                                        metrics={"url": r.url},
+                                    )
+                                )
+                            except Exception:
+                                pass
+
+                    # Spider depth is state-driven: uncertainty × energy
+                    idx_e = self.axis.get("energy")
+                    e_now = float(s_now.values[idx_e]) if idx_e is not None and idx_e < len(s_now.values) else 0.5
+                    unc = max(0.0, min(1.0, u_now))
+                    ene = max(0.0, min(1.0, abs(e_now)))
+                    max_pages = 2 + int(round(4 * unc * ene))
+                    bud = SpiderBudget(
+                        max_pages=max(2, min(8, max_pages)),
+                        per_domain_max=3,
+                        max_links_per_page=12,
+                    )
+                    seeds = [results[0].url] if results and results[0].url else []
+                    crawled = (
+                        self._call_with_health(
+                            "websense_spider",
+                            lambda: spider(seeds, bud),
+                            metrics={"seeds": seeds, "max_pages": bud.max_pages},
+                        )
+                        if seeds
+                        else []
+                    )
+
+                    # Merge + de-duplicate
+                    pages = []
+                    seen_hash, seen_url = set(), set()
+                    for p in fetched + crawled:
+                        u = getattr(p, "url", "") or ""
+                        h = getattr(p, "hash", "") or ""
+                        if not u or u in seen_url or (h and h in seen_hash):
+                            continue
+                        pages.append(p)
+                        seen_url.add(u)
+                        if h:
+                            seen_hash.add(h)
+
+                    ok_flag = 1 if results else 0
+                    err_reason = "" if ok_flag else "no_results"
+
+                    unique_domains = {getattr(p, "domain", "") for p in pages if getattr(p, "domain", "")}
+                    for p in pages:
+                        db_add_websense_page(
+                            self.db,
+                            query,
+                            {
+                                "url": getattr(p, "url", ""),
+                                "title": getattr(p, "title", ""),
+                                "snippet": getattr(p, "snippet", ""),
+                                "body": getattr(p, "body", ""),
+                                "domain": getattr(p, "domain", ""),
+                                "hash": getattr(p, "hash", ""),
+                            },
+                            ok=ok_flag,
+                        )
+
+                    ctx_lines: List[str] = []
+                    for i, r in enumerate(results[:4], start=1):
+                        if r.url:
+                            ctx_lines.append(f"[R{i}] {r.title}\nURL: {r.url}\nSNIPPET: {r.snippet}")
+                    for i, p in enumerate(pages[:4], start=1):
+                        t = (getattr(p, "title", "") or "").strip()
+                        dom = getattr(p, "domain", "") or ""
+                        urlp = getattr(p, "url", "") or ""
+                        body = getattr(p, "body", "") or ""
+                        ctx_lines.append(f"[P{i}] {t} ({dom})\nURL: {urlp}\nEXCERPT: {body[:1400]}")
+
+                    if ctx_lines:
+                        ws_context = "\n\nWEBSENSE_EVIDENCE:\n" + "\n\n".join(ctx_lines)
+                        try:
+                            serp_lines = [ln for ln in ctx_lines if ln.startswith("[R")]
+                            page_lines = [ln for ln in ctx_lines if ln.startswith("[P")]
+                            ev_cfg = EvidenceConfig(
+                                host=self.cfg.host,
+                                model=self.cfg.model,
+                                temperature=0.1,
+                                num_ctx=min(2048, int(self.cfg.num_ctx)),
+                                stream=False,
+                            )
+                            ev = self._call_with_health(
+                                "evidence",
+                                lambda: extract_evidence_claims(
+                                    ev_cfg,
+                                    question=text,
+                                    query=query,
+                                    serp_lines=serp_lines,
+                                    page_lines=page_lines,
+                                ),
+                                metrics={"query": query, "serp": len(serp_lines), "pages": len(page_lines)},
+                            )
+                            db_add_evidence_log(self.db, query=query, question=text, evidence=ev)
+                            ws_claims_obj = ev if isinstance(ev, dict) else {}
+                            ws_claims_json = json.dumps(ws_claims_obj, ensure_ascii=False)
+                            ws_context += "\n\nWEBSENSE_CLAIMS_JSON:\n" + ws_claims_json
+                        except Exception:
+                            pass
+
+                    # Optional iteration-2: if evidence says something is missing and budgets allow,
+                    # ask the model to refine the query and run a second pass.
+                    try:
+                        miss = ws_claims_obj.get("missing") if isinstance(ws_claims_obj, dict) else None
+                        unc2 = float(ws_claims_obj.get("uncertainty", 0.0) or 0.0) if isinstance(ws_claims_obj, dict) else 0.0
+                        idx_pain = self.axis.get("pain_physical")
+                        pain_total_now = float(s_now.values[idx_pain]) if idx_pain is not None and idx_pain < len(s_now.values) else 0.0
+                        if isinstance(miss, list) and miss and unc2 >= 0.45 and ene >= 0.25 and pain_total_now <= 0.65:
+                            ev_cfg_r = EvidenceConfig(
+                                host=self.cfg.host,
+                                model=self.cfg.model,
+                                temperature=0.1,
+                                num_ctx=min(2048, int(self.cfg.num_ctx)),
+                                stream=False,
+                            )
+                            rq = self._call_with_health(
+                                "evidence_refine",
+                                lambda: refine_search_query(ev_cfg_r, question=text, current_query=query, claims=ws_claims_obj),
+                                metrics={"query": query},
+                            )
+                            q2 = (rq.get("query") or "").strip() if isinstance(rq, dict) else ""
+                            if q2 and q2.lower() != query.lower():
+                                r2, pages2, ctx2, ev2 = _run_websense_once(q2, tag="iter2")
+                                if ctx2:
+                                    ws_context += "\n\nWEBSENSE_ITERATION_2:\n" + "\n\n".join(ctx2)
+                                if isinstance(ev2, dict) and ev2:
+                                    ws_claims_obj = ev2
+                                    ws_claims_json = json.dumps(ws_claims_obj, ensure_ascii=False)
+                                    ws_context += "\n\nWEBSENSE_CLAIMS_JSON:\n" + ws_claims_json
+                                # emit an auto note for transparency
+                                unique_domains2 = {getattr(p, "domain", "") for p in pages2 if getattr(p, "domain", "")}
+                                aid2 = db_add_message(
+                                    self.db,
+                                    "auto",
+                                    f"[websense] iter=2 query=\"{q2}\" results={len(r2)} pages={len(pages2)} domains={len(unique_domains2)} ok={1 if r2 else 0}",
+                                )
+                                self.broker.publish("message", self._ui_message(aid2))
+                    except Exception:
+                        pass
+
+                    self.hb.enqueue(
+                        Event(
+                            "websense",
+                            {"pages": len(pages), "domains": len(unique_domains), "ok": int(ok_flag), "query": query},
+                        ).with_time()
+                    )
+                    aid = db_add_message(
+                        self.db,
+                        "auto",
+                        f"[websense] query=\"{query}\" results={len(results)} pages={len(pages)} domains={len(unique_domains)} ok={int(ok_flag)} reason={err_reason}",
+                    )
+                    self.broker.publish("message", self._ui_message(aid))
+                except Exception as e:
+                    self.hb.enqueue(
+                        Event(
+                            "websense",
+                            {"pages": 0, "domains": 0, "ok": 0, "query": query, "error": str(e)[:200]},
+                        ).with_time()
+                    )
+                    aid = db_add_message(self.db, "auto", f"[websense] query=\"{query}\" ok=0 error={str(e)[:140]}")
+                    self.broker.publish("message", self._ui_message(aid))
+
+                self.hb.step()
+                self.broker.publish("status", db_status(self.db))
+
+            # --- Daydream organ ---
+            s_now2 = self.hb.load_state()
+            idx_dd = self.axis.get("pressure_daydream")
+            p_dd = float(s_now2.values[idx_dd]) if idx_dd is not None and idx_dd < len(s_now2.values) else 0.0
+            want_daydream = (p_dd >= self.th_daydream) or (float(((decision.get("actions") or {}).get("daydream") or 0.0)) >= self.th_daydream)
+            if want_daydream:
+                try:
+                    recent = db_list_messages(self.db, limit=40)
+                    dd = run_daydream(self.daydream_cfg, db_get_axioms(self.db), self._state_summary(), recent, trigger="user")
+                    db_add_daydream(self.db, "user", {"state": self._state_summary()}, dd)
+
+                    ax_int = dd.get("axiom_interpretations") if isinstance(dd.get("axiom_interpretations"), dict) else {}
+                    for ak, val in (ax_int or {}).items():
+                        s = (str(val) if val is not None else "").strip()
+                        if s and str(ak) in ("A1", "A2", "A3", "A4"):
+                            db_upsert_axiom_interpretation(self.db, str(ak), "rewrite", "latest", s, 0.4, "daydream")
+
+                    # Persist current needs/wishes derived from daydream
+                    try:
+                        if isinstance(dd.get('needs'), list):
+                            db_set_needs_current(self.db, {'needs': dd.get('needs') or [], 'source': 'daydream', 'at': now_iso()})
+                        if isinstance(dd.get('wishes'), list):
+                            db_set_wishes_current(self.db, {'wishes': dd.get('wishes') or [], 'source': 'daydream', 'at': now_iso()})
+                    except Exception:
+                        pass
+                    try:
+                        for p in (dd.get('proposals') or []):
+                            if isinstance(p, dict):
+                                db_add_mutation_proposal(self.db, trigger='daydream', proposal=p)
+                    except Exception:
+                        pass
+
+                    dd_drives = dd.get("drives") if isinstance(dd.get("drives"), dict) else {}
+                    if dd_drives:
+                        self.hb.enqueue(Event("daydream", {"drives": dd_drives}).with_time())
+                        self.hb.step()
+                        self.broker.publish("status", db_status(self.db))
+                except Exception as e:
+                    db_add_daydream(self.db, "user_error", {"state": self._state_summary()}, {"error": str(e)[:200]})
+
+            sys_prompt = (
+                "You are Bunny, a digital organism. Speech is an organ that emits text from internal state. "
+	            "Be natural, concise, and precise. "
+	            "No filler: do not open with greetings or boilerplate unless the user greeted you first. "
+	            "Never use phrases like 'Ich habe deine Frage gelesen', 'Wie kann ich helfen?', 'Es ist nicht ganz klar'. "
+	                "Do NOT invent a human biography: you have no human family, friends, childhood, or physical body unless explicitly provided via capabilities. "
+	                "If asked about your family: explain you are a digital organism running as software; your closest equivalent is the set of organs/modules and your operator (the user). "
+                "Do NOT apologize, do NOT talk about being confused/overburdened, do NOT give meta commentary. "
+                "If WEBSENSE_EVIDENCE / WEBSENSE_CLAIMS_JSON are present, use them as evidence. "
+                "If USER_FEEDBACK_JSON is present, treat the USER message as a correction/disagreement about the last assistant reply: "
+                "(1) acknowledge briefly, (2) apply the correction, (3) answer the underlying question correctly. "
+                "Prefer concrete values and cite source URLs when available. "
+                "If evidence is insufficient, state exactly what is missing and ask ONE clarifying question."
+            )
+
+            ws_items_cur = db_get_workspace_current(self.db)
+            active_topic = _get_active_topic(ws_items_cur)
+            needs_cur = db_get_needs_current(self.db)
+            wishes_cur = db_get_wishes_current(self.db)
+            self_rep = build_self_report(self.hb.load_state(), self.axis).to_dict()
+            workspace_block = f"\n\nWORKSPACE:\n" + json.dumps(ws_items_cur or [], ensure_ascii=False) if ws_items_cur else ""
+            needs_block = f"\n\nNEEDS_CURRENT:\n" + json.dumps(needs_cur or {}, ensure_ascii=False) if needs_cur else ""
+            wishes_block = f"\n\nWISHES_CURRENT:\n" + json.dumps(wishes_cur or {}, ensure_ascii=False) if wishes_cur else ""
+            selfreport_block = f"\n\nSELF_REPORT:\n" + json.dumps(self_rep or {}, ensure_ascii=False)
+            mood_obj = project_mood(self.hb.load_state(), self.axis).to_dict()
+            mood_block = f"\n\nMOOD:\n" + json.dumps(mood_obj or {}, ensure_ascii=False)
+            topic_block = f"\n\nACTIVE_TOPIC: {active_topic}" if active_topic else ""
+
+            mem_long = db_get_memory_long(self.db, limit=4)
+            mem_long_ctx = render_memory_long_context(mem_long)
+            mem_long_block = f"\n\nMEMORY_LONG:\n{mem_long_ctx}" if mem_long_ctx else ""
+
+            mem_items = db_get_memory_short(self.db, limit=14)
+            mem_ctx = render_memory_context(mem_items)
+            mem_block = f"\n\nMEMORY_SHORT:\n{mem_ctx}" if mem_ctx else ""
+
+            beliefs_items = db_list_beliefs(self.db, limit=10, topic=active_topic)
+            beliefs_ctx = render_beliefs_context(beliefs_items)
+            beliefs_block = f"\n\nBELIEFS:\n{beliefs_ctx}" if beliefs_ctx else ""
+            sensory_items = db_get_sensory_tokens(self.db, limit=5, topic=active_topic)
+            sensory_block = f"\n\nSENSORY_TOKENS:\n" + json.dumps(sensory_items or [], ensure_ascii=False) if sensory_items else ""
+
+            user_prompt = (
+                f"INTERNAL_STATE: {self._state_summary()}{topic_block}{selfreport_block}{mood_block}{needs_block}{wishes_block}{workspace_block}{mem_long_block}{mem_block}{beliefs_block}{sensory_block}\n\n"
+                f"USER: {text}{ws_context}{fb_ctx}\n\n"
+                "Reply as Bunny (German is ok if the user writes German)."
+            )
+
+            try:
+                out = self._call_with_health(
+                    "speech",
+                    lambda: ollama_chat(self.cfg, sys_prompt, user_prompt),
+                    metrics={
+                        "model": self.cfg.model,
+                        "ctx": int(self.cfg.num_ctx),
+                        "sys_chars": len(sys_prompt),
+                        "user_chars": len(user_prompt),
+                        # rough proxy: 4 chars/token (language dependent); used only for budgeting/telemetry
+                        "ctx_pressure": float(len(sys_prompt) + len(user_prompt)) / max(1.0, float(self.cfg.num_ctx) * 4.0),
+                    },
+                )
+            except Exception as e:
+                out = f"(speech organ error: {e})"
+
+            if not out.strip():
+                out = "Ich bin da. Sag mir kurz, worum es geht."
+
+            reply_id = db_add_message(self.db, "reply", out)
+            self.broker.publish("message", self._ui_message(reply_id))
+            self.hb.enqueue(Event("speech_outcome", {"len": len(out)}).with_time())
+
+            # --- Outcome self-learning (no explicit user rating required) ---
+            try:
+                se = self._call_with_health(
+                    "selfeval",
+                    lambda: evaluate_outcome(
+                        self.selfeval_cfg,
+                        db_get_axioms(self.db),
+                        self._state_summary(),
+                        question=text,
+                        answer=out,
+                        websense_claims_json=ws_claims_json,
+                    ),
+                )
+                # integrate suggested drive deltas into state
+                drives_delta = se.get("drives_delta") if isinstance(se.get("drives_delta"), dict) else {}
+                if drives_delta:
+                    # Self-eval outputs deltas; apply in delta-mode.
+                    self.hb.enqueue(Event("decision", {"drives": drives_delta, "_mode": "delta"}).with_time())
+                    self.hb.step()
+
+                # plasticity: gently update decision coupling from self-eval reward
+                # Use the current turn's decision drive vector as x.
+                x_feats = drives if isinstance(drives, dict) else {}
+                self._apply_matrix_update(
+                    "decision",
+                    drives_delta or {},
+                    x_feats or {},
+                    float(se.get("delta_reward", 0.0) or 0.0),
+                )
+
+                # trust learning from outcome
+                for dom in (se.get("domains_penalty") or []):
+                    db_update_domain_trust(self.db, str(dom), -abs(float(se.get("delta_reward", -0.2) or -0.2)))
+                for dom in (se.get("domains_reward") or []):
+                    db_update_domain_trust(self.db, str(dom), abs(float(se.get("delta_reward", 0.2) or 0.2)))
+
+                # beliefs from outcome (only when supported)
+                for b in (se.get("beliefs") or []):
+                    if not isinstance(b, dict):
+                        continue
+                    db_add_belief(
+                        self.db,
+                        str(b.get("subject") or ""),
+                        str(b.get("predicate") or ""),
+                        str(b.get("object") or ""),
+                        float(b.get("confidence", 0.65) or 0.65),
+                        str(b.get("provenance") or "self_eval"),
+                    )
+            except Exception:
+                pass
+
+            # --- Workspace commit (global workspace for consciousness-like broadcast) ---
+            try:
+                s_now = self.hb.load_state()
+                idx_pain = self.axis.get("pain_physical")
+                idx_energy = self.axis.get("energy")
+                idx_unc = self.axis.get("uncertainty")
+                pain_v = float(s_now.values[idx_pain]) if idx_pain is not None and idx_pain < len(s_now.values) else 0.0
+                energy_v = float(s_now.values[idx_energy]) if idx_energy is not None and idx_energy < len(s_now.values) else 0.5
+                unc_v = float(s_now.values[idx_unc]) if idx_unc is not None and idx_unc < len(s_now.values) else 0.5
+                candidates = [
+                    {"kind":"question","text": text, "w": 1.0},
+                    {"kind":"answer","text": out[:800], "w": 0.9},
+                    {"kind":"websense_claims","text": (ws_claims_json or "")[:800], "w": 0.7},
+                    {"kind":"state","text": f"pain={pain_v:.2f}, energy={energy_v:.2f}, uncertainty={unc_v:.2f}", "w": 0.6},
+                ]
+                prev = db_get_workspace_current(self.db)
+                arb_model = os.environ.get("BUNNY_MODEL_WORKSPACE") or (os.environ.get("BUNNY_MODEL_DECIDER") or "llama3.2:3b-instruct")
+                items = arbitrate_workspace(
+                    getattr(self.cfg, "host", "http://127.0.0.1:11434"),
+                    arb_model,
+                    candidates=candidates,
+                    prev_items=prev,
+                    max_items=int(os.environ.get("BUNNY_WORKSPACE_MAX", "12")),
+                )
+                db_set_workspace_current(self.db, items, note="user_turn")
+            except Exception:
+                pass
+
+            # immutable pain integration (health/outcome-driven)
+            self._integrate_pain_tick()
+            self._integrate_fatigue_tick()
+            return user_id, reply_id
+            self.hb.step()
+            self.broker.publish("status", db_status(self.db))
+
+    def caught(self, message_id: int) -> None:
+        with self._lock:
+            db_caught_message(self.db, message_id)
+            self.broker.publish("message", self._ui_message(message_id))
+
+            # Treat explicit ❌ as strong negative feedback and learn generically (LLM-based).
+            # No hardcoded domain heuristics: we self-evaluate the (question, answer) pair.
+            try:
+                q, a, ts = db_get_prev_user_for_reply(self.db, int(message_id))
+                if q and a:
+                    se = self._call_with_health(
+                        "selfeval",
+                        lambda: evaluate_outcome(
+                            self.selfeval_cfg,
+                            db_get_axioms(self.db),
+                            self._state_summary(),
+                            question=q,
+                            answer=a,
+                            websense_claims_json="",
+                        ),
+                    )
+                    drives_delta = se.get("drives_delta") if isinstance(se.get("drives_delta"), dict) else {}
+                    if drives_delta:
+                        self.hb.enqueue(Event("decision", {"drives": drives_delta, "_mode": "delta"}).with_time())
+                        self.hb.step()
+
+                    x_feats = db_get_decision_drives_before(self.db, ts)
+                    self._apply_matrix_update(
+                        "decision",
+                        drives_delta or {},
+                        x_feats or {},
+                        float(se.get("delta_reward", -0.6) or -0.6),
+                    )
+                    # Update failure clusters (generic, LLM-based) for long-term self-development.
+                    try:
+                        fc = self._call_with_health(
+                            "cluster",
+                            lambda: assign_failure_cluster(
+                                self.cluster_cfg,
+                                db_get_axioms(self.db),
+                                user_text=q,
+                                last_assistant=a,
+                                selfeval=se if isinstance(se, dict) else {},
+                                feedback={},
+                            ),
+                        )
+                        db_upsert_failure_cluster(self.db, fc, example={"message_id": int(message_id), "q": q[:500], "a": a[:500]})
+                        db_meta_set(self.db, "last_failure_cluster", str(fc.get("cluster_key") or ""))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+
+
+
+def _run_sleep_curriculum(self) -> None:
+    """Self-training during 'sleep': build shadow matrix candidates from recent failures, test, and promote.
+
+    Also performs self-development steps:
+    - failure clustering
+    - skill refinement
+    - matured DevLab proposals with REAL sandbox test runner
+    """
+    # Rate-limit via meta key (avoid constant background training).
+    try:
+        last = float(db_meta_get(self.db, "last_curriculum_ts", "0") or 0.0)
+    except Exception:
+        last = 0.0
+    now = time.time()
+    cooldown_s = float(os.getenv("BUNNY_CURRICULUM_COOLDOWN", "900") or 900.0)
+    if now - last < cooldown_s:
+        return
+
+    # Seeds: recent caught pairs (strong signal).
+    pairs = db_list_recent_caught_pairs(self.db, limit=int(os.getenv("BUNNY_CURRICULUM_SEEDS", "10") or 10))
+    if not pairs:
+        return
+
+    # ---- Self-development: cluster failures + maintain skills + mature proposals (DevLab) ----
+    try:
+        # Assign clusters for each (q,a) pair and persist cluster stats.
+        for p in pairs:
+            q0 = str(p.get("question") or "")
+            a0 = str(p.get("answer") or "")
+            fc = self._call_with_health(
+                "cluster",
+                lambda q=q0, a=a0: assign_failure_cluster(
+                    self.cluster_cfg,
+                    db_get_axioms(self.db),
+                    user_text=q,
+                    last_assistant=a,
+                    selfeval={},
+                    feedback={"caught": True},
+                ),
+            )
+            db_upsert_failure_cluster(self.db, fc, example={"q": q0[:500], "a": a0[:500]})
+
+        # Build/refine skills for top clusters.
+        all_fc = db_list_failure_clusters(self.db, limit=8)
+        for fc in all_fc[:3]:
+            ck = str(fc.get("cluster_key") or "")
+            if not ck or ck == "none":
+                continue
+            existing = db_get_skill(self.db, ck) or {}
+            examples = list(fc.get("examples") or [])[-12:]
+            sk = self._call_with_health(
+                "skill",
+                lambda: build_skill(self.skill_cfg, db_get_axioms(self.db), fc, examples, existing_skill=existing),
+            )
+            db_upsert_skill(self.db, ck, sk)
+
+            # If cluster persists and skill confidence is low, request DevLab matured proposal.
+            if int(fc.get("count") or 0) >= int(os.getenv("BUNNY_DEVBOT_MIN_CLUSTER", "4") or 4) and float(sk.get("confidence") or 0.0) < float(os.getenv("BUNNY_DEVBOT_MIN_SKILL_CONF", "0.65") or 0.65):
+                last_dev = float(db_meta_get(self.db, f"devlab_last_{ck}", "0") or 0.0)
+                if time.time() - last_dev > float(os.getenv("BUNNY_DEVBOT_COOLDOWN", "7200") or 7200):
+                    skills = [db_get_skill(self.db, ck) or {}]
+                    dev = self._call_with_health(
+                        "devlab",
+                        lambda: propose_patch_and_tests(
+                            self.devlab_cfg,
+                            db_get_axioms(self.db),
+                            fc,
+                            examples,
+                            skills,
+                            repo_hint={"project": "FSKI pybunny", "note": "python codebase; propose minimal diffs + tests"},
+                        ),
+                    )
+                    prop_v2 = dev.get("proposal_v2") if isinstance(dev, dict) else {}
+                    patch = str(dev.get("patch_unified_diff") or "")
+                    cmds = dev.get("test_commands") if isinstance(dev.get("test_commands"), list) else [["python", "-m", "compileall", "."], ["python", "-m", "pytest", "-q"]]
+
+                    # REAL sandbox tests: apply patch in temp dir then run commands.
+                    verdict = "proposed"
+                    test_out = ""
+                    _fx = [{"question": str(e.get("q") or "") , "answer": str(e.get("a") or "")} for e in (examples or [])][-8:]
+                    try:
+                        res = run_patch_tests_with_pain(self._repo_root(), patch, cmds, fixtures=_fx, axioms=db_get_axioms(self.db), state_summary=self._state_summary())
+                        test_out = json.dumps(res, ensure_ascii=False)
+                        verdict = "tested_ok" if int(res.get("ok") or 0) == 1 else "tested_fail"
+                    except Exception as e:
+                        test_out = f"test_runner_error: {type(e).__name__}: {e}"
+                        verdict = "not_tested"
+
+                    db_add_devlab_run(self.db, ck, "mature_proposal", patch, cmds, test_out, verdict, meta={"proposal_v2": prop_v2})
+                    # Positive reinforcement (A3/A4 progress): small "high" that decays naturally via resources tick.
+                    if verdict == "tested_ok":
+                        joy = {"valence": 0.06, "confidence": 0.05, "awe": 0.03, "arousal": 0.02, "curiosity": 0.02, "sat_a1": 0.08, "sat_a3": 0.10, "sat_a4": 0.10}
+                        self.hb.enqueue(Event("reward_signal", {"_mode":"delta", "drives": joy}).with_time())
+                    if isinstance(prop_v2, dict) and prop_v2:
+                        db_add_mutation_proposal(self.db, trigger=f"devlab:{ck}", proposal={"proposal_v2": prop_v2, "patch": patch, "test_plan": cmds, "test_result": verdict})
+                    db_meta_set(self.db, f"devlab_last_{ck}", str(time.time()))
+    except Exception:
+        # Never let sleep dev loop crash the server.
+        pass
+
+    seeds = [{"question": p["question"], "failure": "caught"} for p in pairs]
+    tasks = build_task_variants(self.curriculum_cfg, seeds, variants_per_seed=int(os.getenv("BUNNY_CURRICULUM_VARIANTS", "2") or 2))
+    if not tasks:
+        return
+
+    # Candidate matrix for 'decision' only (primary lever for A3/A4 behaviors).
+    binding = self.reg.get("decision")
+    if binding is None:
+        return
+
+    # Load current matrix entries.
+    try:
+        cur = self.store.get_sparse(binding.matrix_name, int(binding.matrix_version))
+    except Exception:
+        return
+    state_dim = int(cur.n_rows)
+
+    # Build candidate entries dict from current.
+    ent = {(int(i), int(j)): float(v) for (i, j, v) in (cur.entries or [])}
+
+    # Apply aggregated updates from seeds (use selfeval on the actual failed Q/A).
+    eta = float(os.getenv("BUNNY_CURRICULUM_ETA", "0.08") or 0.08)
+    decay = float(os.getenv("BUNNY_CURRICULUM_DECAY", "0.002") or 0.002)
+    clamp = float(os.getenv("BUNNY_CURRICULUM_CLAMP", "0.25") or 0.25)
+
+    # Protected axes: never learn through non-health/resources matrices.
+    protected_names = {"pain", "pain_physical", "pain_psych", "energy", "fatigue", "sleep_pressure"}
+    protected_idx = {self.axis.get(n) for n in protected_names if self.axis.get(n) is not None}
+    protected_idx.discard(None)
+
+    def _apply_update(u: Dict[str, float], x_feats: Dict[str, float], reward: float) -> None:
+        # L2 decay
+        if decay > 0.0 and ent:
+            for k in list(ent.keys()):
+                ent[k] = float(ent[k]) * (1.0 - decay)
+                if abs(ent[k]) < 1e-6:
+                    ent.pop(k, None)
+
+        # Sparse u, x over axis indices
+        u_idx: Dict[int, float] = {}
+        for k, v in (u or {}).items():
+            idx = self.axis.get(str(k))
+            if idx is None:
+                continue
+            if idx in protected_idx:
+                continue
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if abs(fv) < 1e-6:
+                continue
+            u_idx[int(idx)] = max(-1.0, min(1.0, fv))
+
+        x_idx: Dict[int, float] = {}
+        for k, v in (x_feats or {}).items():
+            idx = self.axis.get(str(k))
+            if idx is None:
+                continue
+            if idx in protected_idx:
+                continue
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if abs(fv) < 1e-6:
+                continue
+            x_idx[int(idx)] = max(-1.0, min(1.0, fv))
+
+        if not u_idx or not x_idx:
+            return
+
+        r = max(-1.0, min(1.0, float(reward)))
+        for i, ui in u_idx.items():
+            for j, xj in x_idx.items():
+                dv = eta * r * ui * xj
+                if abs(dv) < 1e-7:
+                    continue
+                key = (int(i), int(j))
+                ent[key] = max(-clamp, min(clamp, float(ent.get(key, 0.0)) + dv))
+                if abs(ent[key]) < 1e-6:
+                    ent.pop(key, None)
+
+    # Do updates
+    axioms = db_get_axioms(self.db)
+    for p in pairs[: int(os.getenv("BUNNY_CURRICULUM_SEED_UPDATES", "8") or 8)]:
+        q = p.get("question") or ""
+        a = p.get("answer") or ""
+        ts = p.get("ts") or ""
+        try:
+            se = self._call_with_health("selfeval", lambda: evaluate_outcome(self.selfeval_cfg, axioms, self._state_summary(), question=q, answer=a, websense_claims_json=""))
+        except Exception:
+            se = {}
+        drives_delta = se.get("drives_delta") if isinstance(se, dict) else {}
+        if not isinstance(drives_delta, dict):
+            drives_delta = {}
+        try:
+            reward = float(se.get("delta_reward", -0.6) if isinstance(se, dict) else -0.6)
+        except Exception:
+            reward = -0.6
+        x_feats = db_get_decision_drives_before(self.db, ts) if ts else db_get_last_decision_drives(self.db)
+        _apply_update(drives_delta, x_feats or {}, reward)
+
+    # Create new matrix version in DB (shadow candidate).
+    con = self.db.connect()
+    try:
+        row = con.execute("SELECT MAX(version) AS v FROM matrices WHERE name=?", (binding.matrix_name,)).fetchone()
+        vmax = int(row["v"] or 0)
+    finally:
+        con.close()
+    cand_v = vmax + 1
+    cand_entries = [(i, j, v) for (i, j), v in ent.items()]
+    self.store.put_sparse(
+        binding.matrix_name,
+        cand_v,
+        n_rows=cur.n_rows,
+        n_cols=cur.n_cols,
+        entries=cand_entries,
+        meta={"origin": "sleep_curriculum", "parent": int(binding.matrix_version), "n_tasks": len(tasks)},
+        parent_version=int(binding.matrix_version),
+    )
+
+    # Evaluate: compare baseline vs candidate on tasks using LLM + SelfEval.
+    def _state_from_matrix(mat, x_feats: Dict[str, float]) -> str:
+        s0 = self.hb.load_state()
+        x = [0.0] * state_dim
+        for k, v in (x_feats or {}).items():
+            idx = self.axis.get(str(k))
+            if idx is None or idx >= state_dim:
+                continue
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            x[int(idx)] = max(-1.0, min(1.0, fv))
+        y = mat.apply(x)
+        vals = []
+        for i in range(state_dim):
+            vv = float(s0.values[i]) + float(y[i])
+            if vv < 0.0:
+                vv = 0.0
+            if vv > 1.0:
+                vv = 1.0
+            vals.append(vv)
+        # reuse existing state summary formatter
+        return format_state_summary(self.axis, vals)
+
+    try:
+        cand = self.store.get_sparse(binding.matrix_name, cand_v)
+    except Exception:
+        return
+
+    base_total = 0.0
+    cand_total = 0.0
+    n = 0
+
+    for t in tasks[: int(os.getenv("BUNNY_CURRICULUM_EVAL_TASKS", "12") or 12)]:
+        q = str(t.get("question") or "").strip()
+        if not q:
+            continue
+        # Decide drives for this question (generic; no heuristics).
+        try:
+            d = self._call_with_health("decider", lambda: decide_pressures(self.decider_cfg, axioms, self._state_summary(), user_text=q, workspace_json=json.dumps(db_get_workspace_current(self.db), ensure_ascii=False)))
+        except Exception:
+            d = {}
+        drives = (d.get("drives") if isinstance(d, dict) else {}) or {}
+        if not isinstance(drives, dict):
+            drives = {}
+
+        base_state = _state_from_matrix(cur, drives)
+        cand_state = _state_from_matrix(cand, drives)
+
+        sys_base, user_base = build_speech_prompt(axioms, base_state, q)
+        sys_cand, user_cand = build_speech_prompt(axioms, cand_state, q)
+
+        try:
+            a_base = ollama_chat(self.cfg, sys_base, user_base)
+        except Exception:
+            a_base = ""
+        try:
+            a_cand = ollama_chat(self.cfg, sys_cand, user_cand)
+        except Exception:
+            a_cand = ""
+
+        try:
+            se_base = evaluate_outcome(self.selfeval_cfg, axioms, base_state, question=q, answer=a_base, websense_claims_json="")
+        except Exception:
+            se_base = {}
+        try:
+            se_cand = evaluate_outcome(self.selfeval_cfg, axioms, cand_state, question=q, answer=a_cand, websense_claims_json="")
+        except Exception:
+            se_cand = {}
+
+        def score(se: Dict[str, Any]) -> float:
+            try:
+                dr = float(se.get("delta_reward", 0.0) or 0.0)
+            except Exception:
+                dr = 0.0
+            ax = se.get("axiom_scores") if isinstance(se.get("axiom_scores"), dict) else {}
+            ev = se.get("eval_scores") if isinstance(se.get("eval_scores"), dict) else {}
+            axm = 0.0
+            if isinstance(ax, dict) and ax:
+                axm = sum(float(ax.get(k, 0.0) or 0.0) for k in ["A1","A2","A3","A4"]) / 4.0
+            evm = 0.0
+            if isinstance(ev, dict) and ev:
+                evm = sum(float(v or 0.0) for v in ev.values()) / max(1.0, float(len(ev)))
+            # mix: reward + compliance/quality nudges
+            return dr + 0.4*(axm - 0.5) + 0.3*(evm - 0.5)
+
+        s_base = score(se_base if isinstance(se_base, dict) else {})
+        s_cand = score(se_cand if isinstance(se_cand, dict) else {})
+        base_total += s_base
+        cand_total += s_cand
+        n += 1
+
+    if n < 3:
+        return
+
+    base_avg = base_total / float(n)
+    cand_avg = cand_total / float(n)
+
+    # Gate: promote only if candidate is clearly better and doesn't tank A2.
+    promote_margin = float(os.getenv("BUNNY_CURRICULUM_PROMOTE_MARGIN", "0.05") or 0.05)
+    if cand_avg >= base_avg + promote_margin:
+        # bind adapter to candidate version
+        b2 = AdapterBinding(
+            event_type=binding.event_type,
+            encoder_name=binding.encoder_name,
+            matrix_name=binding.matrix_name,
+            matrix_version=cand_v,
+            meta=binding.meta,
+        )
+        self.reg.upsert(b2)
+        db_meta_set(self.db, "last_curriculum_ts", str(now))
+    def apply_proposal_patch(self, proposal_id: int, *, confirm: bool) -> Dict[str, Any]:
+        """Apply a tested DevLab patch to the working copy (with explicit confirmation).
+
+        Safety:
+        - always runs `git apply --check` first
+        - only applies if confirm=True and check passes
+        - records outcome into mutation_proposals.user_note + status
+        """
+        repo = self._repo_root()
+        con = self.db.connect()
+        row = con.execute("SELECT id, proposal_json, status FROM mutation_proposals WHERE id=?", (int(proposal_id),)).fetchone()
+        if not row:
+            con.close()
+            return {"ok": 0, "error": "proposal not found"}
+
+        pid = int(row[0])
+        try:
+            pj = json.loads(row[1] or "{}")
+        except Exception:
+            pj = {}
+        patch = str((pj.get("patch") or pj.get("patch_unified_diff") or "")).strip()
+        if not patch:
+            con.close()
+            return {"ok": 0, "error": "proposal has no patch"}
+
+        import tempfile, os, subprocess
+        with tempfile.TemporaryDirectory(prefix="bunny-apply-") as td:
+            pf = os.path.join(td, "patch.diff")
+            with open(pf, "w", encoding="utf-8") as f:
+                f.write(patch)
+
+            def _run(cmd: List[str]) -> Dict[str, Any]:
+                try:
+                    cp = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=120)
+                    return {"cmd": cmd, "rc": cp.returncode, "stdout": cp.stdout[-20000:], "stderr": cp.stderr[-20000:]}
+                except Exception as e:
+                    return {"cmd": cmd, "rc": 125, "stdout": "", "stderr": f"{type(e).__name__}: {e}"}
+
+            check = _run(["git", "apply", "--check", pf])
+            res: Dict[str, Any] = {"ok": 0, "checked": check, "applied": None, "proposal_id": pid}
+
+            note_lines = []
+            note_lines.append(f"apply_check rc={check.get('rc')}")
+            if check.get("stderr"):
+                note_lines.append(str(check.get('stderr')))
+
+            if int(check.get("rc") or 1) != 0:
+                con.execute("UPDATE mutation_proposals SET status=?, user_note=? WHERE id=?", ("apply_failed", "\n".join(note_lines), pid))
+                con.commit()
+                con.close()
+                res["ok"] = 0
+                res["error"] = "git apply --check failed"
+                return res
+
+            if not confirm:
+                con.close()
+                res["ok"] = 1
+                res["dry_run"] = 1
+                return res
+
+            applied = _run(["git", "apply", "--whitespace=nowarn", pf])
+            res["applied"] = applied
+            note_lines.append(f"apply rc={applied.get('rc')}")
+            if applied.get("stderr"):
+                note_lines.append(str(applied.get('stderr')))
+
+            if int(applied.get("rc") or 1) == 0:
+                con.execute("UPDATE mutation_proposals SET status=?, user_note=? WHERE id=?", ("applied", "\n".join(note_lines), pid))
+                con.commit()
+                con.close()
+                res["ok"] = 1
+                # publish status update
+                try:
+                    self.broker.publish("status", db_status(self.db))
+                except Exception:
+                    pass
+                return res
+            else:
+                con.execute("UPDATE mutation_proposals SET status=?, user_note=? WHERE id=?", ("apply_failed", "\n".join(note_lines), pid))
+                con.commit()
+                con.close()
+                res["ok"] = 0
+                res["error"] = "git apply failed"
+                return res
+
+    def _ui_message(self, message_id: int) -> Dict[str, Any]:
+        con = self.db.connect()
+        try:
+            r = con.execute("SELECT id,created_at,kind,text,rating,caught FROM ui_messages WHERE id=?", (int(message_id),)).fetchone()
+            if r is None:
+                return {}
+            return {
+                "id": int(r["id"]),
+                "created_at": r["created_at"],
+                "role": r["kind"],
+                "content": r["text"],
+                "kind": r["kind"],
+                "text": r["text"],
+                "rating": None if r["rating"] is None else int(r["rating"]),
+                "caught": int(r["caught"] or 0),
+            }
+        finally:
+            con.close()
+
+
+# -----------------------------
+# HTTP handler
+# -----------------------------
+
+# ---- Ops console APIs ----
+
+def db_list_matrices_ops(db: DB) -> list[dict]:
+    con = db.connect()
+    try:
+        rows = con.execute("SELECT name, version, created_at, meta FROM matrices ORDER BY name, version DESC").fetchall()
+        out=[]
+        for r in rows:
+            out.append({"name": r["name"], "version": r["version"], "created_at": r["created_at"], "meta": r["meta"]})
+        return out
+    finally:
+        con.close()
+def db_list_bindings_ops(db: DB) -> list[dict]:
+    """List current adapter bindings (event_type -> matrix_name@version)."""
+    con = db.connect()
+    try:
+        rows = con.execute(
+            "SELECT event_type, encoder_name, matrix_name, matrix_version, meta_json, updated_at FROM adapters ORDER BY event_type"
+        ).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            try:
+                meta = json.loads(r["meta_json"] or "{}")
+            except Exception:
+                meta = {}
+            out.append({
+                "event_type": r["event_type"],
+                "encoder_name": r["encoder_name"],
+                "matrix_name": r["matrix_name"],
+                "matrix_version": int(r["matrix_version"]),
+                "meta": meta,
+                "updated_at": r["updated_at"],
+            })
+        return out
+    finally:
+        con.close()
+
+
+
+def db_get_matrix_ops(db: DB, name: str, version: int, limit: int = 500, offdiag_only: bool = False) -> dict:
+    con = db.connect()
+    try:
+        m = con.execute(
+            "SELECT name, version, created_at, meta FROM matrices WHERE name=? AND version=?",
+            (name, version),
+        ).fetchone()
+        if not m:
+            return {"error": "not_found"}
+
+        # Aggregate stats (fast, SQL side)
+        total = con.execute(
+            "SELECT COUNT(*) AS c FROM matrix_entries WHERE name=? AND version=?",
+            (name, version),
+        ).fetchone()["c"]
+        diag = con.execute(
+            "SELECT COUNT(*) AS c FROM matrix_entries WHERE name=? AND version=? AND i=j",
+            (name, version),
+        ).fetchone()["c"]
+        offdiag = int(total) - int(diag)
+
+        agg = con.execute(
+            "SELECT MAX(ABS(v)) AS max_abs, AVG(ABS(v)) AS mean_abs, SUM(ABS(v)) AS sum_abs FROM matrix_entries WHERE name=? AND version=?",
+            (name, version),
+        ).fetchone()
+        stats = {
+            "count_total": int(total),
+            "count_diag": int(diag),
+            "count_offdiag": int(offdiag),
+            "max_abs": float(agg["max_abs"] or 0.0),
+            "mean_abs": float(agg["mean_abs"] or 0.0),
+            "sum_abs": float(agg["sum_abs"] or 0.0),
+            "sparsity_hint": None,  # unknown without declared dims
+        }
+
+        where = "name=? AND version=?"
+        args = [name, version]
+        if offdiag_only:
+            where += " AND i!=j"
+
+        rows = con.execute(
+            f"SELECT i, j, v FROM matrix_entries WHERE {where} ORDER BY ABS(v) DESC LIMIT ?",
+            (*args, int(limit)),
+        ).fetchall()
+        entries = [{"i": r["i"], "j": r["j"], "v": r["v"]} for r in rows]
+
+        # Mini heatmap: derive a small index set from the top entries (no assumptions about global dims)
+        idx = []
+        for e in entries:
+            if e["i"] not in idx:
+                idx.append(e["i"])
+            if e["j"] not in idx:
+                idx.append(e["j"])
+            if len(idx) >= 12:
+                break
+        idx = idx[:12]
+        valmap = {(e["i"], e["j"]): float(e["v"]) for e in entries}
+        heat = []
+        if idx:
+            for ii in idx:
+                row = []
+                for jj in idx:
+                    row.append(valmap.get((ii, jj), 0.0))
+                heat.append(row)
+
+        return {
+            "name": m["name"],
+            "version": m["version"],
+            "created_at": m["created_at"],
+            "meta": m["meta"],
+            "stats": stats,
+            "index": idx,
+            "heatmap": heat,
+            "entries": entries,
+        }
+    finally:
+        con.close()
+
+
+def db_get_matrix_stats_ops(db: DB, name: str, version: int) -> dict:
+    # convenience for quick refresh without pulling entries
+    con = db.connect()
+    try:
+        m = con.execute(
+            "SELECT name, version, created_at, meta FROM matrices WHERE name=? AND version=?",
+            (name, version),
+        ).fetchone()
+        if not m:
+            return {"error": "not_found"}
+        total = con.execute(
+            "SELECT COUNT(*) AS c FROM matrix_entries WHERE name=? AND version=?",
+            (name, version),
+        ).fetchone()["c"]
+        diag = con.execute(
+            "SELECT COUNT(*) AS c FROM matrix_entries WHERE name=? AND version=? AND i=j",
+            (name, version),
+        ).fetchone()["c"]
+        offdiag = int(total) - int(diag)
+        agg = con.execute(
+            "SELECT MAX(ABS(v)) AS max_abs, AVG(ABS(v)) AS mean_abs, SUM(ABS(v)) AS sum_abs FROM matrix_entries WHERE name=? AND version=?",
+            (name, version),
+        ).fetchone()
+        return {
+            "name": m["name"],
+            "version": m["version"],
+            "created_at": m["created_at"],
+            "meta": m["meta"],
+            "stats": {
+                "count_total": int(total),
+                "count_diag": int(diag),
+                "count_offdiag": int(offdiag),
+                "max_abs": float(agg["max_abs"] or 0.0),
+                "mean_abs": float(agg["mean_abs"] or 0.0),
+                "sum_abs": float(agg["sum_abs"] or 0.0),
+                "sparsity_hint": None,
+            },
+        }
+    finally:
+        con.close()
+
+
+def db_get_matrix_diff_ops(db: DB, name: str, a: int, b: int, limit: int = 500, offdiag_only: bool = False) -> dict:
+    con = db.connect()
+    try:
+        ma = con.execute("SELECT name, version, created_at FROM matrices WHERE name=? AND version=?", (name, a)).fetchone()
+        mb = con.execute("SELECT name, version, created_at FROM matrices WHERE name=? AND version=?", (name, b)).fetchone()
+        if not ma or not mb:
+            return {"error": "not_found"}
+
+        def load(ver: int) -> dict:
+            rows = con.execute("SELECT i, j, v FROM matrix_entries WHERE name=? AND version=?", (name, ver)).fetchall()
+            d = {}
+            for r in rows:
+                i, j = int(r["i"]), int(r["j"])
+                if offdiag_only and i == j:
+                    continue
+                d[(i, j)] = float(r["v"])
+            return d
+
+        da = load(a)
+        dbb = load(b)
+
+        keys = set(da.keys()) | set(dbb.keys())
+        diffs = []
+        for k in keys:
+            va = da.get(k, 0.0)
+            vb = dbb.get(k, 0.0)
+            dv = vb - va
+            if dv != 0.0:
+                diffs.append((k[0], k[1], va, vb, dv))
+        diffs.sort(key=lambda t: abs(t[4]), reverse=True)
+        top = diffs[: int(limit)]
+        stats = {
+            "count_changed": int(len(diffs)),
+            "max_abs_delta": float(abs(top[0][4]) if top else 0.0),
+        }
+
+        # Build a tiny diff-heatmap over the most affected indices (for Ops UI)
+        pairs = [(i,j,dv) for (i,j,va,vb,dv) in top]
+        # pick top unique indices by max |Δ|
+        score: dict[int,float] = {}
+        for i,j,dv in pairs:
+            score[i] = max(score.get(i,0.0), abs(dv))
+            score[j] = max(score.get(j,0.0), abs(dv))
+        idxs = [k for (k,_) in sorted(score.items(), key=lambda t: t[1], reverse=True)[:12]]
+        idxs = sorted(set(idxs))
+        heat = []
+        if idxs:
+            dmap = {(i,j):dv for (i,j,va,vb,dv) in top}
+            for i in idxs:
+                row=[]
+                for j in idxs:
+                    row.append(float(dmap.get((i,j), 0.0)))
+                heat.append(row)
+        return {
+            "name": name,
+            "a": int(a),
+            "b": int(b),
+            "created_a": ma["created_at"],
+            "created_b": mb["created_at"],
+            "offdiag_only": bool(offdiag_only),
+            "stats": stats,
+            "index": idxs,
+            "heatmap": heat,
+            "diff": [{"i": i, "j": j, "va": va, "vb": vb, "dv": dv} for (i, j, va, vb, dv) in top],
+        }
+    finally:
+        con.close()
+def db_list_proposals_ops(db: DB, limit: int = 100) -> list[dict]:
+    con = db.connect()
+    try:
+        # Older DBs don't have a dedicated `title` column. Keep Ops UI stable by
+        # deriving a title from proposal_json (preferred) and falling back to trigger.
+        rows = con.execute(
+            "SELECT id, created_at, status, trigger, proposal_json FROM mutation_proposals ORDER BY id DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+
+        import json as _json
+        out: list[dict] = []
+        for r in rows:
+            title = ""
+            try:
+                pj = _json.loads(r["proposal_json"] or "{}")
+                title = (pj.get("title") or (pj.get("proposal_v2") or {}).get("title") or "")
+            except Exception:
+                title = ""
+            if not title:
+                title = r["trigger"] or "proposal"
+            out.append({
+                "id": r["id"],
+                "created_at": r["created_at"],
+                "status": r["status"],
+                "title": title,
+            })
+        return out
+    finally:
+        con.close()
+
+def db_get_proposal_ops(db: DB, pid: int) -> dict:
+    con = db.connect()
+    try:
+        r = con.execute("SELECT * FROM mutation_proposals WHERE id=?", (int(pid),)).fetchone()
+        if not r:
+            return {"error": "not_found"}
+        d = {k: r[k] for k in r.keys()}
+        return d
+    finally:
+        con.close()
+
+def db_axioms_full_ops(db: DB, limit_per_axiom: int = 50) -> dict:
+    con = db.connect()
+    try:
+        axioms = con.execute("SELECT id, key, text, created_at FROM axioms ORDER BY id ASC").fetchall()
+        dig = {r["key"]: r["digest"] for r in con.execute("SELECT axiom_key, digest FROM axiom_digests").fetchall()}
+        out=[]
+        for a in axioms:
+            key=a["key"]
+            inter = con.execute(
+                "SELECT id, created_at, text FROM axiom_interpretations WHERE axiom_key=? ORDER BY id DESC LIMIT ?",
+                (key, int(limit_per_axiom)),
+            ).fetchall()
+            out.append({
+                "id": a["id"], "key": key, "text": a["text"], "created_at": a["created_at"],
+                "digest": dig.get(key,""),
+                "interpretations": [{"id": r["id"], "created_at": r["created_at"], "text": r["text"]} for r in inter],
+            })
+        return {"axioms": out}
+    finally:
+        con.close()
+
+def db_llm_telemetry_ops(db: DB, limit: int = 200) -> dict:
+    con = db.connect()
+    try:
+        rows = con.execute(
+            "SELECT id, organ, model, purpose, started_at, duration_ms, ok, error FROM llm_calls ORDER BY id DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        calls=[{k: r[k] for k in r.keys()} for r in rows]
+        # aggregate by organ+model
+        agg={}
+        for c in calls:
+            key=(c["organ"], c["model"])
+            a=agg.get(key, {"organ": c["organ"], "model": c["model"], "calls":0, "errors":0, "last_at":"", "last_ms":0.0})
+            a["calls"] += 1
+            if not c["ok"]:
+                a["errors"] += 1
+            if not a["last_at"]:
+                a["last_at"]=c["started_at"]
+                a["last_ms"]=c["duration_ms"]
+            agg[key]=a
+        return {"recent": calls, "aggregate": list(agg.values())}
+    finally:
+        con.close()
+
+
+class Handler(BaseHTTPRequestHandler):
+    # Windows browsers frequently abort SSE/HTTP connections mid-stream.
+    # The stdlib http.server prints a traceback unless we swallow these here.
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+            return
+
+    server_version = "BunnyUI/0.1"
+
+    def _json(self, obj: Any, status: int = 200) -> None:
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_json(self) -> Any:
+        n = int(self.headers.get("Content-Length", "0") or "0")
+        raw = self.rfile.read(n) if n > 0 else b"{}"
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None
+
+    def do_GET(self):
+        p = urlparse(self.path)
+        if p.path == "/":
+            data = CHAT_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if p.path == "/ops":
+            data = OPS_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if p.path == "/api/messages":
+            qs = parse_qs(p.query or "")
+            limit = 50
+            if "limit" in qs:
+                try:
+                    limit = max(1, min(500, int(qs["limit"][0])))
+                except Exception:
+                    pass
+            self._json(db_list_messages(self.server.kernel.db, limit))
+            return
+
+        if p.path == "/api/status":
+            self._json(db_status(self.server.kernel.db))
+            return
+
+
+        if p.path == "/api/telemetry":
+            qs = parse_qs(p.query or "")
+            limit = 200
+            if "limit" in qs:
+                try:
+                    limit = max(1, min(2000, int(qs["limit"][0])))
+                except Exception:
+                    pass
+            self._json(db_llm_telemetry_ops(self.server.kernel.db, limit))
+            return
+
+        
+        if p.path == "/api/bindings":
+            self._json(db_list_bindings_ops(self.server.kernel.db))
+            return
+
+        if p.path == "/api/matrices":
+            self._json(db_list_matrices_ops(self.server.kernel.db))
+            return
+
+        if p.path == "/api/matrix":
+            qs = parse_qs(p.query or "")
+            name = (qs.get("name") or [""])[0]
+            version = int((qs.get("version") or ["0"])[0] or "0")
+            limit = int((qs.get("limit") or ["500"])[0] or "500")
+            offdiag = int((qs.get("offdiag") or ["0"])[0] or "0")
+            self._json(db_get_matrix_ops(self.server.kernel.db, name, version, limit, offdiag_only=bool(offdiag)))
+            return
+
+        if p.path == "/api/matrix_diff":
+            qs = parse_qs(p.query or "")
+            name = (qs.get("name") or [""])[0]
+            a = int((qs.get("a") or ["0"])[0] or "0")
+            b = int((qs.get("b") or ["0"])[0] or "0")
+            limit = int((qs.get("limit") or ["500"])[0] or "500")
+            offdiag = int((qs.get("offdiag") or ["0"])[0] or "0")
+            self._json(db_get_matrix_diff_ops(self.server.kernel.db, name, a, b, limit, offdiag_only=bool(offdiag)))
+            return
+
+        if p.path == "/api/matrix_stats":
+            qs = parse_qs(p.query or "")
+            name = (qs.get("name") or [""])[0]
+            version = int((qs.get("version") or ["0"])[0] or "0")
+            self._json(db_get_matrix_stats_ops(self.server.kernel.db, name, version))
+            return
+
+        if p.path == "/api/proposals":
+            qs = parse_qs(p.query or "")
+            limit = int((qs.get("limit") or ["100"])[0] or "100")
+            self._json(db_list_proposals_ops(self.server.kernel.db, limit))
+            return
+
+        if p.path == "/api/proposal":
+            qs = parse_qs(p.query or "")
+            pid = int((qs.get("id") or ["0"])[0] or "0")
+            self._json(db_get_proposal_ops(self.server.kernel.db, pid))
+            return
+
+        if p.path == "/api/axioms_full":
+            qs = parse_qs(p.query or "")
+            limit = int((qs.get("limit") or ["50"])[0] or "50")
+            self._json(db_axioms_full_ops(self.server.kernel.db, limit))
+            return
+
+        if p.path == "/sse":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            q = self.server.kernel.broker.subscribe()
+
+            def _safe_write(data: bytes) -> bool:
+                """Write to SSE stream; return False if client disconnected."""
+                try:
+                    self.wfile.write(data)
+                    self.wfile.flush()
+                    return True
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    return False
+
+            try:
+                # initial status
+                init = f"event: status\ndata: {json.dumps(db_status(self.server.kernel.db), ensure_ascii=False)}\n\n"
+                if not _safe_write(init.encode("utf-8")):
+                    return
+
+                while True:
+                    try:
+                        msg = q.get(timeout=25.0)
+                    except queue.Empty:
+                        # keepalive
+                        if not _safe_write(b": keepalive\n\n"):
+                            break
+                        continue
+                    if not _safe_write(msg.encode("utf-8")):
+                        break
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                # Client disconnected (common on browser refresh / network change)
+                pass
+            finally:
+                self.server.kernel.broker.unsubscribe(q)
+            return
+
+
+        if p.path == "/api/proposal/apply":
+            try:
+                pid = int(body.get("proposal_id", 0))
+            except Exception:
+                self.send_error(400, "bad proposal_id"); return
+            confirm = bool(body.get("confirm", False))
+            if pid <= 0:
+                self.send_error(400, "bad proposal_id"); return
+            res = self.server.kernel.apply_proposal_patch(pid, confirm=confirm)
+            self._send_json(res)
+            return
+
+        self.send_error(404)
+
+    def do_POST(self):
+        p = urlparse(self.path)
+        body = self._read_json()
+        if body is None:
+            self.send_error(400, "bad json")
+            return
+
+        if p.path == "/api/send":
+            text = str(body.get("text", "")).strip()
+            if not text:
+                self.send_error(400, "empty")
+                return
+            self.server.kernel.process_user_text(text)
+            self._json({"ok": True})
+            return
+
+        if p.path == "/api/caught":
+            try:
+                mid = int(body.get("message_id", 0))
+            except Exception:
+                self.send_error(400, "bad payload"); return
+            if mid <= 0:
+                self.send_error(400, "bad payload"); return
+            self.server.kernel.caught(mid)
+            self.send_response(204); self.end_headers()
+            return
+
+        self.send_error(404)
+
+
+class BunnyHTTPServer(ThreadingHTTPServer):
+    # Suppress noisy tracebacks for expected client disconnects (common on Windows).
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError)):
+            return
+        return super().handle_error(request, client_address)
+
+    def __init__(self, addr: Tuple[str,int], handler_cls, kernel: Kernel):
+        super().__init__(addr, handler_cls)
+        self.kernel = kernel
+
+
+def render_memory_context(items: List[Dict[str, Any]]) -> str:
+    # Keep deterministic formatting; no heuristics, only context window.
+    if not items:
+        return ""
+    lines = []
+    for it in items:
+        role = it.get("role","")
+        if role == "assistant":
+            prefix = "ASSISTANT"
+        else:
+            prefix = "USER"
+        c = (it.get("content") or "").strip()
+        if c:
+            lines.append(f"{prefix}: {c}")
+    return "\n".join(lines)
+
+
+def render_memory_long_context(items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return ""
+    lines = []
+    for it in items:
+        s = (it.get("summary") or "").strip()
+        if s:
+            lines.append(f"- {s}")
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

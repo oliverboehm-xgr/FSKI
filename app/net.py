@@ -2,10 +2,34 @@ from __future__ import annotations
 
 import json
 import ssl
+import os
+import time
+import sqlite3
+import inspect
+import datetime
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
+
+
+
+def _log_llm_call(organ: str, model: str, purpose: str, started_at: str, duration_ms: float, ok: int, error: str) -> None:
+    db_path = os.environ.get("BUNNY_DB_PATH", "")
+    if not db_path:
+        return
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute(
+                "INSERT INTO llm_calls(organ,model,purpose,started_at,duration_ms,ok,error) VALUES(?,?,?,?,?,?,?)",
+                (organ or "", model or "", purpose or "", started_at, float(duration_ms), int(ok), error or ""),
+            )
+            con.commit()
+        finally:
+            con.close()
+    except Exception:
+        return
 
 
 @dataclass
@@ -41,6 +65,20 @@ def http_get(url: str, headers: Optional[Dict[str, str]] = None, timeout: float 
 
 
 def http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None, timeout: float = 60.0) -> Tuple[int, str]:
+    started = time.time()
+    started_at = datetime.datetime.utcnow().isoformat(timespec='seconds')+'Z'
+    organ = ''
+    try:
+        for fr in inspect.stack()[1:8]:
+            mod = fr.frame.f_globals.get('__name__','')
+            if mod.startswith('app.organs.'):
+                organ = mod.split('.')[-1]
+                break
+        if not organ:
+            organ = inspect.stack()[1].frame.f_globals.get('__name__','')
+    except Exception:
+        organ = ''
+
     body = json.dumps(payload).encode("utf-8")
     hdrs = {"Content-Type": "application/json", "Accept": "application/json"}
     if headers:
@@ -53,6 +91,8 @@ def http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[str
                 txt = data.decode("utf-8", errors="replace")
             except Exception:
                 txt = data.decode(errors="replace")
+            dur_ms = (time.time()-started)*1000.0
+            _log_llm_call(organ, str(payload.get('model','')), str(payload.get('purpose','')), started_at, dur_ms, 1, '')
             return int(resp.status), txt
     except urllib.error.HTTPError as e:
         data = e.read()
@@ -60,6 +100,8 @@ def http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[str
             txt = data.decode("utf-8", errors="replace")
         except Exception:
             txt = data.decode(errors="replace")
+        dur_ms = (time.time()-started)*1000.0
+        _log_llm_call(organ, str(payload.get('model','')), str(payload.get('purpose','')), started_at, dur_ms, 0, f'HTTPError {e.code}')
         return int(e.code), txt
     except Exception as e:
         return 0, f"{type(e).__name__}: {e}"
