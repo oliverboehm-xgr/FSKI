@@ -533,10 +533,11 @@ def db_get_last_decision_drives(db: DB) -> Dict[str, float]:
         con.close()
 
 def db_get_last_assistant_text(db: DB) -> str:
+    """Return last assistant-like utterance (reply/assistant/auto), used for feedback pairing."""
     con = db.connect()
     try:
         row = con.execute(
-            "SELECT text FROM ui_messages WHERE kind='reply' ORDER BY id DESC LIMIT 1"
+            "SELECT text FROM ui_messages WHERE kind IN ('reply','assistant','auto') ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return str(row["text"]) if row and row.get("text") is not None else ""
     finally:
@@ -603,7 +604,16 @@ def db_add_feedback(db: DB, user_text: str, last_assistant: str, parsed: Dict[st
     finally:
         con.close()
 
-def db_add_belief(db: DB, subject: str, predicate: str, obj: str, confidence: float = 0.7, provenance: str = "") -> None:
+def db_add_belief(
+    db: DB,
+    subject: str,
+    predicate: str,
+    obj: str,
+    confidence: float = 0.7,
+    provenance: str = "",
+    *,
+    salience: float = 0.0,
+) -> None:
     subject = (subject or "").strip()
     predicate = (predicate or "").strip()
     obj = (obj or "").strip()
@@ -624,19 +634,47 @@ def db_add_belief(db: DB, subject: str, predicate: str, obj: str, confidence: fl
         except Exception:
             topic = ""
 
-        # schema supports topic via lightweight migration; keep insert compatible
-        con.execute(
-            "INSERT INTO beliefs(created_at,subject,predicate,object,confidence,provenance,topic) VALUES(?,?,?,?,?,?,?)",
-            (
-                now_iso(),
-                subject[:200],
-                predicate[:60],
-                obj[:600],
-                float(confidence or 0.7),
-                (provenance or "")[:120],
-                topic,
-            ),
-        )
+        s = max(0.0, min(1.0, float(salience or 0.0)))
+        base_hl = float(os.environ.get('BUNNY_BELIEF_HALF_LIFE_DAYS', '45') or 45)
+        hl = max(7.0, min(365.0, base_hl * (1.0 + float(os.environ.get('BUNNY_SALIENCE_HALF_LIFE_GAIN', '1.2') or 1.2) * s)))
+        upd = now_iso()
+
+        # migration-safe columns
+        try:
+            cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(beliefs)").fetchall()}
+        except Exception:
+            cols = set()
+
+        if {"topic", "salience", "half_life_days", "updated_at"}.issubset(cols):
+            con.execute(
+                "INSERT INTO beliefs(created_at,subject,predicate,object,confidence,provenance,topic,salience,half_life_days,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    upd,
+                    subject[:200],
+                    predicate[:60],
+                    obj[:600],
+                    float(confidence or 0.7),
+                    (provenance or "")[:120],
+                    topic,
+                    float(s),
+                    float(hl),
+                    upd,
+                ),
+            )
+        else:
+            # legacy fallback
+            con.execute(
+                "INSERT INTO beliefs(created_at,subject,predicate,object,confidence,provenance,topic) VALUES(?,?,?,?,?,?,?)",
+                (
+                    upd,
+                    subject[:200],
+                    predicate[:60],
+                    obj[:600],
+                    float(confidence or 0.7),
+                    (provenance or "")[:120],
+                    topic,
+                ),
+            )
         try:
             bid = int(con.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
             con.execute(
@@ -653,6 +691,8 @@ def db_add_belief(db: DB, subject: str, predicate: str, obj: str, confidence: fl
                             "confidence": float(confidence or 0.7),
                             "provenance": (provenance or "")[:120],
                             "topic": topic,
+                            "salience": float(s),
+                            "half_life_days": float(hl),
                         },
                         ensure_ascii=False,
                     ),
@@ -663,6 +703,254 @@ def db_add_belief(db: DB, subject: str, predicate: str, obj: str, confidence: fl
         con.commit()
     finally:
         con.close()
+
+
+def db_boost_beliefs_since(db: DB, since_iso: str, salience: float, *, conf_gain: float = 0.18) -> int:
+    """Boost belief stickiness for beliefs created since `since_iso`.
+
+    This is the generic mechanism for "high emotional" / "high consequence" learning:
+    - salience increases belief.salience
+    - salience increases half_life_days (slower decay)
+    - optionally increases confidence slightly
+
+    Returns number of rows updated.
+    """
+    s = max(0.0, min(1.0, float(salience or 0.0)))
+    if s <= 0.0 or not since_iso:
+        return 0
+    con = db.connect()
+    try:
+        try:
+            cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(beliefs)").fetchall()}
+        except Exception:
+            cols = set()
+        if not {"salience", "half_life_days", "updated_at"}.issubset(cols):
+            return 0
+        base_hl = float(os.environ.get('BUNNY_BELIEF_HALF_LIFE_DAYS', '45') or 45)
+        hl_gain = float(os.environ.get('BUNNY_SALIENCE_HALF_LIFE_GAIN', '1.2') or 1.2)
+        upd = now_iso()
+
+        rows = con.execute(
+            "SELECT id,confidence,salience,half_life_days FROM beliefs WHERE created_at >= ?",
+            (since_iso,),
+        ).fetchall()
+        n = 0
+        for r in rows:
+            bid = int(r["id"])
+            c0 = float(r["confidence"] or 0.0)
+            s0 = float(r["salience"] or 0.0)
+            hl0 = float(r["half_life_days"] or base_hl)
+            s1 = max(s0, s)
+            hl1 = max(7.0, min(365.0, max(hl0, base_hl * (1.0 + hl_gain * s1))))
+            c1 = max(0.0, min(1.0, c0 * (1.0 + float(conf_gain) * s)))
+            if abs(c1 - c0) < 1e-9 and abs(s1 - s0) < 1e-9 and abs(hl1 - hl0) < 1e-9:
+                continue
+            con.execute(
+                "UPDATE beliefs SET confidence=?, salience=?, half_life_days=?, updated_at=? WHERE id=?",
+                (float(c1), float(s1), float(hl1), upd, bid),
+            )
+            try:
+                con.execute(
+                    "INSERT INTO beliefs_history(created_at,belief_id,op,row_json) VALUES(?,?,?,?)",
+                    (
+                        upd,
+                        bid,
+                        "boost",
+                        json.dumps(
+                            {
+                                "confidence_before": c0,
+                                "confidence_after": c1,
+                                "salience_before": s0,
+                                "salience_after": s1,
+                                "half_life_before": hl0,
+                                "half_life_after": hl1,
+                                "since_iso": since_iso,
+                                "boost_salience": s,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+            except Exception:
+                pass
+            n += 1
+        con.commit()
+        return n
+    finally:
+        con.close()
+
+
+def db_upsert_belief(
+    db: DB,
+    subject: str,
+    predicate: str,
+    obj: str,
+    confidence: float = 0.7,
+    provenance: str = "",
+    *,
+    topic: str = "",
+    compress: bool = True,
+    salience: float = 0.0,
+) -> None:
+    """Insert or replace a belief by (subject,predicate,object).
+
+    This is used by Sleep/Consolidation to *compress* redundant long-term memory.
+    If compress=True, existing matching rows are removed and written to beliefs_history (op=delete).
+    """
+    subject = (subject or "").strip()
+    predicate = (predicate or "").strip()
+    obj = (obj or "").strip()
+    if not (subject and predicate and obj):
+        return
+    con = db.connect()
+    try:
+        # Ensure new columns exist (migration-safe)
+        try:
+            cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(beliefs)").fetchall()}
+            if "topic" not in cols:
+                con.execute("ALTER TABLE beliefs ADD COLUMN topic TEXT NOT NULL DEFAULT ''")
+                cols.add("topic")
+            if "salience" not in cols:
+                con.execute("ALTER TABLE beliefs ADD COLUMN salience REAL NOT NULL DEFAULT 0.0")
+                cols.add("salience")
+            if "half_life_days" not in cols:
+                con.execute("ALTER TABLE beliefs ADD COLUMN half_life_days REAL NOT NULL DEFAULT 45.0")
+                cols.add("half_life_days")
+            if "updated_at" not in cols:
+                con.execute("ALTER TABLE beliefs ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+                cols.add("updated_at")
+        except Exception:
+            cols = set()
+
+        topic = (topic or "").strip()[:80]
+
+        s = max(0.0, min(1.0, float(salience or 0.0)))
+        base_hl = float(os.environ.get('BUNNY_BELIEF_HALF_LIFE_DAYS', '45') or 45)
+        hl = max(7.0, min(365.0, base_hl * (1.0 + float(os.environ.get('BUNNY_SALIENCE_HALF_LIFE_GAIN', '1.2') or 1.2) * s)))
+        upd = now_iso()
+
+        max_s = s
+        max_hl = hl
+        if compress:
+            rows = con.execute(
+                "SELECT id,subject,predicate,object,confidence,provenance,created_at,topic, salience, half_life_days FROM beliefs WHERE subject=? AND predicate=? AND object=? ORDER BY id DESC",
+                (subject[:200], predicate[:60], obj[:600]),
+            ).fetchall()
+            for r in rows:
+                bid = int(r["id"])
+                try:
+                    max_s = max(float(max_s), float(r["salience"] or 0.0))
+                except Exception:
+                    pass
+                try:
+                    max_hl = max(float(max_hl), float(r["half_life_days"] or 0.0))
+                except Exception:
+                    pass
+                try:
+                    con.execute(
+                        "INSERT INTO beliefs_history(created_at,belief_id,op,row_json) VALUES(?,?,?,?)",
+                        (
+                            now_iso(),
+                            bid,
+                            "delete",
+                            json.dumps(
+                                {
+                                    "subject": str(r["subject"]),
+                                    "predicate": str(r["predicate"]),
+                                    "object": str(r["object"]),
+                                    "confidence": float(r["confidence"] or 0.0),
+                                    "provenance": str(r["provenance"] or ""),
+                                    "topic": str(r["topic"] or ""),
+                                    "created_at": str(r["created_at"] or ""),
+                                    "salience": float(r["salience"] or 0.0) if ("salience" in r.keys()) else 0.0,
+                                    "half_life_days": float(r["half_life_days"] or 0.0) if ("half_life_days" in r.keys()) else 0.0,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        ),
+                    )
+                except Exception:
+                    pass
+                try:
+                    con.execute("DELETE FROM beliefs WHERE id=?", (bid,))
+                except Exception:
+                    pass
+
+        if {"topic", "salience", "half_life_days", "updated_at"}.issubset(cols):
+            con.execute(
+                "INSERT INTO beliefs(created_at,subject,predicate,object,confidence,provenance,topic,salience,half_life_days,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    upd,
+                    subject[:200],
+                    predicate[:60],
+                    obj[:600],
+                    float(confidence or 0.7),
+                    (provenance or "")[:120],
+                    topic,
+                    float(max_s),
+                    float(max_hl),
+                    upd,
+                ),
+            )
+        else:
+            con.execute(
+                "INSERT INTO beliefs(created_at,subject,predicate,object,confidence,provenance,topic) VALUES(?,?,?,?,?,?,?)",
+                (
+                    upd,
+                    subject[:200],
+                    predicate[:60],
+                    obj[:600],
+                    float(confidence or 0.7),
+                    (provenance or "")[:120],
+                    topic,
+                ),
+            )
+        try:
+            bid = int(con.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+            con.execute(
+                "INSERT INTO beliefs_history(created_at,belief_id,op,row_json) VALUES(?,?,?,?)",
+                (
+                    now_iso(),
+                    bid,
+                    "insert",
+                    json.dumps(
+                        {
+                            "subject": subject[:200],
+                            "predicate": predicate[:60],
+                            "object": obj[:600],
+                            "confidence": float(confidence or 0.7),
+                            "provenance": (provenance or "")[:120],
+                            "topic": topic,
+                            "salience": float(max_s),
+                            "half_life_days": float(max_hl),
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+        except Exception:
+            pass
+        con.commit()
+    finally:
+        con.close()
+
+
+def db_downrank_belief(
+    db: DB,
+    subject: str,
+    predicate: str,
+    obj: str,
+    *,
+    reason: str = "",
+    floor: float = 0.15,
+    target: float = 0.25,
+    topic: str = "",
+) -> None:
+    """Lower confidence of a belief by replacing it with a low-confidence version."""
+    prov = ("sleep_downgrade" + (":" + reason.strip()[:60] if reason else "")).strip()
+    conf = max(float(floor), min(float(target), 1.0))
+    db_upsert_belief(db, subject, predicate, obj, confidence=conf, provenance=prov, topic=topic, compress=True)
+
 
 def db_list_beliefs(db: DB, limit: int = 12, topic: str = "") -> List[Dict[str, Any]]:
     con = db.connect()
@@ -709,6 +997,173 @@ def db_list_beliefs(db: DB, limit: int = 12, topic: str = "") -> List[Dict[str, 
                 }
             )
         return out
+    finally:
+        con.close()
+
+
+def db_age_and_prune_beliefs(
+    db: DB,
+    *,
+    half_life_days: float = 45.0,
+    floor: float = 0.15,
+    prune_ttl_days: float = 180.0,
+    prune_below: float = 0.18,
+) -> None:
+    """Soft forgetting for long-term beliefs.
+
+    - Exponential confidence decay over time with half-life `half_life_days`.
+    - Prunes very old, low-confidence beliefs to keep the store compact.
+
+    Uses meta.key='belief_decay_last' to avoid over-decay on frequent ticks.
+    """
+    try:
+        half_life_days = float(half_life_days or 0.0)
+    except Exception:
+        half_life_days = 45.0
+    if half_life_days <= 0:
+        return
+    try:
+        floor = float(floor or 0.0)
+    except Exception:
+        floor = 0.15
+    floor = max(0.0, min(1.0, floor))
+
+    try:
+        prune_ttl_days = float(prune_ttl_days or 0.0)
+    except Exception:
+        prune_ttl_days = 180.0
+    try:
+        prune_below = float(prune_below or 0.0)
+    except Exception:
+        prune_below = 0.18
+    prune_below = max(0.0, min(1.0, prune_below))
+
+    con = db.connect()
+    try:
+        now = time.time()
+        now_iso_str = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))
+
+        # read last decay timestamp
+        last_iso = None
+        try:
+            r = con.execute("SELECT value FROM meta WHERE key='belief_decay_last'").fetchone()
+            if r:
+                last_iso = str(r["value"] or "").strip()
+        except Exception:
+            last_iso = None
+
+        def _parse_iso(s: str) -> float:
+            try:
+                # format like 2026-02-27T12:34:56Z
+                return time.mktime(time.strptime(s, '%Y-%m-%dT%H:%M:%SZ'))
+            except Exception:
+                return now
+
+        last_t = _parse_iso(last_iso) if last_iso else (now - 86400.0)  # default: 1 day
+        dt_days = max(0.0, (now - float(last_t)) / 86400.0)
+        if dt_days <= 0.05:  # don't churn for tiny deltas
+            return
+
+        # Determine whether per-belief half-life exists.
+        try:
+            cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(beliefs)").fetchall()}
+        except Exception:
+            cols = set()
+        has_hl = "half_life_days" in cols
+
+        if has_hl:
+            rows = con.execute(
+                "SELECT id,subject,predicate,object,confidence,provenance,created_at,topic,half_life_days FROM beliefs WHERE confidence > ?",
+                (float(floor),),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT id,subject,predicate,object,confidence,provenance,created_at,topic FROM beliefs WHERE confidence > ?",
+                (float(floor),),
+            ).fetchall()
+
+        for r in rows:
+            bid = int(r["id"])
+            conf0 = float(r["confidence"] or 0.0)
+            hl_row = float(r["half_life_days"] or half_life_days) if has_hl else float(half_life_days)
+            hl_row = max(1.0, float(hl_row))
+            decay_factor = 0.5 ** (dt_days / hl_row)
+            conf1 = max(float(floor), min(1.0, conf0 * float(decay_factor)))
+            if abs(conf1 - conf0) < 1e-6:
+                continue
+            # log history
+            try:
+                con.execute(
+                    "INSERT INTO beliefs_history(created_at,belief_id,op,row_json) VALUES(?,?,?,?)",
+                    (
+                        now_iso(),
+                        bid,
+                        "decay",
+                        json.dumps(
+                            {
+                                "subject": str(r["subject"]),
+                                "predicate": str(r["predicate"]),
+                                "object": str(r["object"]),
+                                "confidence_before": conf0,
+                                "confidence_after": conf1,
+                                "provenance": str(r["provenance"] or ""),
+                                "topic": str(r["topic"] or ""),
+                                "created_at": str(r["created_at"] or ""),
+                                "half_life_days": hl_row,
+                                "dt_days": dt_days,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+            except Exception:
+                pass
+            con.execute("UPDATE beliefs SET confidence=? WHERE id=?", (float(conf1), bid))
+
+        # prune very old low-confidence beliefs
+        if prune_ttl_days > 0:
+            cutoff = now - float(prune_ttl_days) * 86400.0
+            cutoff_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(cutoff))
+            old = con.execute(
+                "SELECT id,subject,predicate,object,confidence,provenance,created_at,topic FROM beliefs WHERE created_at < ? AND confidence <= ?",
+                (cutoff_iso, float(prune_below)),
+            ).fetchall()
+            for r in old:
+                bid = int(r["id"])
+                try:
+                    con.execute(
+                        "INSERT INTO beliefs_history(created_at,belief_id,op,row_json) VALUES(?,?,?,?)",
+                        (
+                            now_iso(),
+                            bid,
+                            "prune",
+                            json.dumps(
+                                {
+                                    "subject": str(r["subject"]),
+                                    "predicate": str(r["predicate"]),
+                                    "object": str(r["object"]),
+                                    "confidence": float(r["confidence"] or 0.0),
+                                    "provenance": str(r["provenance"] or ""),
+                                    "topic": str(r["topic"] or ""),
+                                    "created_at": str(r["created_at"] or ""),
+                                    "cutoff_iso": cutoff_iso,
+                                    "prune_below": prune_below,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        ),
+                    )
+                except Exception:
+                    pass
+                con.execute("DELETE FROM beliefs WHERE id=?", (bid,))
+
+        # update last decay timestamp
+        try:
+            con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('belief_decay_last',?)", (now_iso_str,))
+        except Exception:
+            pass
+
+        con.commit()
     finally:
         con.close()
 
@@ -1457,6 +1912,67 @@ def db_add_daydream(db: DB, trigger: str, state_json: Dict[str, Any], output_jso
 # UI DB helpers
 # -----------------------------
 
+def _prune_memory_short(con, *, max_rows: int = 800, ttl_days: float = 30.0) -> None:
+    """Soft forgetting for short-term memory.
+
+    Keeps at most `max_rows` newest rows and drops very old rows beyond `ttl_days`.
+    This prevents unbounded growth while still allowing recency-based context.
+    """
+    try:
+        max_rows = int(max(0, int(max_rows or 0)))
+    except Exception:
+        max_rows = 800
+    try:
+        ttl_days = float(ttl_days or 0.0)
+    except Exception:
+        ttl_days = 30.0
+
+    # TTL prune
+    if ttl_days > 0:
+        cutoff = time.time() - float(ttl_days) * 86400.0
+        cutoff_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(cutoff))
+        con.execute("DELETE FROM memory_short WHERE created_at < ?", (cutoff_iso,))
+
+    # Count prune (keep last max_rows). Prefer retaining high-salience items.
+    if max_rows > 0:
+        try:
+            cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(memory_short)").fetchall()}
+        except Exception:
+            cols = set()
+
+        if "salience" in cols:
+            rows = con.execute(
+                "SELECT id, created_at, salience FROM memory_short ORDER BY id DESC"
+            ).fetchall()
+            if rows and len(rows) > max_rows:
+                # Retention score combines salience (dominant) + recency.
+                n = float(max(1, len(rows) - 1))
+                scored = []
+                for rank, r in enumerate(rows):
+                    rid = int(r["id"])
+                    sal = float(r["salience"] or 0.0)
+                    rec = 1.0 - (float(rank) / n)  # newest ~1
+                    score = 0.75 * max(0.0, min(1.0, sal)) + 0.25 * max(0.0, min(1.0, rec))
+                    scored.append((score, rid))
+                scored.sort(reverse=True)
+                keep = {rid for _, rid in scored[: int(max_rows)]}
+                drop = [rid for _, rid in scored[int(max_rows) :]]
+                if drop:
+                    # delete in chunks
+                    for i in range(0, len(drop), 250):
+                        chunk = drop[i : i + 250]
+                        q = ",".join(["?"] * len(chunk))
+                        con.execute(f"DELETE FROM memory_short WHERE id IN ({q})", tuple(chunk))
+        else:
+            # Fallback for older DBs: keep last max_rows by id threshold.
+            row = con.execute(
+                "SELECT id FROM memory_short ORDER BY id DESC LIMIT 1 OFFSET ?",
+                (int(max_rows),),
+            ).fetchone()
+            if row and row["id"] is not None:
+                thr = int(row["id"])
+                con.execute("DELETE FROM memory_short WHERE id <= ?", (thr,))
+
 def db_add_message(db: DB, kind: str, text: str) -> int:
     con = db.connect()
     try:
@@ -1465,15 +1981,54 @@ def db_add_message(db: DB, kind: str, text: str) -> int:
             "INSERT INTO ui_messages(created_at,kind,text) VALUES(?,?,?)",
             (now, kind, text),
         )
+        ui_mid = int(cur.lastrowid)
         # Short-term memory stream (like main: keep raw dialogue; summarization can be a separate organ).
         if kind in ("user","reply"):
             role = "user" if kind == "user" else "assistant"
-            con.execute(
-                "INSERT INTO memory_short(role,content,created_at) VALUES(?,?,?)",
-                (role, text, now),
-            )
+            # best-effort topic anchoring
+            topic = ""
+            try:
+                row = con.execute("SELECT items_json FROM workspace_current WHERE id=1").fetchone()
+                if row and row["items_json"]:
+                    items = json.loads(row["items_json"] or "[]") or []
+                    for it in items:
+                        if isinstance(it, dict) and it.get("kind") == "topic" and it.get("active_topic"):
+                            topic = str(it.get("active_topic") or "")[:80]
+                            break
+            except Exception:
+                topic = ""
+
+            # Migration-safe insert (older DBs may not have the new columns)
+            try:
+                cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(memory_short)").fetchall()}
+            except Exception:
+                cols = set()
+            if {"ui_message_id", "topic", "salience"}.issubset(cols):
+                # Support optional episode tagging columns.
+                if {"episode_id", "episode_dist"}.issubset(cols):
+                    con.execute(
+                        "INSERT INTO memory_short(role,content,created_at,ui_message_id,topic,salience,episode_id,episode_dist) VALUES(?,?,?,?,?,?,?,?)",
+                        (role, text, now, ui_mid, topic, 0.0, "", 0),
+                    )
+                else:
+                    con.execute(
+                        "INSERT INTO memory_short(role,content,created_at,ui_message_id,topic,salience) VALUES(?,?,?,?,?,?)",
+                        (role, text, now, ui_mid, topic, 0.0),
+                    )
+            else:
+                con.execute(
+                    "INSERT INTO memory_short(role,content,created_at) VALUES(?,?,?)",
+                    (role, text, now),
+                )
+            # Soft forgetting: prune short memory (count + TTL)
+            try:
+                max_rows = int(os.environ.get('BUNNY_MEMORY_SHORT_MAX', '800') or 800)
+                ttl_days = float(os.environ.get('BUNNY_MEMORY_SHORT_TTL_DAYS', '30') or 30)
+                _prune_memory_short(con, max_rows=max_rows, ttl_days=ttl_days)
+            except Exception:
+                pass
         con.commit()
-        return int(cur.lastrowid)
+        return ui_mid
     finally:
         con.close()
 
@@ -1507,11 +2062,33 @@ def db_get_memory_short(db: DB, limit: int = 12) -> List[Dict[str, Any]]:
     """Return last N short-memory items (chronological order)."""
     con = db.connect()
     try:
-        rows = con.execute(
-            "SELECT role,content,created_at FROM memory_short ORDER BY id DESC LIMIT ?",
-            (int(limit),),
-        ).fetchall()
-        out = [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in rows]
+        try:
+            cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(memory_short)").fetchall()}
+        except Exception:
+            cols = set()
+
+        if {"salience", "topic", "ui_message_id"}.issubset(cols):
+            rows = con.execute(
+                "SELECT role,content,created_at,ui_message_id,topic,salience FROM memory_short ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+            out = [
+                {
+                    "role": r["role"],
+                    "content": r["content"],
+                    "created_at": r["created_at"],
+                    "ui_message_id": int(r["ui_message_id"] or 0),
+                    "topic": str(r["topic"] or ""),
+                    "salience": float(r["salience"] or 0.0),
+                }
+                for r in rows
+            ]
+        else:
+            rows = con.execute(
+                "SELECT role,content,created_at FROM memory_short ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+            out = [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in rows]
         out.reverse()
         return out
     finally:
@@ -1531,6 +2108,158 @@ def db_get_memory_long(db: DB, limit: int = 4) -> List[Dict[str, Any]]:
     finally:
         con.close()
 
+
+def db_update_memory_short_salience(db: DB, ui_message_id: int, salience: float, *, topic: str = "") -> None:
+    """Update salience/topic for a short-memory row linked to a UI message.
+
+    Migration-safe: does nothing if the linkage columns don't exist.
+    """
+    try:
+        ui_message_id = int(ui_message_id or 0)
+    except Exception:
+        ui_message_id = 0
+    if ui_message_id <= 0:
+        return
+    s = float(salience or 0.0)
+    s = max(0.0, min(1.0, s))
+    topic = (topic or "").strip()[:80]
+
+    con = db.connect()
+    try:
+        try:
+            cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(memory_short)").fetchall()}
+        except Exception:
+            cols = set()
+        if not {"ui_message_id", "salience"}.issubset(cols):
+            return
+        # Update salience (monotonic max) and topic if provided.
+        if "topic" in cols and topic:
+            con.execute(
+                "UPDATE memory_short SET salience=MAX(COALESCE(salience,0.0),?), topic=CASE WHEN topic='' THEN ? ELSE topic END WHERE ui_message_id=?",
+                (s, topic, ui_message_id),
+            )
+        else:
+            con.execute(
+                "UPDATE memory_short SET salience=MAX(COALESCE(salience,0.0),?) WHERE ui_message_id=?",
+                (s, ui_message_id),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+
+
+def db_update_memory_short_episode(db: DB, ui_message_id: int, episode_id: str, episode_dist: int, *, salience_floor: float = 0.0) -> None:
+    """Attach episode metadata to STM and optionally raise salience.
+
+    Migration-safe: no-op if episode columns do not exist.
+    """
+    try:
+        ui_message_id = int(ui_message_id or 0)
+    except Exception:
+        ui_message_id = 0
+    if ui_message_id <= 0:
+        return
+    eid = (episode_id or "").strip()[:64]
+    try:
+        dist = int(episode_dist or 0)
+    except Exception:
+        dist = 0
+    sf = float(salience_floor or 0.0)
+    sf = max(0.0, min(1.0, sf))
+
+    con = db.connect()
+    try:
+        try:
+            cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(memory_short)").fetchall()}
+        except Exception:
+            cols = set()
+        if not {"ui_message_id", "salience"}.issubset(cols):
+            return
+        if not {"episode_id", "episode_dist"}.issubset(cols):
+            # If DB is old, just raise salience if possible.
+            con.execute(
+                "UPDATE memory_short SET salience=MAX(COALESCE(salience,0.0),?) WHERE ui_message_id=?",
+                (sf, ui_message_id),
+            )
+            con.commit()
+            return
+        con.execute(
+            "UPDATE memory_short SET episode_id=?, episode_dist=?, salience=MAX(COALESCE(salience,0.0),?) WHERE ui_message_id=?",
+            (eid, dist, sf, ui_message_id),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+
+def db_apply_episode_boost(db: DB, center_ui_message_id: int, episode_id: str, strength: float, window: int, tau: float) -> int:
+    """Boost salience for STM rows around a high-salience episode.
+
+    Models human 'tag-and-capture': salient events strengthen nearby context.
+
+    Only updates existing rows; future messages are boosted by Kernel when they arrive.
+    Returns number of rows updated.
+    """
+    try:
+        center = int(center_ui_message_id or 0)
+    except Exception:
+        center = 0
+    if center <= 0:
+        return 0
+    eid = (episode_id or "").strip()[:64]
+    try:
+        w = max(0, int(window or 0))
+    except Exception:
+        w = 0
+    try:
+        t = max(0.25, float(tau or 2.5))
+    except Exception:
+        t = 2.5
+    s0 = max(0.0, min(1.0, float(strength or 0.0)))
+    if w <= 0 or s0 <= 0.0:
+        return 0
+
+    lo = max(0, center - w)
+    hi = center + w
+
+    import math
+    con = db.connect()
+    try:
+        try:
+            cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(memory_short)").fetchall()}
+        except Exception:
+            cols = set()
+        if not {"ui_message_id", "salience"}.issubset(cols):
+            return 0
+        rows = con.execute(
+            "SELECT id, ui_message_id FROM memory_short WHERE ui_message_id BETWEEN ? AND ?",
+            (lo, hi),
+        ).fetchall()
+        n = 0
+        for r in rows:
+            rid = int(r["id"])
+            mid = int(r["ui_message_id"] or 0)
+            dist = abs(mid - center)
+            boost = s0 * math.exp(-float(dist) / t)
+            boost = max(0.0, min(1.0, boost))
+            if {"episode_id", "episode_dist"}.issubset(cols):
+                con.execute(
+                    "UPDATE memory_short SET salience=MAX(COALESCE(salience,0.0),?), episode_id=?, episode_dist=? WHERE id=?",
+                    (boost, eid, int(dist), rid),
+                )
+            else:
+                con.execute(
+                    "UPDATE memory_short SET salience=MAX(COALESCE(salience,0.0),?) WHERE id=?",
+                    (boost, rid),
+                )
+            n += 1
+        con.commit()
+        return n
+    finally:
+        con.close()
 def db_add_sensory_token(db: DB, modality: str, summary: str, tokens: Dict[str, Any], salience: float, topic: str = "") -> None:
     con = db.connect()
     try:
@@ -1637,16 +2366,3 @@ def db_add_websense_page(db: DB, query: str, fr: Dict[str, Any], ok: int = 1) ->
 # -----------------------------
 # SSE broker
 # -----------------------------
-
-def db_get_memory_short(db: DB, limit: int = 12) -> List[Dict[str, Any]]:
-    con = db.connect()
-    try:
-        rows = con.execute(
-            "SELECT role,content,created_at FROM memory_short ORDER BY id DESC LIMIT ?",
-            (int(limit),),
-        ).fetchall()
-        out = [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in rows]
-        out.reverse()
-        return out
-    finally:
-        con.close()

@@ -40,7 +40,7 @@ def arbitrate_workspace(
     }
 
     try:
-        resp = http_post_json(
+        status, txt = http_post_json(
             f"{ollama_url.rstrip('/')}/api/generate",
             {
                 "model": model,
@@ -51,8 +51,13 @@ def arbitrate_workspace(
             },
             timeout_s=35,
         )
-        txt = (resp or {}).get("response") or ""
-        data = json.loads(txt)
+        if status == 0:
+            raise RuntimeError(txt)
+        if status >= 400:
+            raise RuntimeError(f"ollama /api/generate HTTP {status}: {txt[:200]}")
+        resp = json.loads(txt or "{}")
+        out_txt = (resp or {}).get("response") or ""
+        data = json.loads(out_txt)
         items = data.get("items")
         if isinstance(items, list) and items:
             out: List[Dict[str, Any]] = []

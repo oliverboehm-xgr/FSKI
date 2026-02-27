@@ -24,15 +24,18 @@ def _ollama_chat(cfg: OllamaConfig, system: str, user: str) -> str:
             {"role": "user", "content": user},
         ],
     }
-    r = http_post_json(cfg.host.rstrip("/") + "/api/chat", payload, timeout_s=60.0)
-    # Ollama returns either {"message":{"content":...}} (non-stream) or concatenated.
-    if isinstance(r, dict):
-        msg = r.get("message") or {}
-        if isinstance(msg, dict) and "content" in msg:
-            return str(msg.get("content") or "")
-        if "response" in r:
-            return str(r.get("response") or "")
-    return str(r)
+    status, txt = http_post_json(cfg.host.rstrip("/") + "/api/chat", payload, timeout_s=60.0)
+    if status == 0:
+        raise RuntimeError(txt)
+    if status >= 400:
+        raise RuntimeError(f"ollama /api/chat HTTP {status}: {txt[:200]}")
+    data = json.loads(txt or "{}")
+    msg = data.get("message") or {}
+    if isinstance(msg, dict) and "content" in msg:
+        return str(msg.get("content") or "")
+    if "response" in data:
+        return str(data.get("response") or "")
+    return ""
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     # robust: find first '{' and last '}' and parse
@@ -132,4 +135,30 @@ def interpret_feedback(
         out["feedback_type"] = "other"
     if not isinstance(out.get("notes"), str):
         out["notes"] = ""
+
+    # Fallback: if the model omitted deltas but produced axiom_scores, derive a minimal
+    # desired_state_delta from axiom_scores to keep plasticity functional.
+    try:
+        if (not out.get("desired_state_delta")) and isinstance(out.get("axiom_scores"), dict):
+            ax = out.get("axiom_scores") or {}
+            ds: Dict[str, float] = {}
+            for k, v in ax.items():
+                kk = str(k).strip().lower()
+                if not kk.startswith('a'):
+                    continue
+                try:
+                    n = int(kk[1:])
+                except Exception:
+                    continue
+                try:
+                    sc = float(v)
+                except Exception:
+                    continue
+                sc = max(0.0, min(1.0, sc))
+                d = (sc - 0.5) * 0.25  # small, bounded
+                ds[f"purpose_a{n}"] = d
+                ds[f"tension_a{n}"] = -d
+            out["desired_state_delta"] = ds
+    except Exception:
+        pass
     return out

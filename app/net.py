@@ -64,7 +64,13 @@ def http_get(url: str, headers: Optional[Dict[str, str]] = None, timeout: float 
         return HttpResponse(status=0, url=url, text=f"{type(e).__name__}: {e}", content_type="")
 
 
-def http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None, timeout: float = 60.0) -> Tuple[int, str]:
+def http_post_json(
+    url: str,
+    payload: Dict[str, Any],
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float = 60.0,
+    timeout_s: float | None = None,
+) -> Tuple[int, str]:
     started = time.time()
     started_at = datetime.datetime.utcnow().isoformat(timespec='seconds')+'Z'
     organ = ''
@@ -79,13 +85,16 @@ def http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[str
     except Exception:
         organ = ''
 
+    # Backwards/forwards compatibility: some organs call with timeout_s.
+    eff_timeout = float(timeout_s) if timeout_s is not None else float(timeout)
+
     body = json.dumps(payload).encode("utf-8")
     hdrs = {"Content-Type": "application/json", "Accept": "application/json"}
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ssl.create_default_context()) as resp:
+        with urllib.request.urlopen(req, timeout=eff_timeout, context=ssl.create_default_context()) as resp:
             data = resp.read()
             try:
                 txt = data.decode("utf-8", errors="replace")

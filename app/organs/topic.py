@@ -54,8 +54,13 @@ def detect_topic(cfg: OllamaConfig, user_text: str, prev_topic: str, context_hin
             {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
         ],
     }
-    r = http_post_json(url, payload, timeout=30)
-    content = (r.get("message") or {}).get("content") or ""
+    status, txt = http_post_json(url, payload, timeout=30)
+    if status == 0:
+        raise RuntimeError(txt)
+    if status >= 400:
+        raise RuntimeError(f"ollama /api/chat HTTP {status}: {txt[:200]}")
+    data = json.loads(txt or "{}")
+    content = ((data.get("message") or {}).get("content") or "")
     # strict json parse (best effort)
     try:
         return json.loads(content)

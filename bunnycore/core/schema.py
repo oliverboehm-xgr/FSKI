@@ -78,7 +78,10 @@ CREATE TABLE IF NOT EXISTS memory_short(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   role TEXT NOT NULL,
   content TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  ui_message_id INTEGER NOT NULL DEFAULT 0,
+  topic TEXT NOT NULL DEFAULT '',
+  salience REAL NOT NULL DEFAULT 0.0
 );
 
 CREATE TABLE IF NOT EXISTS memory_long(
@@ -247,7 +250,11 @@ CREATE TABLE IF NOT EXISTS beliefs(
   predicate TEXT NOT NULL,
   object TEXT NOT NULL,
   confidence REAL NOT NULL DEFAULT 0.7,
-  provenance TEXT NOT NULL DEFAULT ''
+  provenance TEXT NOT NULL DEFAULT '',
+  topic TEXT NOT NULL DEFAULT '',
+  salience REAL NOT NULL DEFAULT 0.0,
+  half_life_days REAL NOT NULL DEFAULT 45.0,
+  updated_at TEXT NOT NULL DEFAULT ''
 );
 
 -- Self-model snapshots (capabilities, organs, costs). Used for self-development proposals.

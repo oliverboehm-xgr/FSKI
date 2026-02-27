@@ -26,14 +26,18 @@ def _ollama_chat(cfg: OllamaConfig, system: str, user: str) -> str:
             {"role": "user", "content": user},
         ],
     }
-    r = http_post_json(cfg.host.rstrip("/") + "/api/chat", payload, timeout_s=60.0)
-    if isinstance(r, dict):
-        msg = r.get("message") or {}
-        if isinstance(msg, dict) and "content" in msg:
-            return str(msg.get("content") or "")
-        if "response" in r:
-            return str(r.get("response") or "")
-    return str(r)
+    status, txt = http_post_json(cfg.host.rstrip("/") + "/api/chat", payload, timeout_s=60.0)
+    if status == 0:
+        raise RuntimeError(txt)
+    if status >= 400:
+        raise RuntimeError(f"ollama /api/chat HTTP {status}: {txt[:200]}")
+    data = json.loads(txt or "{}")
+    msg = data.get("message") or {}
+    if isinstance(msg, dict) and "content" in msg:
+        return str(msg.get("content") or "")
+    if "response" in data:
+        return str(data.get("response") or "")
+    return ""
 
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:

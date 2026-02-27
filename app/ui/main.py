@@ -401,8 +401,12 @@ def main() -> int:
     db = init_db(args.db)
     os.environ['BUNNY_DB_PATH']=str(db.path)
     axis = ensure_axes(db)
-    # protect satiation axes from learnable matrices
-    protect_names = ['sat_a1','sat_a3','sat_a4']
+    # Protect measurement-like and invariant axes from learnable matrices.
+    # These should only be influenced by trusted internal event types (health/resources/reward_signal).
+    protect_names = [
+        'pain','pain_physical','pain_psych','energy','fatigue','sleep_pressure',
+        'sat_a1','sat_a3','sat_a4'
+    ]
     protect_indices = [axis[n] for n in protect_names if n in axis]
 
     store = MatrixStore(db)
@@ -415,7 +419,7 @@ def main() -> int:
 
     cfg_integ = IntegratorConfig()
     cfg_integ.protect_indices = protect_indices
-    cfg_integ.protect_allow_event_types = ['reward_signal']
+    cfg_integ.protect_allow_event_types = ['health','resources','reward_signal']
     integ = Integrator(store, reg, encoders, cfg_integ)
     hb = Heartbeat(db, integ, HeartbeatConfig(tick_hz=2.0, snapshot_every_n_ticks=1))
 

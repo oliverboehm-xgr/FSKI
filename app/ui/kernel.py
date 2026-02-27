@@ -18,6 +18,7 @@ import sys
 
 import argparse
 import json
+import hashlib
 import os
 import queue
 import shutil
@@ -72,9 +73,12 @@ from bunnycore.core.matrices import identity
 
 from app.organs.websense import search_ddg, spider, fetch, SpiderBudget
 from app.organs.evidence import extract_evidence_claims, refine_search_query, OllamaConfig as EvidenceConfig
+from app.organs.assimilate import assimilate_websense_claims
+from app.organs.policy_kernel import PolicyKernel, PolicyKernelConfig, POLICY_ACTIONS
 from app.organs.decider import decide as decide_pressures, OllamaConfig as DeciderConfig
 from app.organs.daydream import run_daydream, OllamaConfig as DaydreamConfig
 from app.organs.feedback import interpret_feedback, OllamaConfig as FeedbackConfig
+from app.organs.beliefs import extract_user_beliefs, OllamaConfig as BeliefsConfig
 from app.organs.selfeval import evaluate_outcome, OllamaConfig as SelfEvalConfig
 from app.organs.introspect import build_self_model
 from app.organs.sleep import SleepConfig, sleep_consolidate
@@ -274,7 +278,7 @@ def format_state_summary(axis: Dict[str,int], values: List[float]) -> str:
     parts = []
     for k in keys:
         if k in named:
-            parts.append(f"{k}={named[k]:+.2f}")
+            parts.append(f"{k}={max(0.0, min(1.0, float(named[k]))):.2f}")
     return ", ".join(parts)
 
 
@@ -1249,6 +1253,25 @@ class Kernel:
             num_ctx=1024,
         )
 
+        # Belief extraction runs on every user message (generic memory acquisition).
+        self.beliefs_cfg = BeliefsConfig(
+            host=ollama_host,
+            model=(os.environ.get("BUNNY_MODEL_BELIEFS") or os.environ.get("BUNNY_MODEL_DECIDER") or getattr(self.cfg, "model", "llama3.2:3b-instruct")),
+            temperature=float(os.environ.get("BUNNY_TEMP_BELIEFS", "0.2")),
+            num_ctx=int(os.environ.get("BUNNY_CTX_BELIEFS", "2048")),
+            stream=False,
+        )
+
+        # Policy kernel: trainable, deterministic action prior (mutatable by Daydream).
+        self.policy_cfg = PolicyKernelConfig(
+            enable=str(os.environ.get('BUNNY_POLICY_ENABLE','1')).strip() not in ('0','false','False'),
+            eta=float(os.environ.get('BUNNY_POLICY_ETA','0.05')),
+            l2_decay=float(os.environ.get('BUNNY_POLICY_L2','0.001')),
+            max_abs=float(os.environ.get('BUNNY_POLICY_MAXABS','3.0')),
+            frob_tau=float(os.environ.get('BUNNY_POLICY_FROB','25.0')),
+        )
+        self.policy = PolicyKernel(self.db, self.store, self.axis, cfg=self.policy_cfg)
+
         # Failure clustering + skills + DevLab (self-development pipeline)
         self.cluster_cfg = ClusterConfig(
             host=ollama_host,
@@ -1275,6 +1298,31 @@ class Kernel:
         self.broker = broker
         self._lock = threading.Lock()
 
+        # Ensure LLM calls run sequentially even with background autonomy threads.
+        # This avoids CPU/RAM spikes and makes behavior more deterministic.
+        self._llm_lock = threading.Lock()
+        self._llm_organs = {
+            "speech",
+            "topic",
+            "beliefs",
+            "decider",
+            "feedback",
+            "evidence",
+            "selfeval",
+            "daydream",
+            "sleep",
+            "evolve",
+            "curriculum",
+            "cluster",
+            "skill",
+            "devlab",
+            "workspace_arbiter",
+        }
+
+        # Episode tagging (salience-driven): models human tag-and-capture consolidation.
+        # Active episode context is used to boost nearby STM and belief stickiness.
+        self._active_episode = None  # dict(id, center_ui_id, strength, window, tau, valence)
+
         # Generic capability bus (optional modules: tools/sensors/actors).
         # Never required for core operation; failures must be reflected as pain via health metrics.
         self.cap = CapabilityBus(self.db, self.hb.enqueue)
@@ -1285,9 +1333,14 @@ class Kernel:
         self.th_websense = float(os.environ.get("BUNNY_TH_WEBSENSE", "0.45"))
         self.th_daydream = float(os.environ.get("BUNNY_TH_DAYDREAM", "0.45"))
         self.th_evolve = float(os.environ.get("BUNNY_TH_EVOLVE", "0.55"))
+        self.th_autotalk = float(os.environ.get("BUNNY_TH_AUTOTALK", "0.75"))
         self.idle_period_s = float(os.environ.get("BUNNY_IDLE_PERIOD", "6"))
         self.idle_cooldown_s = float(os.environ.get("BUNNY_IDLE_COOLDOWN", "30"))
         self._last_idle_action = 0.0
+
+        self.autotalk_cooldown_s = float(os.environ.get("BUNNY_AUTOTALK_COOLDOWN", "600"))
+        self._last_autotalk_user_id = 0
+        self._last_autotalk = 0.0
 
         # Drive integration: interpret organ outputs as *targets* and convert to deltas
         # (prevents saturation and makes negative corrections possible).
@@ -1343,7 +1396,12 @@ class Kernel:
         err = ""
         res = None
         try:
-            res = fn()
+            # Serialize LLM-heavy organs to avoid resource spikes.
+            if getattr(self, "_llm_lock", None) is not None and str(organ) in getattr(self, "_llm_organs", set()):
+                with self._llm_lock:
+                    res = fn()
+            else:
+                res = fn()
             return res
         except Exception as e:
             ok = False
@@ -1374,10 +1432,21 @@ class Kernel:
                 energy_value=energy_val,
                 matrix_delta_frob_recent=float(md or 0.0),
             )
-            self.hb.enqueue(Event("health", self._targets_to_delta_payload({"pain_physical": float(pain), "pain": float(pain)}, eta=self.eta_measure)).with_time())
+            # Total pain = max(physical, psych). Psych is integrated elsewhere from self-eval/feedback.
+            idx_ps = self.axis.get("pain_psych")
+            ps = float(s.values[idx_ps]) if idx_ps is not None and idx_ps < len(s.values) else 0.0
+            total = max(float(pain), float(ps))
+            self.hb.enqueue(
+                Event(
+                    "health",
+                    self._targets_to_delta_payload({"pain_physical": float(pain), "pain": float(total)}, eta=self.eta_measure),
+                ).with_time()
+            )
             self.hb.step()
-            # After pain is updated, consider rolling back recent matrix updates that correlate with regressions.
-            self._maybe_rollback_on_pain(float(pain), pain_physical_now=float(pain), pain_psych_now=0.0)
+            # Rollback MUST NOT be driven by latency/resource pain; use psych pain as regression signal.
+            s2 = self.hb.load_state()
+            ps2 = float(s2.values[idx_ps]) if idx_ps is not None and idx_ps < len(s2.values) else 0.0
+            self._maybe_rollback_on_pain(float(ps2), pain_physical_now=float(pain), pain_psych_now=float(ps2))
         except Exception:
             return
 
@@ -1508,6 +1577,7 @@ class Kernel:
                         wishes=db_get_wishes_current(self.db),
                         self_report=build_self_report(self.hb.load_state(), self.axis).to_dict(),
                         active_topic=_get_active_topic(db_get_workspace_current(self.db)),
+                        policy_hint=policy_hint,
                     ),
                 )
             except Exception:
@@ -1553,6 +1623,25 @@ class Kernel:
                         lambda: run_daydream(self.daydream_cfg, db_get_axioms(self.db), self._state_summary(), recent, trigger="idle"),
                     )
                     db_add_daydream(self.db, "idle", {"state": self._state_summary()}, dd)
+
+
+                    # Policy mutation from daydream (idle).
+                    try:
+                        pm = dd.get('policy_mutation') if isinstance(dd, dict) else {}
+                        if isinstance(pm, dict):
+                            act = str(pm.get('action') or '').strip()
+                            if act == 'none':
+                                act = ''
+                            direction = float(pm.get('direction', 1.0) or 1.0)
+                            strength = float(pm.get('strength', 0.0) or 0.0)
+                            strength = max(0.0, min(1.0, strength))
+                            if act in POLICY_ACTIONS and strength >= 0.05:
+                                pol2 = self.policy.predict(self.hb.load_state().values)
+                                v2 = int(pol2.get('version') or 1)
+                                x2 = pol2.get('features') or []
+                                self.policy.apply_update(from_version=v2, x=x2, action=act, reward=float(direction) * float(strength), note='daydream_mutation')
+                    except Exception:
+                        pass
 
                     ax_int = dd.get("axiom_interpretations") if isinstance(dd.get("axiom_interpretations"), dict) else {}
                     for ak, val in (ax_int or {}).items():
@@ -1731,7 +1820,83 @@ class Kernel:
                     except Exception:
                         pass
 
-            # Sleep / consolidation: if sleep_pressure is high and we've been idle for a bit, consolidate.
+            
+            # Auto-speech (unsolicited check-in): only when the decider explicitly requests it.
+            # Kind='auto' so users can react/penalize it; learnability comes from feedback + selfeval.
+            try:
+                # Avoid repeating auto-talk for the same last user message.
+                last_user_id = 0
+                for m in reversed(recent):
+                    if m.get("kind") == "user":
+                        last_user_id = int(m.get("id") or 0)
+                        break
+                if (
+                    float(((decision.get("actions") or {}).get("reply") or 0.0)) >= self.th_autotalk
+                    and last_user_id > int(getattr(self, "_last_autotalk_user_id", 0) or 0)
+                    and (time.time() - float(getattr(self, "_last_autotalk", 0.0) or 0.0)) >= float(self.autotalk_cooldown_s)
+                ):
+                    ws_items_cur = db_get_workspace_current(self.db)
+                    active_topic = _get_active_topic(ws_items_cur)
+                    needs_cur = db_get_needs_current(self.db)
+                    wishes_cur = db_get_wishes_current(self.db)
+                    self_rep = build_self_report(self.hb.load_state(), self.axis).to_dict()
+                    workspace_block = f"\n\nWORKSPACE:\n" + json.dumps(ws_items_cur or [], ensure_ascii=False) if ws_items_cur else ""
+                    needs_block = f"\n\nNEEDS_CURRENT:\n" + json.dumps(needs_cur or {}, ensure_ascii=False) if needs_cur else ""
+                    wishes_block = f"\n\nWISHES_CURRENT:\n" + json.dumps(wishes_cur or {}, ensure_ascii=False) if wishes_cur else ""
+                    selfreport_block = f"\n\nSELF_REPORT:\n" + json.dumps(self_rep or {}, ensure_ascii=False)
+                    mood_obj = project_mood(self.hb.load_state(), self.axis).to_dict()
+                    mood_block = f"\n\nMOOD:\n" + json.dumps(mood_obj or {}, ensure_ascii=False)
+                    topic_block = f"\n\nACTIVE_TOPIC: {active_topic}" if active_topic else ""
+
+                    mem_long = db_get_memory_long(self.db, limit=4)
+                    mem_long_ctx = render_memory_long_context(mem_long)
+                    mem_long_block = f"\n\nMEMORY_LONG:\n{mem_long_ctx}" if mem_long_ctx else ""
+
+                    mem_items = db_get_memory_short(self.db, limit=10)
+                    mem_ctx = render_memory_context(mem_items)
+                    mem_block = f"\n\nMEMORY_SHORT:\n{mem_ctx}" if mem_ctx else ""
+
+                    beliefs_items = db_list_beliefs(self.db, limit=10, topic=active_topic)
+                    beliefs_ctx = render_beliefs_context(beliefs_items)
+                    beliefs_block = f"\n\nBELIEFS:\n{beliefs_ctx}" if beliefs_ctx else ""
+
+                    # Auto talk prompt: short, non-spammy, one question max.
+                    sys_prompt = (
+                        "You are Bunny, a digital organism. You may emit ONE short unsolicited message when idle. "
+                        "Be helpful, calm, and non-intrusive. "
+                        "Do NOT output logs/JSON/tags. "
+                        "If you have nothing valuable to say, output an empty string."
+                    )
+                    user_prompt = (
+                        f"INTERNAL_STATE: {self._state_summary()}{topic_block}{selfreport_block}{mood_block}{needs_block}{wishes_block}{workspace_block}{mem_long_block}{mem_block}{beliefs_block}\n\n"
+                        f"CONTEXT: idle/autonomous tick. Last user message: {last_user!r}\n"
+                        "TASK: If appropriate, send a brief check-in or one short question that helps the user. Otherwise output empty string."
+                    )
+                    out = self._call_with_health(
+                        "speech",
+                        lambda: ollama_chat(self.cfg, sys_prompt, user_prompt),
+                        metrics={
+                            "model": self.cfg.model,
+                            "ctx": int(self.cfg.num_ctx),
+                            "sys_chars": len(sys_prompt),
+                            "user_chars": len(user_prompt),
+                            "auto": True,
+                        },
+                    )
+                    out = (out or "").strip()
+                    if out:
+                        mid = db_add_message(self.db, "auto", out)
+                        self.broker.publish("message", self._ui_message(mid))
+                        self.hb.enqueue(Event("speech_outcome", {"len": len(out), "auto": True}).with_time())
+                        self.hb.step()
+                        self.broker.publish("status", db_status(self.db))
+                        self._last_idle_action = time.time()
+                        self._last_autotalk = time.time()
+                        self._last_autotalk_user_id = int(last_user_id)
+            except Exception:
+                pass
+
+# Sleep / consolidation: if sleep_pressure is high and we've been idle for a bit, consolidate.
             try:
                 s = self.hb.load_state()
                 idx_sp = self.axis.get("sleep_pressure")
@@ -1744,19 +1909,95 @@ class Kernel:
                     recent = db_list_messages(self.db, limit=40)
                     summary = self._call_with_health(
                         "sleep",
-                        lambda: sleep_consolidate(self.sleep_cfg, axioms, self._state_summary(), ws, beliefs, recent),
+                        lambda: sleep_consolidate(
+                            self.sleep_cfg,
+                            axioms,
+                            self._state_summary(),
+                            ws,
+                            beliefs,
+                            recent,
+                            axiom_interpretations=db_group_axiom_interpretations(self.db, limit_per_axiom=24),
+                        ),
                     )
                     if isinstance(summary, dict):
                         db_add_sleep_log(self.db, summary)
-                        # Write a compact consolidation into long memory as a stable anchor
+
+                        # Apply axiom digests (compressed interpretations) so they become first-class memory.
                         try:
-                            con = self.db.connect()
-                            con.execute(
-                                "INSERT INTO memory_long(created_at,key,value,confidence,source_note) VALUES(?,?,?,?,?)",
-                                (now_iso(), "sleep_summary", json.dumps(summary, ensure_ascii=False), 0.6, "sleep_consolidate"),
-                            )
-                            con.commit()
-                            con.close()
+                            ad = summary.get("axiom_digests") if isinstance(summary.get("axiom_digests"), dict) else {}
+                            for ak, dg in (ad or {}).items():
+                                s = (str(dg) if dg is not None else "").strip()
+                                if not s:
+                                    continue
+                                if str(ak) not in ("A1", "A2", "A3", "A4"):
+                                    continue
+                                ck = hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
+                                db_upsert_axiom_digest(self.db, str(ak), s[:600], ck)
+                        except Exception:
+                            pass
+
+                        # Apply belief compression/merges and downranks.
+                        try:
+                            topic = _get_active_topic(ws) if isinstance(ws, list) else ""
+                            for b in (summary.get("merged_beliefs") or []):
+                                if not isinstance(b, dict):
+                                    continue
+                                db_upsert_belief(
+                                    self.db,
+                                    str(b.get("subject") or ""),
+                                    str(b.get("predicate") or ""),
+                                    str(b.get("object") or ""),
+                                    confidence=float(b.get("confidence", 0.7) or 0.7),
+                                    provenance=str(b.get("provenance") or "sleep_merge"),
+                                    topic=topic,
+                                    compress=True,
+                                )
+                            for b in (summary.get("downgrade_beliefs") or []):
+                                if not isinstance(b, dict):
+                                    continue
+                                db_downrank_belief(
+                                    self.db,
+                                    str(b.get("subject") or ""),
+                                    str(b.get("predicate") or ""),
+                                    str(b.get("object") or ""),
+                                    reason=str(b.get("reason") or "")[:120],
+                                    topic=topic,
+                                )
+                        except Exception:
+                            pass
+
+
+                        # Soft forgetting: decay belief confidence over time and prune very old low-confidence details.
+                        try:
+                            hl = float(os.environ.get('BUNNY_BELIEF_HALF_LIFE_DAYS', '45') or 45)
+                            floor = float(os.environ.get('BUNNY_BELIEF_FLOOR', '0.15') or 0.15)
+                            ttl = float(os.environ.get('BUNNY_BELIEF_PRUNE_TTL_DAYS', '180') or 180)
+                            below = float(os.environ.get('BUNNY_BELIEF_PRUNE_BELOW', '0.18') or 0.18)
+                            db_age_and_prune_beliefs(self.db, half_life_days=hl, floor=floor, prune_ttl_days=ttl, prune_below=below)
+                        except Exception:
+                            pass
+
+
+                        # Write a compact consolidation into long memory as a stable anchor (schema-migration safe)
+                        try:
+                            summ = str(summary.get("summary") or "").strip()[:1200]
+                            if summ:
+                                con = self.db.connect()
+                                try:
+                                    cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(memory_long)").fetchall()}
+                                    if {"summary", "topic", "modality", "salience", "created_at"}.issubset(cols):
+                                        con.execute(
+                                            "INSERT INTO memory_long(summary,topic,modality,salience,created_at) VALUES(?,?,?,?,?)",
+                                            (summ, (_get_active_topic(ws) if isinstance(ws, list) else "")[:80], "sleep", 0.6, now_iso()),
+                                        )
+                                    elif {"summary", "created_at"}.issubset(cols):
+                                        con.execute(
+                                            "INSERT INTO memory_long(summary,created_at) VALUES(?,?)",
+                                            (summ, now_iso()),
+                                        )
+                                finally:
+                                    con.commit()
+                                    con.close()
                         except Exception:
                             pass
                     self._last_sleep = time.time()
@@ -1846,9 +2087,21 @@ class Kernel:
             self.store.put_sparse("A_evolve", version=1, n_rows=n, n_cols=n, entries=id_entries(0.55, protect_metrics=True),
                                   meta={"desc":"evolve/self-development coupling"})
 
+        # Reward channel matrix (identity-like). Historically reward_signal bypassed matrices;
+        # we keep it explicit so all events follow the same equation S' = decay*S + Σ A φ(E).
+        if not have("A_reward", 1):
+            self.store.put_sparse(
+                "A_reward",
+                version=1,
+                n_rows=n,
+                n_cols=n,
+                entries=id_entries(1.0, protect_metrics=True),
+                meta={"desc": "reward/high coupling (explicit, non-learned)"},
+            )
+
         self.reg.upsert(AdapterBinding("user_utterance", "simple_text_v1", "A_user", 1, {"desc":"user -> state"}))
         self.reg.upsert(AdapterBinding("decision", "drive_field_v1", "A_decision", 1, {"desc":"decider drives -> state"}))
-        self.reg.upsert(AdapterBinding("reward_signal", "drive_field_v1", "A_reward", 1, {"desc":"invariant reward/high channel (bypasses matrices in integrator)"}))
+        self.reg.upsert(AdapterBinding("reward_signal", "drive_field_v1", "A_reward", 1, {"desc":"reward/high channel (explicit matrix; protected axes enforced)"}))
         self.reg.upsert(AdapterBinding("daydream", "drive_field_v1", "A_daydream", 1, {"desc":"daydream drives -> state"}))
         self.reg.upsert(AdapterBinding("websense", "websense_v1", "A_websense", 1, {"desc":"websense -> state"}))
         self.reg.upsert(AdapterBinding("resources", "drive_field_v1", "A_resources", 1, {"desc":"resources drives -> state"}))
@@ -1881,7 +2134,7 @@ class Kernel:
         parts = []
         for k in keys:
             if k in named:
-                parts.append(f"{k}={named[k]:+.2f}")
+                parts.append(f"{k}={max(0.0, min(1.0, float(named[k]))):.2f}")
         return ", ".join(parts)
 
     def __getattr__(self, name: str):
@@ -1982,7 +2235,11 @@ class Kernel:
             pain_before = 0.0
             try:
                 s0 = self.hb.load_state()
-                idx_p = self.axis.get("pain")
+                # IMPORTANT: rollback safety should be based on psych/teleological regressions,
+                # not physical latency/energy fluctuations.
+                idx_p = self.axis.get("pain_psych")
+                if idx_p is None:
+                    idx_p = self.axis.get("pain")
                 if idx_p is not None and idx_p < len(s0.values):
                     pain_before = float(s0.values[idx_p])
             except Exception:
@@ -2140,6 +2397,9 @@ class Kernel:
     def process_user_text(self, text: str) -> Tuple[int, int]:
         """Returns (user_msg_id, reply_msg_id)."""
         with self._lock:
+            # Turn anchor for salience-based learning and memory stickiness.
+            turn_start_iso = now_iso()
+            s_before = self.hb.load_state().copy()
             user_id = db_add_message(self.db, "user", text)
             self.broker.publish("message", self._ui_message(user_id))
 
@@ -2153,17 +2413,19 @@ class Kernel:
             # Lite mode: single-call chat (speech only). This avoids multi-organ
             # LLM pipelines that can hard-freeze CPU-only machines.
             if getattr(self, "lite_mode", False):
+                # IMPORTANT: internal state is context only; Bunny must NEVER print it.
                 sys_prompt = (
-                    "You are Bunny, a digital organism. Reply naturally, concise and precise. "
-                    "No filler, no greetings unless the user greeted first. "
-                    "No apologies, no meta talk. "
-                    "If you lack information, ask ONE clarifying question."
+                    "You are Bunny, a digital organism. Answer the USER in natural, friendly language. "
+                    "Do NOT output logs, JSON, tags, INTERNAL_STATE, MOOD, scores, weights, or any debugging. "
+                    "Never write 'INTERNAL_STATE', 'MOOD', 'updated', or similar. "
+                    "If the user greets you, greet back. Otherwise respond directly. "
+                    "If you truly need more information, ask exactly ONE clarifying question."
                 )
                 mood_obj = project_mood(self.hb.load_state(), self.axis).to_dict()
                 user_prompt = (
-                    f"INTERNAL_STATE: {self._state_summary()}\n"
-                    f"MOOD: {json.dumps(mood_obj or {}, ensure_ascii=False)}\n\n"
-                    f"USER: {text}\n\nReply as Bunny."
+                    "<INTERNAL_STATE>\n" + self._state_summary() + "\n</INTERNAL_STATE>\n" +
+                    "<MOOD>\n" + json.dumps(mood_obj or {}, ensure_ascii=False) + "\n</MOOD>\n\n" +
+                    "USER: " + text + "\n\nASSISTANT:"
                 )
                 try:
                     out = self._call_with_health(
@@ -2179,6 +2441,12 @@ class Kernel:
                     )
                 except Exception as e:
                     out = f"(speech organ error: {e})"
+
+                # Output hygiene: if the model leaks internal context, replace with a normal reply.
+                bad = ("INTERNAL_STATE" in out) or ("MOOD" in out) or out.strip().startswith("{") or out.strip().startswith("[")
+                if bad:
+                    out = "Hi 🙂 Was liegt an – willst du nur kurz quatschen oder hast du ein konkretes Thema?"
+
                 if not out.strip():
                     out = "Ich bin da. Sag mir kurz, worum es geht."
                 reply_id = db_add_message(self.db, "reply", out)
@@ -2210,6 +2478,38 @@ class Kernel:
                 db_set_workspace_current(self.db, ws_items, note='topic')
                 db_upsert_topic(self.db, active_topic, weight_delta=0.02 * conf)
                 db_open_episode_if_needed(self.db, active_topic)
+            except Exception:
+                pass
+
+
+            # --- Belief extraction (runs on every user message; generic memory) ---
+            try:
+                ws_items2 = db_get_workspace_current(self.db)
+                active_topic2 = _get_active_topic(ws_items2)
+                be = self._call_with_health(
+                    "beliefs",
+                    lambda: extract_user_beliefs(
+                        self.beliefs_cfg,
+                        db_get_axioms(self.db),
+                        self._state_summary(),
+                        text,
+                        active_topic=active_topic2,
+                        workspace=ws_items2,
+                        needs=db_get_needs_current(self.db),
+                        wishes=db_get_wishes_current(self.db),
+                    ),
+                )
+                for b in (be.get("beliefs") or []):
+                    if not isinstance(b, dict):
+                        continue
+                    db_add_belief(
+                        self.db,
+                        str(b.get("subject") or ""),
+                        str(b.get("predicate") or ""),
+                        str(b.get("object") or ""),
+                        float(b.get("confidence", 0.75) or 0.75),
+                        str(b.get("provenance") or "user_utterance"),
+                    )
             except Exception:
                 pass
 
@@ -2333,6 +2633,14 @@ class Kernel:
             # --- LLM decider: pressures/actions ---
             try:
                 beliefs = db_list_beliefs(self.db, limit=12)
+                # Deterministic action prior (trainable policy kernel).
+                try:
+                    pol = self.policy.predict(self.hb.load_state().values)
+                    policy_hint = pol.get('probs') or {}
+                    policy_trace = {'version': int(pol.get('version') or 1), 'features': pol.get('features') or []}
+                except Exception:
+                    policy_hint = {}
+                    policy_trace = {'version': 1, 'features': []}
                 decision = self._call_with_health(
                     "decider",
                     lambda: decide_pressures(
@@ -2347,9 +2655,11 @@ class Kernel:
                         wishes=db_get_wishes_current(self.db),
                         self_report=build_self_report(self.hb.load_state(), self.axis).to_dict(),
                         active_topic=_get_active_topic(db_get_workspace_current(self.db)),
+                        policy_hint=policy_hint,
                     ),
                 )
             except Exception as e:
+                policy_trace = {'version': 1, 'features': []}
                 decision = {
                     "drives": {"uncertainty": 0.05, "stress": 0.05},
                     "actions": {"websense": 0.0, "daydream": 0.0, "reply": 1.0},
@@ -2619,6 +2929,9 @@ class Kernel:
                         body = getattr(p, "body", "") or ""
                         ctx_lines.append(f"[P{i}] {t} ({dom})\nURL: {urlp}\nEXCERPT: {body[:1400]}")
 
+                    # Evidence extractor output (claims JSON). Always initialize for safe downstream use.
+                    ws_claims_obj: Dict[str, Any] = {}
+
                     if ctx_lines:
                         ws_context = "\n\nWEBSENSE_EVIDENCE:\n" + "\n\n".join(ctx_lines)
                         try:
@@ -2689,6 +3002,41 @@ class Kernel:
                     except Exception:
                         pass
 
+                    # Assimilation: convert evidence claims into durable beliefs (autonomous learning).
+                    try:
+                        if os.environ.get("BUNNY_WEBSENSE_ASSIMILATE", "1") != "0" and isinstance(ws_claims_obj, dict) and ws_claims_obj.get("claims"):
+                            ws_items_now = db_get_workspace_current(self.db)
+                            active_topic_now = _get_active_topic(ws_items_now)
+                            trust_map_now = db_get_domain_trust_map(self.db)
+                            max_b = int(os.environ.get("BUNNY_WEBSENSE_ASSIMILATE_MAX", "4") or 4)
+                            assim = self._call_with_health(
+                                "assimilate",
+                                lambda: assimilate_websense_claims(
+                                    question=text,
+                                    query=query,
+                                    claims_json=ws_claims_obj,
+                                    trust_map=trust_map_now,
+                                    max_beliefs=max_b,
+                                ),
+                                metrics={"query": query, "max": max_b},
+                            )
+                            for b in (assim.get("beliefs") or []):
+                                if not isinstance(b, dict):
+                                    continue
+                                # Use upsert to compress duplicates; keep topic anchoring.
+                                db_upsert_belief(
+                                    self.db,
+                                    str(b.get("subject") or ""),
+                                    str(b.get("predicate") or ""),
+                                    str(b.get("object") or ""),
+                                    float(b.get("confidence", 0.6) or 0.6),
+                                    str(b.get("provenance") or "websense"),
+                                    topic=active_topic_now,
+                                    compress=True,
+                                )
+                    except Exception:
+                        pass
+
                     self.hb.enqueue(
                         Event(
                             "websense",
@@ -2722,8 +3070,30 @@ class Kernel:
             if want_daydream:
                 try:
                     recent = db_list_messages(self.db, limit=40)
-                    dd = run_daydream(self.daydream_cfg, db_get_axioms(self.db), self._state_summary(), recent, trigger="user")
+                    dd = self._call_with_health(
+                        'daydream',
+                        lambda: run_daydream(self.daydream_cfg, db_get_axioms(self.db), self._state_summary(), recent, trigger='user'),
+                        metrics={'trigger': 'user'}
+                    )
                     db_add_daydream(self.db, "user", {"state": self._state_summary()}, dd)
+
+                    # Daydream can propose direct mutations to the action policy (durable behavior change).
+                    try:
+                        pm = dd.get('policy_mutation') if isinstance(dd, dict) else {}
+                        if isinstance(pm, dict):
+                            act = str(pm.get('action') or '').strip()
+                            if act == 'none':
+                                act = ''
+                            direction = float(pm.get('direction', 1.0) or 1.0)
+                            strength = float(pm.get('strength', 0.0) or 0.0)
+                            strength = max(0.0, min(1.0, strength))
+                            if act in POLICY_ACTIONS and strength >= 0.05:
+                                pol2 = self.policy.predict(self.hb.load_state().values)
+                                v2 = int(pol2.get('version') or 1)
+                                x2 = pol2.get('features') or []
+                                self.policy.apply_update(from_version=v2, x=x2, action=act, reward=float(direction) * float(strength), note='daydream_mutation')
+                    except Exception:
+                        pass
 
                     ax_int = dd.get("axiom_interpretations") if isinstance(dd.get("axiom_interpretations"), dict) else {}
                     for ak, val in (ax_int or {}).items():
@@ -2761,6 +3131,9 @@ class Kernel:
 	            "Never use phrases like 'Ich habe deine Frage gelesen', 'Wie kann ich helfen?', 'Es ist nicht ganz klar'. "
 	                "Do NOT invent a human biography: you have no human family, friends, childhood, or physical body unless explicitly provided via capabilities. "
 	                "If asked about your family: explain you are a digital organism running as software; your closest equivalent is the set of organs/modules and your operator (the user). "
+	                "IMPORTANT: you DO have internal feelings as state (valence/arousal/stress/curiosity/confidence/etc). "
+	                "Never claim 'I have no feelings'. When asked how you feel, answer with 1-3 natural emotion words based on your current state. "
+	                "Do not print raw internal numbers unless explicitly asked. "
                 "Do NOT apologize, do NOT talk about being confused/overburdened, do NOT give meta commentary. "
                 "If WEBSENSE_EVIDENCE / WEBSENSE_CLAIMS_JSON are present, use them as evidence. "
                 "If USER_FEEDBACK_JSON is present, treat the USER message as a correction/disagreement about the last assistant reply: "
@@ -2826,6 +3199,7 @@ class Kernel:
             self.hb.enqueue(Event("speech_outcome", {"len": len(out)}).with_time())
 
             # --- Outcome self-learning (no explicit user rating required) ---
+            delta_reward = 0.0
             try:
                 se = self._call_with_health(
                     "selfeval",
@@ -2838,6 +3212,31 @@ class Kernel:
                         websense_claims_json=ws_claims_json,
                     ),
                 )
+                try:
+                    delta_reward = float(se.get("delta_reward", 0.0) or 0.0)
+                except Exception:
+                    delta_reward = 0.0
+
+                # Integrate psychological/teleological pain from evaluator outputs.
+                # This is the correct place (uses axiom_scores + answer quality) and
+                # feeds the safety/rollback mechanism without being polluted by latency.
+                try:
+                    ax_sc = se.get("axiom_scores") if isinstance(se.get("axiom_scores"), dict) else {}
+                    ev_sc = se.get("eval_scores") if isinstance(se.get("eval_scores"), dict) else {}
+                    ppsy = compute_pain_psych(axiom_scores=ax_sc, eval_scores=ev_sc)
+                    s_now = self.hb.load_state()
+                    idx_phys = self.axis.get("pain_physical")
+                    phys = float(s_now.values[idx_phys]) if idx_phys is not None and idx_phys < len(s_now.values) else 0.0
+                    total = max(float(phys), float(ppsy))
+                    self.hb.enqueue(
+                        Event(
+                            "health",
+                            self._targets_to_delta_payload({"pain_psych": float(ppsy), "pain": float(total)}, eta=self.eta_measure),
+                        ).with_time()
+                    )
+                    self.hb.step()
+                except Exception:
+                    pass
                 # integrate suggested drive deltas into state
                 drives_delta = se.get("drives_delta") if isinstance(se.get("drives_delta"), dict) else {}
                 if drives_delta:
@@ -2873,6 +3272,21 @@ class Kernel:
                         float(b.get("confidence", 0.65) or 0.65),
                         str(b.get("provenance") or "self_eval"),
                     )
+
+                # Policy kernel learning from outcome (actions -> reward).
+                # This closes the gap: internal organs can mutate a durable action policy.
+                try:
+                    x_pol = (policy_trace.get('features') if isinstance(policy_trace, dict) else []) or []
+                    v_pol = int((policy_trace.get('version') if isinstance(policy_trace, dict) else 1) or 1)
+                    r_pol = float(se.get('delta_reward', 0.0) or 0.0)
+                    if x_pol and abs(r_pol) > 1e-6:
+                        # Only update for auxiliary actions that actually ran.
+                        if 'want_websense' in locals() and bool(want_websense):
+                            v_pol = self.policy.apply_update(from_version=v_pol, x=x_pol, action='websense', reward=r_pol, note='selfeval')
+                        if 'want_daydream' in locals() and bool(want_daydream):
+                            v_pol = self.policy.apply_update(from_version=v_pol, x=x_pol, action='daydream', reward=r_pol, note='selfeval')
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -2907,6 +3321,117 @@ class Kernel:
             # immutable pain integration (health/outcome-driven)
             self._integrate_pain_tick()
             self._integrate_fatigue_tick()
+
+            # --- Salience-based consolidation & soft forgetting ---
+            try:
+                s_after = self.hb.load_state()
+                # Compute salience from internal state shifts and outcome reward.
+                def _ax(name: str, st) -> float:
+                    idx = self.axis.get(name)
+                    if idx is None or idx >= len(st.values):
+                        return 0.0
+                    try:
+                        return float(st.values[idx])
+                    except Exception:
+                        return 0.0
+
+                pain_b = max(_ax("pain_psych", s_before), _ax("pain_physical", s_before))
+                pain_a = max(_ax("pain_psych", s_after), _ax("pain_physical", s_after))
+                dpain = abs(pain_a - pain_b)
+
+                # Base salience uses only protected/trusted signals (anti-gaming):
+                # - dpain: immutable pain integration shift
+                # - |delta_reward|: self-eval / feedback outcome (axiom-aware)
+                base_sal = (
+                    0.55 * min(1.0, abs(float(delta_reward)))
+                    + 0.45 * min(1.0, dpain)
+                )
+                base_sal = 0.0 if base_sal < 0.0 else 1.0 if base_sal > 1.0 else base_sal
+
+                # Episode tagging (tag-and-capture): high-salience events strengthen nearby context.
+                import math
+                episode_th = float(os.environ.get("BUNNY_EPISODE_TH", "0.72") or 0.72)
+                base_window = int(os.environ.get("BUNNY_EPISODE_WINDOW", "6") or 6)
+                tau = float(os.environ.get("BUNNY_EPISODE_TAU", "2.5") or 2.5)
+
+                # Expire old episode context
+                ep = self._active_episode if isinstance(getattr(self, "_active_episode", None), dict) else None
+                if ep:
+                    try:
+                        center0 = int(ep.get("center_ui_id", 0) or 0)
+                        w0 = int(ep.get("window", 0) or 0)
+                        if center0 > 0 and int(user_id) > center0 + w0 + 8:
+                            self._active_episode = None
+                            ep = None
+                    except Exception:
+                        self._active_episode = None
+                        ep = None
+
+                # Start/refresh episode if the current turn is strongly salient.
+                if base_sal >= episode_th:
+                    valence = 1 if float(delta_reward) >= 0.0 else -1
+                    pain_level = max(pain_a, pain_b)
+                    if valence >= 0:
+                        w = int(round(float(base_window) * (0.70 + 0.60 * base_sal) * (1.0 - 0.50 * pain_level)))
+                    else:
+                        w = int(round(float(base_window) * (0.35 + 0.45 * base_sal) * (1.0 - 0.70 * pain_level)))
+                    w = max(2, min(10, w))
+                    ep_id = f"ep{int(time.time())}_{int(user_id)}"
+                    self._active_episode = {
+                        "id": ep_id,
+                        "center_ui_id": int(user_id),
+                        "strength": float(base_sal),
+                        "window": int(w),
+                        "tau": float(tau),
+                        "valence": int(valence),
+                    }
+                    ep = self._active_episode
+                    # Retroactive boost for already existing STM rows around the episode center.
+                    try:
+                        db_apply_episode_boost(self.db, int(user_id), ep_id, float(base_sal), int(w), float(tau))
+                    except Exception:
+                        pass
+
+                # Apply episode boost to this turn's STM entries if inside the active window.
+                sal_user = float(base_sal)
+                sal_reply = float(base_sal)
+                ep = self._active_episode if isinstance(getattr(self, "_active_episode", None), dict) else None
+                if ep:
+                    try:
+                        center = int(ep.get("center_ui_id", 0) or 0)
+                        w = int(ep.get("window", 0) or 0)
+                        strength = float(ep.get("strength", 0.0) or 0.0)
+                        t = max(0.25, float(ep.get("tau", tau) or tau))
+                        eid = str(ep.get("id", "") or "")
+                        if center > 0 and eid and w > 0 and strength > 0.0:
+                            for mid, which in ((int(user_id), "user"), (int(reply_id), "reply")):
+                                dist = abs(mid - center)
+                                if dist <= w:
+                                    boost = strength * math.exp(-float(dist) / t)
+                                    boost = max(0.0, min(1.0, float(boost)))
+                                    if which == "user":
+                                        sal_user = max(sal_user, boost)
+                                    else:
+                                        sal_reply = max(sal_reply, boost)
+                                    try:
+                                        db_update_memory_short_episode(self.db, mid, eid, int(dist), salience_floor=boost)
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+
+                # Update STM salience for this turn's messages (enables salience-aware pruning).
+                active_topic3 = _get_active_topic(db_get_workspace_current(self.db))
+                db_update_memory_short_salience(self.db, user_id, sal_user, topic=active_topic3)
+                db_update_memory_short_salience(self.db, reply_id, sal_reply, topic=active_topic3)
+
+                # Boost beliefs created during this turn to mimic emotional consolidation.
+                db_boost_beliefs_since(self.db, turn_start_iso, max(sal_user, sal_reply))
+
+
+            except Exception:
+                pass
+
             return user_id, reply_id
             self.hb.step()
             self.broker.publish("status", db_status(self.db))
@@ -3415,7 +3940,7 @@ def _run_sleep_curriculum(self) -> None:
 def db_list_matrices_ops(db: DB) -> list[dict]:
     con = db.connect()
     try:
-        rows = con.execute("SELECT name, version, created_at, meta FROM matrices ORDER BY name, version DESC").fetchall()
+        rows = con.execute("SELECT name, version, created_at, meta_json AS meta FROM matrices ORDER BY name, version DESC").fetchall()
         out=[]
         for r in rows:
             out.append({"name": r["name"], "version": r["version"], "created_at": r["created_at"], "meta": r["meta"]})
@@ -3453,7 +3978,7 @@ def db_get_matrix_ops(db: DB, name: str, version: int, limit: int = 500, offdiag
     con = db.connect()
     try:
         m = con.execute(
-            "SELECT name, version, created_at, meta FROM matrices WHERE name=? AND version=?",
+            "SELECT name, version, created_at, meta_json AS meta FROM matrices WHERE name=? AND version=?",
             (name, version),
         ).fetchone()
         if not m:
@@ -3471,7 +3996,7 @@ def db_get_matrix_ops(db: DB, name: str, version: int, limit: int = 500, offdiag
         offdiag = int(total) - int(diag)
 
         agg = con.execute(
-            "SELECT MAX(ABS(v)) AS max_abs, AVG(ABS(v)) AS mean_abs, SUM(ABS(v)) AS sum_abs FROM matrix_entries WHERE name=? AND version=?",
+            "SELECT MAX(ABS(value)) AS max_abs, AVG(ABS(value)) AS mean_abs, SUM(ABS(value)) AS sum_abs FROM matrix_entries WHERE name=? AND version=?",
             (name, version),
         ).fetchone()
         stats = {
@@ -3490,7 +4015,7 @@ def db_get_matrix_ops(db: DB, name: str, version: int, limit: int = 500, offdiag
             where += " AND i!=j"
 
         rows = con.execute(
-            f"SELECT i, j, v FROM matrix_entries WHERE {where} ORDER BY ABS(v) DESC LIMIT ?",
+            f"SELECT i, j, value AS v FROM matrix_entries WHERE {where} ORDER BY ABS(v) DESC LIMIT ?",
             (*args, int(limit)),
         ).fetchall()
         entries = [{"i": r["i"], "j": r["j"], "v": r["v"]} for r in rows]
@@ -3533,7 +4058,7 @@ def db_get_matrix_stats_ops(db: DB, name: str, version: int) -> dict:
     con = db.connect()
     try:
         m = con.execute(
-            "SELECT name, version, created_at, meta FROM matrices WHERE name=? AND version=?",
+            "SELECT name, version, created_at, meta_json AS meta FROM matrices WHERE name=? AND version=?",
             (name, version),
         ).fetchone()
         if not m:
@@ -3548,7 +4073,7 @@ def db_get_matrix_stats_ops(db: DB, name: str, version: int) -> dict:
         ).fetchone()["c"]
         offdiag = int(total) - int(diag)
         agg = con.execute(
-            "SELECT MAX(ABS(v)) AS max_abs, AVG(ABS(v)) AS mean_abs, SUM(ABS(v)) AS sum_abs FROM matrix_entries WHERE name=? AND version=?",
+            "SELECT MAX(ABS(value)) AS max_abs, AVG(ABS(value)) AS mean_abs, SUM(ABS(value)) AS sum_abs FROM matrix_entries WHERE name=? AND version=?",
             (name, version),
         ).fetchone()
         return {
@@ -3579,7 +4104,7 @@ def db_get_matrix_diff_ops(db: DB, name: str, a: int, b: int, limit: int = 500, 
             return {"error": "not_found"}
 
         def load(ver: int) -> dict:
-            rows = con.execute("SELECT i, j, v FROM matrix_entries WHERE name=? AND version=?", (name, ver)).fetchall()
+            rows = con.execute("SELECT i, j, value AS v FROM matrix_entries WHERE name=? AND version=?", (name, ver)).fetchall()
             d = {}
             for r in rows:
                 i, j = int(r["i"]), int(r["j"])
@@ -3682,20 +4207,50 @@ def db_get_proposal_ops(db: DB, pid: int) -> dict:
 def db_axioms_full_ops(db: DB, limit_per_axiom: int = 50) -> dict:
     con = db.connect()
     try:
-        axioms = con.execute("SELECT id, key, text, created_at FROM axioms ORDER BY id ASC").fetchall()
-        dig = {r["key"]: r["digest"] for r in con.execute("SELECT axiom_key, digest FROM axiom_digests").fetchall()}
-        out=[]
+        # BunnyCore schema uses axioms(axiom_key,text,updated_at) and
+        # axiom_interpretations(axiom_key,kind,key,value,confidence,source_note,updated_at).
+        axioms = con.execute(
+            "SELECT axiom_key AS key, text, updated_at AS created_at FROM axioms ORDER BY axiom_key ASC"
+        ).fetchall()
+        dig = {r["axiom_key"]: r["digest"] for r in con.execute("SELECT axiom_key, digest FROM axiom_digests").fetchall()}
+
+        out: list[dict] = []
         for a in axioms:
-            key=a["key"]
+            key = str(a["key"])
             inter = con.execute(
-                "SELECT id, created_at, text FROM axiom_interpretations WHERE axiom_key=? ORDER BY id DESC LIMIT ?",
+                """SELECT kind, key, value, confidence, source_note, updated_at
+                   FROM axiom_interpretations
+                   WHERE axiom_key=?
+                   ORDER BY updated_at DESC
+                   LIMIT ?""",
                 (key, int(limit_per_axiom)),
             ).fetchall()
-            out.append({
-                "id": a["id"], "key": key, "text": a["text"], "created_at": a["created_at"],
-                "digest": dig.get(key,""),
-                "interpretations": [{"id": r["id"], "created_at": r["created_at"], "text": r["text"]} for r in inter],
-            })
+
+            # Keep the UI contract stable: it expects {created_at,text} items.
+            inter_out: list[dict] = []
+            for r in inter:
+                try:
+                    k = str(r["kind"] or "")
+                    kk = str(r["key"] or "")
+                    vv = str(r["value"] or "")
+                    cc = float(r["confidence"] or 0.0)
+                    src = str(r["source_note"] or "")
+                    ts = str(r["updated_at"] or "")
+                    line = f"({k}/{kk}, c={cc:.2f}) {vv}" + (f" [src={src}]" if src else "")
+                    inter_out.append({"created_at": ts, "text": line})
+                except Exception:
+                    continue
+
+            out.append(
+                {
+                    "key": key,
+                    "text": str(a["text"] or ""),
+                    "created_at": str(a["created_at"] or ""),
+                    "digest": str(dig.get(key, "") or ""),
+                    "interpretations": inter_out,
+                }
+            )
+
         return {"axioms": out}
     finally:
         con.close()

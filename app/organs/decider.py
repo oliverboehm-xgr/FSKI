@@ -62,6 +62,7 @@ def decide(
     wishes: Any = None,
     self_report: Any = None,
     active_topic: str = '',
+    policy_hint: Any = None,
 ) -> Dict[str, Any]:
     """Small decision model that converts state + input into pressures/actions.
 
@@ -103,6 +104,7 @@ def decide(
         "wishes": wishes or {},
         "self_report": self_report or {},
         "active_topic": active_topic or "",
+        "policy_hint": policy_hint or {},
         "input": input_text,
         "output_schema": {
             "drives": {

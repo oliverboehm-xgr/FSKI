@@ -64,12 +64,34 @@ def init_db(db_path: str | Path) -> DB:
             cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(beliefs)").fetchall()}
             if "topic" not in cols:
                 con.execute("ALTER TABLE beliefs ADD COLUMN topic TEXT NOT NULL DEFAULT ''")
+            if "salience" not in cols:
+                con.execute("ALTER TABLE beliefs ADD COLUMN salience REAL NOT NULL DEFAULT 0.0")
+            if "half_life_days" not in cols:
+                con.execute("ALTER TABLE beliefs ADD COLUMN half_life_days REAL NOT NULL DEFAULT 45.0")
+            if "updated_at" not in cols:
+                con.execute("ALTER TABLE beliefs ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
         except Exception:
             pass
         try:
             cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(memory_long)").fetchall()}
             if "topic" not in cols:
                 con.execute("ALTER TABLE memory_long ADD COLUMN topic TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+
+        # Short-term memory: add salience + topic + linkage to UI message id.
+        try:
+            cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(memory_short)").fetchall()}
+            if "ui_message_id" not in cols:
+                con.execute("ALTER TABLE memory_short ADD COLUMN ui_message_id INTEGER NOT NULL DEFAULT 0")
+            if "topic" not in cols:
+                con.execute("ALTER TABLE memory_short ADD COLUMN topic TEXT NOT NULL DEFAULT ''")
+            if "salience" not in cols:
+                con.execute("ALTER TABLE memory_short ADD COLUMN salience REAL NOT NULL DEFAULT 0.0")
+            if "episode_id" not in cols:
+                con.execute("ALTER TABLE memory_short ADD COLUMN episode_id TEXT NOT NULL DEFAULT ''")
+            if "episode_dist" not in cols:
+                con.execute("ALTER TABLE memory_short ADD COLUMN episode_dist INTEGER NOT NULL DEFAULT 0")
         except Exception:
             pass
                 # Sensory memory tokens (vision/audio) - stored compressed; never raw media.

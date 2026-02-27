@@ -70,7 +70,12 @@ def sleep_consolidate(
         ],
     }
 
-    data = http_post_json(cfg.ollama_url.rstrip("/") + "/api/chat", payload, timeout_s=60)
+    status, txt = http_post_json(cfg.ollama_url.rstrip("/") + "/api/chat", payload, timeout_s=60)
+    if status == 0:
+        raise RuntimeError(txt)
+    if status >= 400:
+        raise RuntimeError(f"ollama /api/chat HTTP {status}: {txt[:200]}")
+    data = json.loads(txt or "{}")
     content = (((data or {}).get("message") or {}).get("content") or "").strip()
     try:
         return json.loads(content)

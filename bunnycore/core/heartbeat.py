@@ -55,10 +55,11 @@ class Heartbeat:
         con = self.db.connect()
         try:
             row = con.execute("SELECT vec_json FROM state_current WHERE id=1").fetchone()
+            dim = self._axis_dim()
 
             # Initialize state if missing
             if row is None:
-                s = StateVector.zeros(self._axis_dim())
+                s = StateVector.zeros(dim)
                 con.execute(
                     "INSERT OR REPLACE INTO state_current(id,vec_json,updated_at) VALUES(1,?,?)",
                     (s.to_json(), now_iso()),
@@ -68,15 +69,22 @@ class Heartbeat:
 
             # Load & reconcile dimension with axes registry
             s = StateVector.from_json(row["vec_json"])
-            dim = self._axis_dim()
-
             if s.dim() != dim:
                 # Schema evolves by adding axes; pad/truncate deterministically.
                 if s.dim() < dim:
                     s.values = list(s.values) + [0.0] * (dim - s.dim())
                 else:
                     s.values = list(s.values)[:dim]
+                con.execute(
+                    "UPDATE state_current SET vec_json=?, updated_at=? WHERE id=1",
+                    (s.to_json(), now_iso()),
+                )
+                con.commit()
 
+            # Enforce V1 invariant: state axes are always in [0,1]
+            before = list(s.values)
+            s.clip(0.0, 1.0)
+            if list(s.values) != before:
                 con.execute(
                     "UPDATE state_current SET vec_json=?, updated_at=? WHERE id=1",
                     (s.to_json(), now_iso()),

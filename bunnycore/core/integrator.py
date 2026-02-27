@@ -32,7 +32,7 @@ class Integrator:
         why: List[Why] = []
         s2 = state.copy().mul_scalar_inplace(self.cfg.decay)
         protect = list(self.cfg.protect_indices or [])
-        allow = set(str(x) for x in (self.cfg.protect_allow_event_types or ['reward_signal']))
+        allow = set(str(x) for x in (self.cfg.protect_allow_event_types or ['health','resources','reward_signal']))
         # baseline values after decay (protected axes can still decay)
         protect_base = {i: s2.values[i] for i in protect if i < dim}
         why.append(Why(source="core", note="decay", data={"decay": self.cfg.decay}))
@@ -47,18 +47,6 @@ class Integrator:
                 continue
             x, wh = enc.encode(dim, ev)
             why.extend(wh)
-            # Invariant reward channel: apply encoded deltas directly without any learnable matrix.
-            # This prevents "high hacking" via matrix training.
-            if str(ev.event_type) == "reward_signal":
-                n = min(dim, len(x))
-                for i in range(n):
-                    s2.values[i] += x[i]
-                why.append(Why(source="core", note="reward_signal (direct)", data={"event_type": ev.event_type}))
-                # update baseline for protected axes because reward_signal is trusted
-                for i in protect:
-                    if i < dim:
-                        protect_base[i] = s2.values[i]
-                continue
             A = self.store.get_sparse(binding.matrix_name, binding.matrix_version)
             y = A.apply(x)
             n = min(dim, len(y))
