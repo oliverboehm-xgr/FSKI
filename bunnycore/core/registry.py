@@ -23,6 +23,7 @@ DEFAULT_AXES = [
     ("curiosity","exploration drive"),
     ("confidence","epistemic confidence"),
     ("uncertainty","epistemic uncertainty"),
+    ("error_signal","recent negative feedback/contradiction signal (decays)"),
     ("freshness_need","need for up-to-date/time-sensitive factual information"),
     ("social_need","social craving / interact urge"),
     ("urge_reply","reply pressure from incoming messages"),
@@ -44,6 +45,40 @@ DEFAULT_AXES = [
     ("sat_a3","satiation: short-term satisfaction with A3 progress; decays"),
     ("sat_a4","satiation: short-term satisfaction with A4 progress; decays"),
 ]
+
+# Homeostatic baseline for the organism state.
+#
+# V1 used a scalar decay which otherwise collapses all axes toward 0 over long runs.
+# That makes autonomous organs (daydream/websense/evolve) silently stop firing after
+# enough ticks. The baseline is a stable initial condition / setpoint: absent new
+# events, S(t) relaxes toward these values (not toward 0).
+DEFAULT_BASELINE_VALUES: dict[str, float] = {
+    # Core budget / affect anchors
+    "energy": 0.62,
+    "stress": 0.22,
+    "curiosity": 0.26,
+    "confidence": 0.34,
+    "uncertainty": 0.30,
+    "freshness_need": 0.18,
+    "social_need": 0.18,
+
+    # Autonomy pressures: keep them non-zero so organs can actually run.
+    "pressure_daydream": 0.22,
+    "pressure_websense": 0.12,
+    "pressure_evolve": 0.18,
+}
+
+
+def make_baseline_vector(axis: Dict[str, int], dim: int) -> List[float]:
+    """Create a baseline vector aligned to the current axis registry."""
+    b = [0.0] * int(dim)
+    for name, v in (DEFAULT_BASELINE_VALUES or {}).items():
+        idx = axis.get(str(name))
+        if idx is None:
+            continue
+        if 0 <= int(idx) < int(dim):
+            b[int(idx)] = float(v)
+    return b
 
 def ensure_axes(db: DB, axes: List[Tuple[str,str]] = None) -> Dict[str,int]:
     axes = axes or DEFAULT_AXES

@@ -87,7 +87,7 @@ def decide(
         "If no web search is needed, set web_query to empty string. "
         "Prefer the same language as the INPUT when forming web_query (e.g. German input -> German query). "
         "If the input asks about your state/goals/needs/wishes, you should set reply=1 and websense=0 unless uncertainty/freshness is high. "
-        "If the input asks about time-sensitive facts (TV program, weather, news, prices), raise freshness_need and actions.websense. "
+        "If the input asks about time-sensitive facts (TV program, weather, news, prices, current office holders like president/CEO/minister), raise freshness_need and actions.websense. If INTERNAL_STATE shows error_signal high, treat that as a recent correction and prefer verification (actions.websense) over guessing for factual questions. "
         "If the user asks for a concrete external fact and you cannot answer from BELIEFS with high confidence, prefer actions.websense over asking the user for more context. "
         "Do NOT treat channel+time questions (e.g. 'RTL 20:15') as ambiguous; they have a single correct lookup answer. "
         "Be conservative with self-upgrade: only raise capability_gap/desire_upgrade/actions.evolve when you can point to a concrete missing capability or recurring failure; otherwise keep them low (<=0.2)."
@@ -135,14 +135,14 @@ def decide(
             "notes": "short string",
         },
 	        "rules": [
-            "All drive values are bounded 0..1. If you are unsure or a drive is not relevant, output 0 (not -1).",
+	            "All drive values are bounded 0..1.",
+	            "For epistemic drives (uncertainty, confidence, freshness_need, pressure_websense): do not output all zeros by default; reflect the situation.",
             "Do not use string/keyword heuristics. Base decisions on epistemic signals (uncertainty/confidence, freshness_need), curiosity, and teleology tensions.",
             "Use BELIEFS to reduce uncertainty when they directly answer the INPUT; in that case actions.websense should be low and confidence higher.",
             "If uncertainty is high and evidence is needed, increase pressure_websense and actions.websense.",
             "If freshness_need is high (time-sensitive facts like weather/news/prices), increase pressure_websense and actions.websense.",
 	            "If INPUT is about your internal state, goals, needs, wishes, identity, or capabilities (self-queries), set actions.websense=0 and keep uncertainty low unless the user asked for external facts.",
-	            "If INPUT explicitly asks to search the internet / look something up, treat that as freshness_need high and set actions.websense high (>=0.8) with a concrete web_query.",
-            "If INPUT asks for a concrete external fact and you are not confident, do NOT ask for clarification by default; set actions.websense high and form a query.",
+	            "If INPUT explicitly asks to search the internet / look something up, treat that as freshness_need high and set actions.websense high (>=0.8) with a concrete web_query.",            "If INPUT asks for a concrete external fact and you are not confident, do NOT ask for clarification by default; set actions.websense high and form a query.",
             "If the user asks for a concrete fact, web_query should include the key entity + attribute (e.g. 'Wetter Berlin aktuell Temperatur').",
             "If scope is idle: prefer daydream unless uncertainty or freshness_need is meaningfully high AND you can form a concrete web_query.",
             "If capability_gap is high or desire_upgrade is high (often linked to A4), actions.evolve may be increased (>=0.6) to propose mutations.",

@@ -10,20 +10,30 @@ set BUNNY_LITE=0
 
 REM --- Context window (global) ---
 REM Soft-mode: keep CTX moderate to avoid crashes on CPU/RAM limited machines.
-set BUNNY_CTX=2048
+set BUNNY_CTX=8192
 
-REM --- Soft-mode organ activation thresholds/cooldowns (reduce background load) ---
-REM Slightly higher threshold to avoid WebSense on pure smalltalk; still triggers on factual/time-sensitive questions.
-set BUNNY_TH_WEBSENSE=0.85
-set BUNNY_TH_DAYDREAM=0.90
-set BUNNY_TH_EVOLVE=0.95
+REM --- Organ activation thresholds/cooldowns ---
+REM These thresholds are now *real* cutoffs: above threshold, an organ runs deterministically.
+REM Keep them moderate, otherwise daydream/evolve will never run and logs stay empty.
+set BUNNY_TH_WEBSENSE=0.60
+set BUNNY_TH_DAYDREAM=0.60
+set BUNNY_TH_EVOLVE=0.70
 set BUNNY_TH_AUTOTALK=0.85
+set BUNNY_AUTOTALK_MAX_ERROR_SIGNAL=0.15
+set BUNNY_AUTOTALK_MAX_WS_NEED=0.25
 set BUNNY_AUTOTALK_COOLDOWN=600
 set BUNNY_IDLE_PERIOD=30
 set BUNNY_IDLE_COOLDOWN=180
 set BUNNY_EVOLVE_COOLDOWN=3600
 set BUNNY_PROPOSAL_REFINE_COOLDOWN=1800
 set BUNNY_WORKSPACE_MAX=10
+
+REM --- Output length control (token budget) ---
+REM Prevent rambling / repetition by limiting generation length.
+set BUNNY_NUM_PREDICT=240
+
+REM --- Epistemic sensor blending (evidence -> uncertainty/confidence) ---
+set BUNNY_ETA_EPISTEMIC=0.45
 
 REM --- Memory retention / soft forgetting ---
 set BUNNY_MEMORY_SHORT_MAX=800
@@ -93,7 +103,8 @@ REM If you use a venv, activate it here:
 REM call .venv\Scripts\activate.bat
 
 REM NOTE: run via Python sources (start.cmd). main.exe may be an older frozen build.
-python -m app.ui --db bunny.db --addr 127.0.0.1:8080
+REM Use the bundled DB by default (keeps learning across restarts).
+python -m app.ui --db data\frankenstein.sqlite --addr 127.0.0.1:8080
 
 echo.
 echo [BUNNY] process exited with code %ERRORLEVEL%

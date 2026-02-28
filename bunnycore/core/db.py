@@ -109,6 +109,9 @@ def init_db(db_path: str | Path) -> DB:
                 con.execute("ALTER TABLE memory_long ADD COLUMN modality TEXT NOT NULL DEFAULT ''")
             if "salience" not in cols:
                 con.execute("ALTER TABLE memory_long ADD COLUMN salience REAL NOT NULL DEFAULT 0.0")
+            if "axioms_json" not in cols:
+                # Optional: which axioms this memory supports (for future filtering).
+                con.execute("ALTER TABLE memory_long ADD COLUMN axioms_json TEXT NOT NULL DEFAULT '[]'")
         except Exception:
             pass
 

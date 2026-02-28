@@ -19,6 +19,13 @@ class IntegratorConfig:
     clip_hi: float = 1.0
     decay: float = 0.995  # scalar decay (V1). Replace with diagonal or sparse matrix later.
 
+    # Optional homeostatic baseline (same dimension as state). If provided, the
+    # integrator mixes toward this baseline each tick instead of collapsing
+    # everything toward 0.
+    baseline: List[float] | None = None
+    # If None, we use (1 - decay). Otherwise this is the additive mixing weight.
+    baseline_mix: float | None = None
+
 class Integrator:
     """Core equation: S' = clip(decay*S + Σ A_k φ(E_k))"""
     def __init__(self, store: MatrixStore, registry: AdapterRegistry, encoders: Dict[str, Encoder], cfg: IntegratorConfig):
@@ -31,6 +38,26 @@ class Integrator:
         dim = state.dim()
         why: List[Why] = []
         s2 = state.copy().mul_scalar_inplace(self.cfg.decay)
+
+        # Homeostasis: mix toward baseline to prevent long-run collapse of all axes.
+        if self.cfg.baseline is not None:
+            try:
+                mix = self.cfg.baseline_mix
+                if mix is None:
+                    mix = 1.0 - float(self.cfg.decay)
+                mix = float(mix)
+                if mix < 0.0:
+                    mix = 0.0
+                if mix > 1.0:
+                    mix = 1.0
+                b = self.cfg.baseline
+                n = min(dim, len(b))
+                for i in range(n):
+                    s2.values[i] += mix * float(b[i])
+                if mix > 1e-12:
+                    why.append(Why(source="core", note="homeostasis", data={"mix": mix}))
+            except Exception:
+                pass
         protect = list(self.cfg.protect_indices or [])
         allow = set(str(x) for x in (self.cfg.protect_allow_event_types or ['health','resources','reward_signal']))
         # baseline values after decay (protected axes can still decay)

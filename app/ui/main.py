@@ -37,7 +37,7 @@ from .kernel import Broker, BunnyHTTPServer, Handler
 
 
 from bunnycore.core.db import init_db, DB
-from bunnycore.core.registry import ensure_axes
+from bunnycore.core.registry import ensure_axes, make_baseline_vector
 from bunnycore.core.matrix_store import MatrixStore
 from bunnycore.core.adapters import (
     AdapterRegistry, AdapterBinding,
@@ -378,11 +378,13 @@ def compute_fatigue(
     return fatigue, sleep_pressure
 
 from app.ui.kernel import Kernel
+from app.ui.db_ops import db_ensure_axiom_interpretations, db_refresh_axiom_digests
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="bunny.db")
-    ap.add_argument("--model", default=os.environ.get("BUNNY_MODEL","llama3.1:8b-instruct"))
+    # Default to a non-"*-instruct" model name; operator may override via env/CLI.
+    ap.add_argument("--model", default=os.environ.get("BUNNY_MODEL","llama3.1:8b"))
     ap.add_argument("--model-speech", default=os.environ.get("BUNNY_MODEL_SPEECH",""))
     ap.add_argument("--model-decider", default=os.environ.get("BUNNY_MODEL_DECIDER",""))
     ap.add_argument("--model-daydream", default=os.environ.get("BUNNY_MODEL_DAYDREAM",""))
@@ -420,6 +422,12 @@ def main() -> int:
     cfg_integ = IntegratorConfig()
     cfg_integ.protect_indices = protect_indices
     cfg_integ.protect_allow_event_types = ['health','resources','reward_signal']
+    # Homeostatic baseline prevents autonomy pressures from decaying to ~0 over long runs.
+    try:
+        cfg_integ.baseline = make_baseline_vector(axis, len(axis))
+        cfg_integ.baseline_mix = None  # default: (1 - decay)
+    except Exception:
+        pass
     integ = Integrator(store, reg, encoders, cfg_integ)
     hb = Heartbeat(db, integ, HeartbeatConfig(tick_hz=2.0, snapshot_every_n_ticks=1))
 
@@ -442,7 +450,11 @@ def main() -> int:
 
     kernel = Kernel(db, hb, axis, store, reg, cfg_speech, cfg_decider, cfg_daydream, cfg_feedback, cfg_selfeval, cfg_evolve, cfg_curriculum, broker)
     kernel.ensure_seed()
-
+    db_ensure_axiom_interpretations(db)
+    try:
+        db_refresh_axiom_digests(db)
+    except Exception:
+        pass
     # Background idle loop (Daydream/WebSense triggering via decider; no keyword heuristics)
     def _idle_loop():
         while True:

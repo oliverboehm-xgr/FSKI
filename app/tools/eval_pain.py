@@ -45,7 +45,7 @@ def main() -> int:
     ap.add_argument("--state", default="", help="State summary string passed to selfeval")
     ap.add_argument("--out", required=True, help="Output JSON path")
     ap.add_argument("--host", default=os.environ.get("BUNNY_OLLAMA_HOST", "http://127.0.0.1:11434"))
-    ap.add_argument("--model", default=os.environ.get("BUNNY_MODEL_SELF_EVAL", "llama3.2:3b-instruct"))
+    ap.add_argument("--model", default=os.environ.get("BUNNY_MODEL_SELF_EVAL", "llama3.2:3b"))
     args = ap.parse_args()
 
     fixtures = json.loads(open(args.fixtures, "r", encoding="utf-8").read() or "[]")
@@ -59,7 +59,7 @@ def main() -> int:
         q = str(it.get("question") or "")
         a = str(it.get("answer") or "")
         ws = str(it.get("websense_claims_json") or "")
-        ev = evaluate_outcome(cfg, axioms, args.state, q, a, websense_claims_json=ws)
+        ev = evaluate_outcome(cfg, axioms, args.state, q, a, websense_claims_json=ws, meta_json="{}")
         p = compute_psych_pain_from_eval(ev)
         pains.append(p)
         out["items"].append({"question": q[:200], "psych_pain": p, "eval": ev})

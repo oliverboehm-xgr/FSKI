@@ -490,6 +490,102 @@ def db_upsert_axiom_interpretation(
     finally:
         con.close()
 
+def db_ensure_axiom_interpretations(db: DB) -> None:
+    axioms = db_get_axioms(db) or {}
+    con = db.connect()
+    try:
+        for k, txt in axioms.items():
+            row = con.execute(
+                "SELECT COUNT(*) AS c FROM axiom_interpretations WHERE axiom_key=?",
+                (k,),
+            ).fetchone()
+            c = int((row["c"] if row is not None else 0) or 0)
+            if c == 0:
+                con.execute(
+                    """INSERT OR IGNORE INTO axiom_interpretations
+                       (axiom_key, kind, key, value, confidence, source_note, updated_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (k, "definition", "base", str(txt), 1.0, "bootstrap", now_iso()),
+                )
+        con.commit()
+    finally:
+        con.close()
+
+
+def db_refresh_axiom_digests(db: DB) -> None:
+    """Rebuild axiom_digests from current interpretations/specs (deterministic).
+
+    This avoids the "digests stay empty forever" failure mode when the sleep organ
+    never runs (e.g., low idle time). The digest is a compact, operational view that
+    the rest of the system can reference.
+    """
+    import hashlib
+
+    con = db.connect()
+    try:
+        axioms = db_get_axioms(db) or {}
+        for ak in ("A1", "A2", "A3", "A4"):
+            base = ""
+            rewrite = ""
+            specs: list[str] = []
+
+            try:
+                r = con.execute(
+                    "SELECT value FROM axiom_interpretations WHERE axiom_key=? AND kind='definition' AND key='base' ORDER BY updated_at DESC LIMIT 1",
+                    (ak,),
+                ).fetchone()
+                base = str((r["value"] if r is not None else "") or "").strip()
+            except Exception:
+                base = str(axioms.get(ak, "") or "").strip()
+
+            try:
+                r = con.execute(
+                    "SELECT value FROM axiom_interpretations WHERE axiom_key=? AND kind='rewrite' AND key='latest' ORDER BY updated_at DESC LIMIT 1",
+                    (ak,),
+                ).fetchone()
+                rewrite = str((r["value"] if r is not None else "") or "").strip()
+            except Exception:
+                rewrite = ""
+
+            try:
+                rows = con.execute(
+                    "SELECT value FROM axiom_interpretations WHERE axiom_key=? AND kind='spec' ORDER BY confidence DESC, updated_at DESC LIMIT 4",
+                    (ak,),
+                ).fetchall()
+                for rr in rows or []:
+                    v = str(rr["value"] or "").strip()
+                    if v:
+                        specs.append(v)
+            except Exception:
+                specs = []
+
+            parts: list[str] = []
+            if base:
+                parts.append(f"base: {base}")
+            if rewrite and rewrite != base:
+                parts.append(f"latest: {rewrite}")
+            if specs:
+                # keep compact; specs are already atomic rules
+                for i, sp in enumerate(specs[:3], start=1):
+                    parts.append(f"spec{i}: {sp}")
+
+            digest = "\n".join(parts).strip()
+            if not digest:
+                continue
+            digest = digest[:600]
+            ck = hashlib.sha1(digest.encode("utf-8")).hexdigest()[:12]
+            try:
+                con.execute(
+                    "INSERT OR REPLACE INTO axiom_digests(axiom_key,digest,checksum,updated_at) VALUES(?,?,?,?)",
+                    (ak, digest, ck, now_iso()),
+                )
+            except Exception:
+                pass
+
+        con.commit()
+    finally:
+        con.close()
+
 def db_add_decision(db: DB, scope: str, input_text: str, decision: Dict[str, Any]) -> None:
     con = db.connect()
     try:
@@ -1307,6 +1403,39 @@ def db_add_health_log(db: DB, organ: str, ok: bool, latency_ms: float, error: st
     finally:
         con.close()
 
+
+def db_add_capability_call(
+    db: DB,
+    *,
+    name: str,
+    ok: bool,
+    latency_ms: float,
+    error: str = "",
+    args: Dict[str, Any] | None = None,
+    result: Dict[str, Any] | None = None,
+) -> None:
+    """Insert a capability/tool call row.
+
+    This is used as a generic telemetry channel to make tool/organ usage visible.
+    """
+    con = db.connect()
+    try:
+        con.execute(
+            "INSERT INTO capability_calls(created_at,name,ok,latency_ms,error,args_json,result_json) VALUES(?,?,?,?,?,?,?)",
+            (
+                now_iso(),
+                str(name or "")[:120],
+                1 if bool(ok) else 0,
+                float(latency_ms or 0.0),
+                str(error or "")[:300],
+                json.dumps(args or {}, ensure_ascii=False)[:12000],
+                json.dumps(result or {}, ensure_ascii=False)[:12000],
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
 def db_meta_get(db: DB, key: str, default: str = "") -> str:
     con = db.connect()
     try:
@@ -1615,6 +1744,29 @@ def db_add_evidence_log(db: DB, query: str, question: str, evidence: Dict[str, A
             (now_iso(), query or "", question or "", json.dumps(evidence or {}, ensure_ascii=False)),
         )
         con.commit()
+    finally:
+        con.close()
+
+
+def db_get_recent_evidence(db: DB, *, limit: int = 2, window_s: float = 3600.0) -> List[Dict[str, Any]]:
+    """Return recent evidence_log entries (newest first).
+
+    window_s is a soft time window; if parsing timestamps fails, falls back to LIMIT only.
+    """
+    con = db.connect()
+    try:
+        rows = con.execute(
+            "SELECT created_at,query,question,evidence_json FROM evidence_log ORDER BY id DESC LIMIT ?",
+            (int(limit or 2),),
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            try:
+                ev = json.loads(r["evidence_json"] or "{}")
+            except Exception:
+                ev = {}
+            out.append({"created_at": r["created_at"], "query": r["query"], "question": r["question"], "evidence": ev})
+        return out
     finally:
         con.close()
 
@@ -2020,11 +2172,14 @@ def db_add_message(db: DB, kind: str, text: str) -> int:
                     "INSERT INTO memory_short(role,content,created_at) VALUES(?,?,?)",
                     (role, text, now),
                 )
-            # Soft forgetting: prune short memory (count + TTL)
+            # Soft forgetting is optional. By default we keep memory unbounded and let ENERGY
+            # and retrieval budgets control runtime cost. Enable pruning explicitly via env.
             try:
-                max_rows = int(os.environ.get('BUNNY_MEMORY_SHORT_MAX', '800') or 800)
-                ttl_days = float(os.environ.get('BUNNY_MEMORY_SHORT_TTL_DAYS', '30') or 30)
-                _prune_memory_short(con, max_rows=max_rows, ttl_days=ttl_days)
+                do_prune = str(os.environ.get('BUNNY_MEMORY_SHORT_PRUNE', '0') or '0').lower() in ('1','true','yes','y')
+                if do_prune:
+                    max_rows = int(os.environ.get('BUNNY_MEMORY_SHORT_MAX', '50000') or 50000)
+                    ttl_days = float(os.environ.get('BUNNY_MEMORY_SHORT_TTL_DAYS', '3650') or 3650)
+                    _prune_memory_short(con, max_rows=max_rows, ttl_days=ttl_days)
             except Exception:
                 pass
         con.commit()
@@ -2069,7 +2224,7 @@ def db_get_memory_short(db: DB, limit: int = 12) -> List[Dict[str, Any]]:
 
         if {"salience", "topic", "ui_message_id"}.issubset(cols):
             rows = con.execute(
-                "SELECT role,content,created_at,ui_message_id,topic,salience FROM memory_short ORDER BY id DESC LIMIT ?",
+                "SELECT ms.role,ms.content,ms.created_at,ms.ui_message_id,ms.topic,ms.salience FROM memory_short ms LEFT JOIN ui_messages um ON um.id = ms.ui_message_id WHERE COALESCE(um.caught,0)=0 ORDER BY ms.id DESC LIMIT ?",
                 (int(limit),),
             ).fetchall()
             out = [
@@ -2094,10 +2249,54 @@ def db_get_memory_short(db: DB, limit: int = 12) -> List[Dict[str, Any]]:
     finally:
         con.close()
 
-def db_get_memory_long(db: DB, limit: int = 4) -> List[Dict[str, Any]]:
-    """Return last N long-memory summaries (chronological order)."""
+def db_get_memory_long(db: DB, limit: int = 4, topic: str = "") -> List[Dict[str, Any]]:
+    """Return long-term memory summaries.
+
+    Retrieval is salience-aware ("memory glue") when the DB has the extended columns.
+    We do not hard-prune LTM; runtime cost is controlled by retrieval limits and ENERGY.
+    """
     con = db.connect()
     try:
+        topic = (topic or "").strip()[:80]
+        try:
+            cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(memory_long)").fetchall()}
+        except Exception:
+            cols = set()
+
+        if {"summary", "created_at", "salience", "topic"}.issubset(cols):
+            if topic:
+                rows = con.execute(
+                    """
+                    SELECT summary,created_at,topic,modality,salience,axioms_json
+                    FROM memory_long
+                    ORDER BY (CASE WHEN topic=? THEN 1 ELSE 0 END) DESC, salience DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (topic, int(limit)),
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    """
+                    SELECT summary,created_at,topic,modality,salience,axioms_json
+                    FROM memory_long
+                    ORDER BY salience DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                ).fetchall()
+            out = []
+            for r in rows:
+                out.append({
+                    "summary": r["summary"],
+                    "created_at": r["created_at"],
+                    "topic": str(r["topic"] or ""),
+                    "modality": str(r["modality"] or ""),
+                    "salience": float(r["salience"] or 0.0),
+                    "axioms_json": r["axioms_json"] if "axioms_json" in r.keys() else "[]",
+                })
+            out.reverse()
+            return out
+
         rows = con.execute(
             "SELECT summary,created_at FROM memory_long ORDER BY id DESC LIMIT ?",
             (int(limit),),
@@ -2105,6 +2304,62 @@ def db_get_memory_long(db: DB, limit: int = 4) -> List[Dict[str, Any]]:
         out = [{"summary": r["summary"], "created_at": r["created_at"]} for r in rows]
         out.reverse()
         return out
+    finally:
+        con.close()
+
+
+def db_add_memory_long(
+    db: DB,
+    *,
+    summary: str,
+    topic: str = "",
+    modality: str = "",
+    salience: float = 0.0,
+    axioms: List[str] | None = None,
+) -> None:
+    """Insert a long-term memory row (migration-safe).
+
+    If the DB has extended columns (topic/modality/salience/axioms_json), fill them.
+    Otherwise fall back to (summary,created_at) only.
+    """
+    s = (summary or "").strip()
+    if not s:
+        return
+    if len(s) > 1200:
+        s = s[:1200].rstrip()
+    topic = (topic or "").strip()[:80]
+    modality = (modality or "").strip()[:40]
+    try:
+        sal = float(salience or 0.0)
+    except Exception:
+        sal = 0.0
+    sal = max(0.0, min(1.0, sal))
+    ax = axioms if isinstance(axioms, list) else []
+    ax2: List[str] = []
+    for a in ax:
+        aa = str(a or "").strip().upper()
+        if aa in ("A1", "A2", "A3", "A4") and aa not in ax2:
+            ax2.append(aa)
+
+    con = db.connect()
+    try:
+        cols = {str(r["name"]) for r in con.execute("PRAGMA table_info(memory_long)").fetchall()}
+        if {"summary", "topic", "modality", "salience", "axioms_json", "created_at"}.issubset(cols):
+            con.execute(
+                "INSERT INTO memory_long(summary,topic,modality,salience,axioms_json,created_at) VALUES(?,?,?,?,?,?)",
+                (s, topic, modality, float(sal), json.dumps(ax2, ensure_ascii=False), now_iso()),
+            )
+        elif {"summary", "topic", "modality", "salience", "created_at"}.issubset(cols):
+            con.execute(
+                "INSERT INTO memory_long(summary,topic,modality,salience,created_at) VALUES(?,?,?,?,?)",
+                (s, topic, modality, float(sal), now_iso()),
+            )
+        elif {"summary", "created_at"}.issubset(cols):
+            con.execute(
+                "INSERT INTO memory_long(summary,created_at) VALUES(?,?)",
+                (s, now_iso()),
+            )
+        con.commit()
     finally:
         con.close()
 

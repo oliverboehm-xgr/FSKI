@@ -59,7 +59,30 @@ class Heartbeat:
 
             # Initialize state if missing
             if row is None:
+                # Non-zero baseline avoids dead-zones (e.g. uncertainty stuck at 0 -> no crawl budget).
+                # This is not a heuristic about content; it is the organism's initial condition.
                 s = StateVector.zeros(dim)
+                try:
+                    axis = {r["axis_name"]: int(r["axis_index"]) for r in con.execute("SELECT axis_index,axis_name FROM state_axes").fetchall()}
+
+                    def _set(name: str, v: float):
+                        i = axis.get(name)
+                        if i is None or i >= dim:
+                            return
+                        s.values[i] = float(v)
+
+                    _set("energy", 0.62)
+                    _set("stress", 0.22)
+                    _set("curiosity", 0.26)
+                    _set("confidence", 0.34)
+                    _set("uncertainty", 0.30)
+                    _set("freshness_need", 0.18)
+                    _set("social_need", 0.18)
+                    _set("pressure_daydream", 0.22)
+                    _set("pressure_websense", 0.12)
+                    _set("pressure_evolve", 0.12)
+                except Exception:
+                    pass
                 con.execute(
                     "INSERT OR REPLACE INTO state_current(id,vec_json,updated_at) VALUES(1,?,?)",
                     (s.to_json(), now_iso()),
@@ -90,6 +113,33 @@ class Heartbeat:
                     (s.to_json(), now_iso()),
                 )
                 con.commit()
+
+            # If state is effectively uninitialized (all zeros), apply the same baseline as on first boot.
+            try:
+                if sum(abs(float(x)) for x in (s.values or [])) < 1e-9:
+                    axis = {r["axis_name"]: int(r["axis_index"]) for r in con.execute("SELECT axis_index,axis_name FROM state_axes").fetchall()}
+                    def _set(name: str, v: float):
+                        i = axis.get(name)
+                        if i is None or i >= dim:
+                            return
+                        s.values[i] = float(v)
+                    _set("energy", 0.62)
+                    _set("stress", 0.22)
+                    _set("curiosity", 0.26)
+                    _set("confidence", 0.34)
+                    _set("uncertainty", 0.30)
+                    _set("freshness_need", 0.18)
+                    _set("social_need", 0.18)
+                    _set("pressure_daydream", 0.22)
+                    _set("pressure_websense", 0.12)
+                    _set("pressure_evolve", 0.12)
+                    con.execute(
+                        "UPDATE state_current SET vec_json=?, updated_at=? WHERE id=1",
+                        (s.to_json(), now_iso()),
+                    )
+                    con.commit()
+            except Exception:
+                pass
 
             return s
         finally:

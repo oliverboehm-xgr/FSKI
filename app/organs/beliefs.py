@@ -2,8 +2,11 @@ from __future__ import annotations
 
 """Belief extraction organ.
 
-Goal: extract durable, user-asserted facts/preferences from *any* user message
-without hardcoded keywords. This is the generic memory acquisition path.
+Goal: extract durable, user-asserted facts/preferences from *any* user message.
+
+Hard requirement for this project:
+  - No keyword routing, no hard-coded user-intent heuristics.
+  - The output must be conservative (prefer 0 beliefs over hallucinations).
 
 Contract:
   extract_user_beliefs(...) -> {"beliefs": [...], "notes": str}
@@ -21,7 +24,7 @@ from app.net import http_post_json
 @dataclass
 class OllamaConfig:
     host: str = "http://127.0.0.1:11434"
-    model: str = "llama3.2:3b-instruct"
+    model: str = "llama3.2:3b"
     temperature: float = 0.2
     num_ctx: int = 2048
     stream: bool = False
@@ -95,10 +98,7 @@ def extract_user_beliefs(
         "- Extract 0..3 beliefs. Each belief is {subject,predicate,object,confidence,provenance}.\n"
         "- confidence in [0,1]. Use <=0.6 if slightly uncertain; >=0.85 only if explicit.\n"
         "- provenance must be one of: 'user_utterance', 'user_preference', 'user_identity'.\n"
-        "- Use generic predicates such as: name, role, language_preference, preference, goal, constraint, identity.\n"
-        "- Example (German): 'Ich bin Oliver, dein Schöpfer.' => beliefs may include: "
-        "  {subject:'User', predicate:'name', object:'Oliver'} and {subject:'User', predicate:'role', object:'creator/operator'}.\n"
-        "- Example: 'Sprich bitte Deutsch mit mir.' => {subject:'User', predicate:'language_preference', object:'de'}.\n"
+        "- Predicates should be short and generic (e.g. name, preference, goal, constraint, role).\n"
         "Output JSON keys: beliefs (list), notes (short string)."
     )
 

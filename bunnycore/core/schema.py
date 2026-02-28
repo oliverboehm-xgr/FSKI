@@ -224,6 +224,18 @@ CREATE TABLE IF NOT EXISTS matrix_update_log(
   notes TEXT NOT NULL DEFAULT ''
 );
 
+-- Organ gating decisions (why an organ did/didn't run)
+CREATE TABLE IF NOT EXISTS organ_gate_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  phase TEXT NOT NULL,         -- user|idle
+  organ TEXT NOT NULL,
+  score REAL NOT NULL,
+  threshold REAL NOT NULL,
+  want INTEGER NOT NULL,
+  data_json TEXT NOT NULL DEFAULT '{}'
+);
+
 -- Evidence extraction (claims JSON) derived from WebSense evidence for auditability
 CREATE TABLE IF NOT EXISTS evidence_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,

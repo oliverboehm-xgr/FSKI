@@ -11,7 +11,8 @@ from app.net import http_post_json
 @dataclass
 class OllamaConfig:
     host: str = "http://127.0.0.1:11434"
-    model: str = "llama3.2:3b-instruct"
+    # Default to a non-"*-instruct" model name. Operator may override.
+    model: str = "llama3.2:3b"
     temperature: float = 0.2
     num_ctx: int = 2048
     stream: bool = False
